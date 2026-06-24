@@ -36,6 +36,8 @@
 #include "Search.hpp"
 #include "BitmapCache.hpp"
 #include "GUI_App.hpp"
+#include "GLCanvas3D.hpp"
+#include "Plater.hpp"
 
 #include "../Utils/MacDarkMode.hpp"
 #include <nanosvg/nanosvg.h>
@@ -45,6 +47,17 @@
 
 namespace Slic3r {
 namespace GUI {
+
+static void AddDrawCallRenderStats()
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+
+    GLCanvas3D* canvas = plater->get_current_canvas3D();
+    if (canvas != nullptr)
+        canvas->AddRenderStatsDrawCall();
+}
 
 static const std::map<const wchar_t, std::string> font_icons = {
     {ImGui::PrintIconMarker       , "cog"                           },
@@ -3066,6 +3079,7 @@ void ImGuiWrapper::render_draw_data(ImDrawData *draw_data)
                 // Bind texture, Draw
                 glsafe(::glBindTexture(GL_TEXTURE_2D, (GLuint)(intptr_t)pcmd->GetTexID()));
                 glsafe(::glDrawElements(GL_TRIANGLES, (GLsizei)pcmd->ElemCount, sizeof(ImDrawIdx) == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, (void*)(intptr_t)(pcmd->IdxOffset * sizeof(ImDrawIdx))));
+                AddDrawCallRenderStats();
             }
         }
 

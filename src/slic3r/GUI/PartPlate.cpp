@@ -32,6 +32,7 @@
 #include "Widgets/Label.hpp"
 #include "2DBed.hpp"
 #include "3DBed.hpp"
+#include "GLCanvas3D.hpp"
 #include "PartPlate.hpp"
 #include "Camera.hpp"
 #include "GUI_Colors.hpp"
@@ -659,6 +660,16 @@ void PartPlate::calc_vertex_for_icons_background(int icon_count, GLModel &buffer
 }
 */
 
+void PartPlate::AddSceneRenderStats(const GLModel& model) const
+{
+    if (m_plater == nullptr)
+        return;
+
+    GLCanvas3D* canvas = m_plater->get_current_canvas3D();
+    if (canvas != nullptr)
+        canvas->AddRenderStatsModel(model, GLCanvas3D::RenderStats::GeometryScope::Scene);
+}
+
 void PartPlate::render_background(bool force_default_color)
 {
 	//return directly for current plate
@@ -680,6 +691,7 @@ void PartPlate::render_background(bool force_default_color)
         color = PartPlate::DEFAULT_COLOR;
 	}
     m_triangles.model.set_color(color);
+    AddSceneRenderStats(m_triangles.model);
     m_triangles.model.render();
 	glsafe(::glDepthMask(GL_TRUE));
 }
@@ -715,6 +727,7 @@ void PartPlate::render_logo_texture(GLTexture &logo_texture, GLModel& logo_buffe
 			GLuint tex_id = (GLuint)logo_texture.get_id();
 
 			glsafe(::glBindTexture(GL_TEXTURE_2D, tex_id));
+            AddSceneRenderStats(logo_buffer);
             logo_buffer.render();
 			glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
 
@@ -866,6 +879,7 @@ void PartPlate::render_exclude_area(bool force_default_color) {
 	}
 
 	m_exclude_triangles.set_color(m_selected ? select_color : unselect_color);
+    AddSceneRenderStats(m_exclude_triangles);
     m_exclude_triangles.render();
 	glsafe(::glDepthMask(GL_TRUE));
 }
@@ -898,10 +912,12 @@ void PartPlate::render_grid(bool bottom) {
             color = m_partplate_list->m_is_dark ? LINE_TOP_DARK_COLOR : LINE_TOP_COLOR;
 	}
     m_gridlines.set_color(color);
+    AddSceneRenderStats(m_gridlines);
     m_gridlines.render();
 
 	glsafe(::glLineWidth(2.0f * m_scale_factor));
     m_gridlines_bolder.set_color(color);
+    AddSceneRenderStats(m_gridlines_bolder);
     m_gridlines_bolder.render();
 }
 
@@ -912,11 +928,13 @@ void PartPlate::render_height_limit(PartPlate::HeightLimitMode mode)
 		// draw lower limit
 		glsafe(::glLineWidth(3.0f * m_scale_factor));
         m_height_limit_common.set_color(HEIGHT_LIMIT_BOTTOM_COLOR);
+        AddSceneRenderStats(m_height_limit_common);
         m_height_limit_common.render();
 
 		if ((mode == HEIGHT_LIMIT_BOTTOM) || (mode == HEIGHT_LIMIT_BOTH)) {
 			glsafe(::glLineWidth(3.0f * m_scale_factor));
             m_height_limit_bottom.set_color(HEIGHT_LIMIT_BOTTOM_COLOR);
+            AddSceneRenderStats(m_height_limit_bottom);
             m_height_limit_bottom.render();
 		}
 
@@ -924,15 +942,18 @@ void PartPlate::render_height_limit(PartPlate::HeightLimitMode mode)
 		if ((mode == HEIGHT_LIMIT_TOP) || (mode == HEIGHT_LIMIT_BOTH)){
             glsafe(::glLineWidth(3.0f * m_scale_factor));
             m_height_limit_top.set_color(HEIGHT_LIMIT_TOP_COLOR);
+            AddSceneRenderStats(m_height_limit_top);
             m_height_limit_top.render();
 		}
 	}
 }
 
-void PartPlate::render_icon_texture(GLModel &buffer, GLTexture &texture)
+void PartPlate::render_icon_texture(GLModel &buffer, GLTexture &texture, bool addRenderStats)
 {
 	GLuint tex_id = (GLuint)texture.get_id();
 	glsafe(::glBindTexture(GL_TEXTURE_2D, tex_id));
+    if (addRenderStats)
+        AddSceneRenderStats(buffer);
     buffer.render();
 	glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
 }
@@ -1054,7 +1075,7 @@ void PartPlate::render_icons(bool bottom, bool only_name, int hover_id)
             }
 
             if (m_plate_index >= 0 && m_plate_index < MAX_PLATE_COUNT) {
-                render_icon_texture(m_plate_idx_icon, m_partplate_list->m_idx_textures[m_plate_index]);
+                render_icon_texture(m_plate_idx_icon, m_partplate_list->m_idx_textures[m_plate_index], false);
             }
         }
 		render_plate_name_texture();
@@ -1089,7 +1110,7 @@ void PartPlate::render_only_numbers(bool bottom)
         glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
 
         if (m_plate_index >=0 && m_plate_index < MAX_PLATE_COUNT) {
-            render_icon_texture(m_plate_idx_icon, m_partplate_list->m_idx_textures[m_plate_index]);
+            render_icon_texture(m_plate_idx_icon, m_partplate_list->m_idx_textures[m_plate_index], false);
         }
 
         glsafe(::glDisable(GL_BLEND));

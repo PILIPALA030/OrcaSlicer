@@ -175,6 +175,7 @@ private:
     void calc_vertex_for_plate_name_edit_icon(GLTexture *texture, int index, PickingModel &model);
     void calc_vertex_for_icons(int index, PickingModel &model);
     // void calc_vertex_for_icons_background(int icon_count, GLModel &buffer);
+    void AddSceneRenderStats(const GLModel& model) const;
     void render_background(bool force_default_color = false);
     void render_logo(bool bottom, bool render_cali = true);
     void render_logo_texture(GLTexture &logo_texture, GLModel &logo_buffer, bool bottom);
@@ -188,7 +189,7 @@ private:
     // void render_arrows(const ColorRGBA render_color, bool use_lighting) const;
     // void render_left_arrow(const ColorRGBA render_color, bool use_lighting) const;
     // void render_right_arrow(const ColorRGBA render_color, bool use_lighting) const;
-    void render_icon_texture(GLModel &buffer, GLTexture &texture);
+    void render_icon_texture(GLModel &buffer, GLTexture &texture, bool addRenderStats = true);
     void show_tooltip(const std::string tooltip);
     void render_icons(bool bottom, bool only_name = false, int hover_id = -1);
     void render_only_numbers(bool bottom);

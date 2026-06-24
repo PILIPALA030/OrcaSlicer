@@ -43,6 +43,17 @@
 namespace Slic3r {
 namespace GUI {
 
+static void AddDrawCallRenderStats()
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+
+    GLCanvas3D* canvas = plater->get_current_canvas3D();
+    if (canvas != nullptr)
+        canvas->AddRenderStatsDrawCall();
+}
+
 //BBS translation of EViewType
 //const std::string EViewType_Map[(int) GCodeViewer::EViewType::Count] = {
 //        _u8L("Line Type"),
@@ -1328,6 +1339,7 @@ void GCodeViewer::_render_calibration_thumbnail_internal(ThumbnailData& thumbnai
             assert(!path.offsets.empty());
             shader.set_uniform(uniform_color, path.color);
             glsafe(::glMultiDrawElements(GL_TRIANGLES, (const GLsizei*)path.sizes.data(), GL_UNSIGNED_SHORT, (const void* const*)path.offsets.data(), (GLsizei)path.sizes.size()));
+            AddDrawCallRenderStats();
 #if ENABLE_GCODE_VIEWER_STATISTICS
             ++m_statistics.gl_multi_triangles_calls_count;
 #endif // ENABLE_GCODE_VIEWER_STATISTICS
@@ -1401,6 +1413,7 @@ void GCodeViewer::_render_calibration_thumbnail_internal(ThumbnailData& thumbnai
                     size_t count = static_cast<size_t>(render_range.last - render_range.first) * indices_per_instance;
                     if (count > 0) {
                         glsafe(::glDrawElements(GL_TRIANGLES, (GLsizei)count, GL_UNSIGNED_SHORT, (const void*)offset_bytes));
+                        AddDrawCallRenderStats();
 #if ENABLE_GCODE_VIEWER_STATISTICS
                         ++m_statistics.gl_batched_models_calls_count;
 #endif // ENABLE_GCODE_VIEWER_STATISTICS
@@ -3762,6 +3775,7 @@ void GCodeViewer::render_toolpaths()
             assert(! path.offsets.empty());
             shader.set_uniform(uniform_color, path.color);
             glsafe(::glMultiDrawElements(GL_LINES, (const GLsizei*)path.sizes.data(), GL_UNSIGNED_SHORT, (const void* const*)path.offsets.data(), (GLsizei)path.sizes.size()));
+            AddDrawCallRenderStats();
 #if ENABLE_GCODE_VIEWER_STATISTICS
             ++m_statistics.gl_multi_lines_calls_count;
 #endif // ENABLE_GCODE_VIEWER_STATISTICS
@@ -3780,6 +3794,7 @@ void GCodeViewer::render_toolpaths()
             assert(! path.offsets.empty());
             shader.set_uniform(uniform_color, path.color);
             glsafe(::glMultiDrawElements(GL_TRIANGLES, (const GLsizei*)path.sizes.data(), GL_UNSIGNED_SHORT, (const void* const*)path.offsets.data(), (GLsizei)path.sizes.size()));
+            AddDrawCallRenderStats();
 #if ENABLE_GCODE_VIEWER_STATISTICS
             ++m_statistics.gl_multi_triangles_calls_count;
 #endif // ENABLE_GCODE_VIEWER_STATISTICS
@@ -3853,6 +3868,7 @@ void GCodeViewer::render_toolpaths()
                     const size_t count = static_cast<size_t>(render_range.last - render_range.first) * indices_per_instance;
                     if (count > 0) {
                         glsafe(::glDrawElements(GL_TRIANGLES, (GLsizei)count, GL_UNSIGNED_SHORT, (const void*)offset_bytes));
+                        AddDrawCallRenderStats();
 #if ENABLE_GCODE_VIEWER_STATISTICS
                         ++m_statistics.gl_batched_models_calls_count;
 #endif // ENABLE_GCODE_VIEWER_STATISTICS
@@ -4000,6 +4016,7 @@ void GCodeViewer::render_toolpaths()
 
         glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, cap.ibo));
         glsafe(::glDrawElements(GL_TRIANGLES, (GLsizei)cap.indices_count(), GL_UNSIGNED_SHORT, nullptr));
+        AddDrawCallRenderStats();
         glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
 
 #if ENABLE_GCODE_VIEWER_STATISTICS

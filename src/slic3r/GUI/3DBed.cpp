@@ -32,6 +32,19 @@ static const float GROUND_Z = -0.04f;
 namespace Slic3r {
 namespace GUI {
 
+using RenderStatsGeometryScope = GLCanvas3D::RenderStats::GeometryScope;
+
+static void AddModelRenderStats(const GLModel& model, RenderStatsGeometryScope scope)
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+
+    GLCanvas3D* canvas = plater->get_current_canvas3D();
+    if (canvas != nullptr)
+        canvas->AddRenderStatsModel(model, scope);
+}
+
 bool init_model_from_poly(GLModel &model, const ExPolygon &poly, float z)
 {
     if (poly.empty())
@@ -214,6 +227,7 @@ void Bed3D::Axes::render()
         shader->set_uniform("projection_matrix", camera.get_projection_matrix());
         //const Matrix3d view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) * transform.matrix().block(0, 0, 3, 3).inverse().transpose();
         //shader->set_uniform("view_normal_matrix", view_normal_matrix);
+        AddModelRenderStats(m_arrow, RenderStatsGeometryScope::Scene);
         m_arrow.render();
     };
 
@@ -686,6 +700,7 @@ void Bed3D::render_model(const Transform3d& view_matrix, const Transform3d& proj
             shader->set_uniform("projection_matrix", projection_matrix);
             const Matrix3d view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) * model_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
             shader->set_uniform("view_normal_matrix", view_normal_matrix);
+            AddModelRenderStats(m_model, RenderStatsGeometryScope::Scene);
             m_model.render();
             shader->stop_using();
         }
@@ -729,6 +744,7 @@ void Bed3D::render_default(bool bottom, const Transform3d& view_matrix, const Tr
             ColorRGBA color = m_is_dark ? DEFAULT_MODEL_COLOR_DARK : DEFAULT_MODEL_COLOR;   // ORCA add dark mode support
             color = ColorRGBA(color[0] * 0.8f, color[1] * 0.8f,color[2] * 0.8f, color[3]);  // ORCA shift color a darker tone to fix difference between flat / gouraud_light shader
             m_triangles.set_color(color);
+            AddModelRenderStats(m_triangles, RenderStatsGeometryScope::Scene);
             m_triangles.render();
             glsafe(::glDepthMask(GL_TRUE));
         }

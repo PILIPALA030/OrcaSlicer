@@ -1897,6 +1897,8 @@ void GLCanvas3D::render(bool only_init)
     if (only_init)
         return;
 
+    m_render_stats.BeginFrame();
+
 #if ENABLE_ENVIRONMENT_MAP
     if (wxGetApp().is_editor())
         wxGetApp().plater()->init_environment_texture();
@@ -2040,6 +2042,7 @@ void GLCanvas3D::render(bool only_init)
     _render_overlays();
 
     if (wxGetApp().plater()->is_render_statistic_dialog_visible()) {
+        ImGui::SetNextWindowCollapsed(true, ImGuiCond_Appearing);
         ImGui::ShowMetricsWindow();
 
         ImGuiWrapper& imgui = *wxGetApp().imgui();
@@ -2047,6 +2050,26 @@ void GLCanvas3D::render(bool only_init)
         imgui.text("FPS (SwapBuffers() calls per second):");
         ImGui::SameLine();
         imgui.text(std::to_string(m_render_stats.get_fps_and_reset_if_needed()));
+        ImGui::Separator();
+        imgui.text("Frame time:");
+        ImGui::SameLine();
+        imgui.text(std::to_string(m_render_stats.get_frame_time_ms()) + " ms");
+        imgui.text("Draw calls:");
+        ImGui::SameLine();
+        imgui.text(std::to_string(m_render_stats.get_draw_calls_count()));
+        ImGui::Separator();
+        RenderStats::GeometryStats sceneGeometry = m_render_stats.get_scene_geometry();
+        if (wxGetApp().show_3d_navigator())
+            sceneGeometry.Add(RenderStats::GetViewNavigatorGeometryStats());
+        imgui.text("Scene geometry:");
+        imgui.text(std::string("  Vertices: ") + std::to_string(sceneGeometry.verticesCount));
+        imgui.text(std::string("  Indices: ") + std::to_string(sceneGeometry.indicesCount));
+        imgui.text(std::string("  Triangles: ") + std::to_string(sceneGeometry.trianglesCount));
+        const RenderStats::GeometryStats& objectGeometry = m_render_stats.get_object_geometry();
+        imgui.text("Object geometry:");
+        imgui.text(std::string("  Vertices: ") + std::to_string(objectGeometry.verticesCount));
+        imgui.text(std::string("  Indices: ") + std::to_string(objectGeometry.indicesCount));
+        imgui.text(std::string("  Triangles: ") + std::to_string(objectGeometry.trianglesCount));
         ImGui::Separator();
         imgui.text("Compressed textures:");
         ImGui::SameLine();
@@ -2126,6 +2149,7 @@ void GLCanvas3D::render(bool only_init)
     wxGetApp().imgui()->render();
 
     m_canvas->SwapBuffers();
+    m_render_stats.EndFrame();
     m_render_stats.increment_fps_counter();
 }
 
@@ -3558,11 +3582,9 @@ void GLCanvas3D::on_key(wxKeyEvent& evt)
     {
         if (!m_gizmos.on_key(evt)) {
             if (evt.GetEventType() == wxEVT_KEY_UP) {
-                if (evt.ShiftDown() && evt.ControlDown() && keyCode == WXK_SPACE) {
-#if !BBL_RELEASE_TO_PUBLIC
+                if (evt.ControlDown() && evt.ShiftDown() && evt.AltDown() && keyCode == WXK_F12) {
                     wxGetApp().plater()->toggle_render_statistic_dialog();
                     m_dirty = true;
-#endif
                 } else if ((evt.ShiftDown() && evt.ControlDown() && keyCode == WXK_RETURN) ||
                     (evt.ShiftDown() && evt.AltDown() && keyCode == WXK_RETURN)) {
                     wxGetApp().plater()->toggle_show_wireframe();

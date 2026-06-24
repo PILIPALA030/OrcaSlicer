@@ -14,6 +14,18 @@ namespace GUI {
 
 float GLGizmoBase::INV_ZOOM = 1.0f;
 
+using RenderStatsGeometryScope = GLCanvas3D::RenderStats::GeometryScope;
+
+static void AddModelRenderStats(const GLModel& model, RenderStatsGeometryScope scope)
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+
+    GLCanvas3D* canvas = plater->get_current_canvas3D();
+    if (canvas != nullptr)
+        canvas->AddRenderStatsModel(model, scope);
+}
 
 const float GLGizmoBase::Grabber::SizeFactor = 0.05f;
 const float GLGizmoBase::Grabber::MinHalfSize = 4.0f;
@@ -154,6 +166,7 @@ void GLGizmoBase::Grabber::render(float size, const ColorRGBA& render_color)
         shader->set_uniform("view_model_matrix", view_matrix * model_matrix);
         const Matrix3d view_normal_matrix = view_matrix_no_offset * model_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
         shader->set_uniform("view_normal_matrix", view_normal_matrix);
+        AddModelRenderStats(model.model, RenderStatsGeometryScope::SceneAndObject);
         model.model.render();
 
         if (raycasters[idx] == nullptr) {
@@ -249,6 +262,7 @@ void GLGizmoBase::render_cross_mark(const Vec3f &target, bool is_single)
 
         GLModel model;
         model.init_from(std::move(init_data));
+        AddModelRenderStats(model, RenderStatsGeometryScope::SceneAndObject);
         model.render();
     };
 

@@ -3,7 +3,9 @@
 
 #include "3DScene.hpp"
 #include "GUI_App.hpp"
+#include "GLCanvas3D.hpp"
 #include "GLShader.hpp"
+#include "Plater.hpp"
 
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/Model.hpp"
@@ -24,6 +26,17 @@
 
 namespace Slic3r {
 namespace GUI {
+
+static void AddDrawCallRenderStats()
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+
+    GLCanvas3D* canvas = plater->get_current_canvas3D();
+    if (canvas != nullptr)
+        canvas->AddRenderStatsDrawCall();
+}
 
 #if ENABLE_SMOOTH_NORMALS
 static void smooth_normals_corner(const TriangleMesh& mesh, std::vector<stl_normal>& normals)
@@ -651,6 +664,7 @@ void GLModel::render(const std::pair<size_t, size_t>& range)
 
     glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_render_data.ibo_id));
     glsafe(::glDrawElements(mode, range.second - range.first, index_type, (const void*)(range.first * Geometry::index_stride_bytes(data))));
+    AddDrawCallRenderStats();
     glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
 
     if (tex_coord_id != -1)
@@ -724,6 +738,7 @@ void GLModel::render_instanced(unsigned int instances_vbo, unsigned int instance
 
     glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_render_data.ibo_id));
     glsafe(::glDrawElementsInstanced(mode, indices_count(), index_type, (const void*)0, instances_count));
+    AddDrawCallRenderStats();
     glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
 
     if (normal)

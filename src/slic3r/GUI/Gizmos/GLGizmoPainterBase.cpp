@@ -18,6 +18,42 @@
 
 namespace Slic3r::GUI {
 
+using RenderStatsGeometryScope = GLCanvas3D::RenderStats::GeometryScope;
+
+static void AddDrawCallRenderStats()
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+
+    GLCanvas3D* canvas = plater->get_current_canvas3D();
+    if (canvas != nullptr)
+        canvas->AddRenderStatsDrawCall();
+}
+
+static void AddGeometryRenderStats(size_t verticesCount, size_t indicesCount, size_t trianglesCount,
+                                   RenderStatsGeometryScope scope)
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+
+    GLCanvas3D* canvas = plater->get_current_canvas3D();
+    if (canvas != nullptr)
+        canvas->AddRenderStatsGeometry(verticesCount, indicesCount, trianglesCount, scope);
+}
+
+static void AddModelRenderStats(const GLModel& model, RenderStatsGeometryScope scope)
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+
+    GLCanvas3D* canvas = plater->get_current_canvas3D();
+    if (canvas != nullptr)
+        canvas->AddRenderStatsModel(model, scope);
+}
+
 std::shared_ptr<GLModel> GLGizmoPainterBase::s_sphere = nullptr;
 
 GLGizmoPainterBase::GLGizmoPainterBase(GLCanvas3D& parent, const std::string& icon_filename, unsigned int sprite_id)
@@ -228,6 +264,7 @@ void GLGizmoPainterBase::render_cursor_circle()
         shader->start_using();
         shader->set_uniform("view_model_matrix", Transform3d::Identity());
         shader->set_uniform("projection_matrix", Transform3d::Identity());
+        AddModelRenderStats(m_circle, RenderStatsGeometryScope::SceneAndObject);
         m_circle.render();
         shader->stop_using();
     }
@@ -273,6 +310,7 @@ void GLGizmoPainterBase::render_cursor_sphere(const Transform3d& trafo) const
 
     assert(s_sphere != nullptr);
     s_sphere->set_color(render_color);
+    AddModelRenderStats(*s_sphere, RenderStatsGeometryScope::SceneAndObject);
     s_sphere->render();
 
     if (is_left_handed)
@@ -327,6 +365,7 @@ void GLGizmoPainterBase::render_cursor_height_range(const Transform3d& trafo) co
             shader->set_uniform("view_model_matrix", view_model_matrix);
             shader->set_uniform("projection_matrix", camera.get_projection_matrix());
             glsafe(::glLineWidth(2.0f));
+            AddModelRenderStats(m_cut_contours[m_volumes_index].contours, RenderStatsGeometryScope::SceneAndObject);
             m_cut_contours[m_volumes_index].contours.render();
             m_volumes_index++;
         }
@@ -1154,6 +1193,7 @@ void TriangleSelectorGUI::render(ImGuiWrapper* imgui, const Transform3d& matrix)
     for (auto iva : {std::make_pair(&m_iva_enforcers, enforcers_color),
                      std::make_pair(&m_iva_blockers, blockers_color)}) {
         iva.first->set_color(iva.second);
+        AddModelRenderStats(*iva.first, RenderStatsGeometryScope::SceneAndObject);
         iva.first->render();
     }
 
@@ -1163,6 +1203,7 @@ void TriangleSelectorGUI::render(ImGuiWrapper* imgui, const Transform3d& matrix)
             color_idx == 2 ? blockers_color :
             GLVolume::NEUTRAL_COLOR);
         iva.set_color(color);
+        AddModelRenderStats(iva, RenderStatsGeometryScope::SceneAndObject);
         iva.render();
     }
 
@@ -1568,6 +1609,11 @@ void TriangleSelectorPatch::render(int triangle_indices_idx, bool show_wireframe
     if (this->m_triangle_indices_sizes[triangle_indices_idx] > 0) {
         glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, this->m_triangle_indices_VBO_ids[triangle_indices_idx]));
         glsafe(::glDrawElements(GL_TRIANGLES, GLsizei(this->m_triangle_indices_sizes[triangle_indices_idx]), GL_UNSIGNED_INT, nullptr));
+        AddDrawCallRenderStats();
+        const size_t verticesCount = triangle_indices_idx < this->m_verticesSizes.size() ?
+                                                            this->m_verticesSizes[triangle_indices_idx] : 0;
+        const size_t indicesCount = this->m_triangle_indices_sizes[triangle_indices_idx];
+        AddGeometryRenderStats(verticesCount, indicesCount, indicesCount / 3, RenderStatsGeometryScope::SceneAndObject);
         glsafe(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
         //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: triangle_indices_idx %2%, bind indices vbo, buffer id %3%")%__LINE__%triangle_indices_idx%this->m_triangle_indices_VBO_ids[triangle_indices_idx];
     }
@@ -1616,6 +1662,7 @@ void TriangleSelectorPatch::finalize_triangle_indices()
     m_vertices_VBO_ids.resize(m_triangle_patches.size());
     m_triangle_indices_VBO_ids.resize(m_triangle_patches.size());
     m_triangle_indices_sizes.resize(m_triangle_patches.size());
+    m_verticesSizes.resize(m_triangle_patches.size());
     assert(std::all_of(m_triangle_indices_VBO_ids.cbegin(), m_triangle_indices_VBO_ids.cend(), [](const auto& ti_VBO_id) { return ti_VBO_id == 0; }));
 
     for (size_t buffer_idx = 0; buffer_idx < m_triangle_patches.size(); ++buffer_idx) {
@@ -1630,6 +1677,7 @@ void TriangleSelectorPatch::finalize_triangle_indices()
         }
 
         std::vector<int>& triangle_indices = m_triangle_patches[buffer_idx].triangle_indices;
+        m_verticesSizes[buffer_idx] = triangle_indices.size();
         m_triangle_indices_sizes[buffer_idx] = triangle_indices.size();
         if (!triangle_indices.empty()) {
             glsafe(::glGenBuffers(1, &m_triangle_indices_VBO_ids[buffer_idx]));
@@ -1789,6 +1837,7 @@ void TriangleSelectorGUI::render_paint_contour(const Transform3d& matrix)
         contour_shader->set_uniform("view_model_matrix", camera.get_view_matrix() * matrix);
         contour_shader->set_uniform("projection_matrix", camera.get_projection_matrix());
 
+        AddModelRenderStats(m_paint_contour, RenderStatsGeometryScope::SceneAndObject);
         m_paint_contour.render();
 
         contour_shader->stop_using();

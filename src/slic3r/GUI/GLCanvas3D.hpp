@@ -2,9 +2,11 @@
 #define slic3r_GLCanvas3D_hpp_
 
 #include <stddef.h>
+#include <algorithm>
 #include <memory>
 #include <chrono>
 #include <cstdint>
+#include <utility>
 
 #include "GLToolbar.hpp"
 #include "Event.hpp"
@@ -385,13 +387,146 @@ class GLCanvas3D
         SpiralLiftNearBoundary  // Snapmaker: 螺旋抬升靠近边界警告
     };
 
+public:
     class RenderStats
     {
+    public:
+        struct GeometryStats
+        {
+            size_t verticesCount{ 0 };
+            size_t indicesCount{ 0 };
+            size_t trianglesCount{ 0 };
+
+            void Add(const GeometryStats& stats)
+            {
+                verticesCount += stats.verticesCount;
+                indicesCount += stats.indicesCount;
+                trianglesCount += stats.trianglesCount;
+            }
+        };
+
+        enum class GeometryScope
+        {
+            Scene,
+            Object,
+            SceneAndObject
+        };
+
+        static constexpr size_t VIEW_NAVIGATOR_VERTICES = 263;
+        static constexpr size_t VIEW_NAVIGATOR_INDICES = 900;
+        static constexpr size_t VIEW_NAVIGATOR_TRIANGLES = 300;
+
     private:
         std::chrono::time_point<std::chrono::high_resolution_clock> m_measuring_start;
+        std::chrono::time_point<std::chrono::high_resolution_clock> _frameStart;
+        size_t _drawCallsCount{ 0 };
+        GeometryStats _sceneGeometry;
+        GeometryStats _objectGeometry;
+        double _lastFrameTimeMs{ 0.0 };
+        size_t _lastDrawCallsCount{ 0 };
+        bool _isFrameActive{ false };
         int m_fps_out = -1;
         int m_fps_running = 0;
+
+        static size_t GetTrianglesCount(GLModel::Geometry::EPrimitiveType type, size_t verticesCount, size_t indicesCount)
+        {
+            const size_t primitiveCount = indicesCount > 0 ? indicesCount : verticesCount;
+            switch (type)
+            {
+            case GLModel::Geometry::EPrimitiveType::Triangles:
+                return primitiveCount / 3;
+            case GLModel::Geometry::EPrimitiveType::TriangleStrip:
+            case GLModel::Geometry::EPrimitiveType::TriangleFan:
+                return primitiveCount >= 3 ? primitiveCount - 2 : 0;
+            default:
+                return 0;
+            }
+        }
+
+        static bool IsFullModelRange(const std::pair<size_t, size_t>& range)
+        {
+            return range == std::make_pair<size_t, size_t>(0, -1);
+        }
+
     public:
+        static GeometryStats GetModelGeometryStats(const GLModel& model)
+        {
+            GeometryStats stats;
+            stats.verticesCount = model.vertices_count();
+            stats.indicesCount = model.indices_count();
+            stats.trianglesCount = GetTrianglesCount(model.get_geometry().format.type, stats.verticesCount, stats.indicesCount);
+            return stats;
+        }
+
+        static GeometryStats GetModelGeometryStats(const GLModel& model, const std::pair<size_t, size_t>& range)
+        {
+            if (IsFullModelRange(range))
+                return GetModelGeometryStats(model);
+
+            GeometryStats stats;
+            const size_t indicesCount = model.indices_count();
+            const size_t firstIndex = std::min(range.first, indicesCount);
+            const size_t secondIndex = std::min(range.second, indicesCount);
+            stats.verticesCount = model.vertices_count();
+            stats.indicesCount = secondIndex > firstIndex ? secondIndex - firstIndex : 0;
+            stats.trianglesCount = GetTrianglesCount(model.get_geometry().format.type, stats.verticesCount, stats.indicesCount);
+            return stats;
+        }
+
+        static GeometryStats GetViewNavigatorGeometryStats()
+        {
+            GeometryStats stats;
+            stats.verticesCount = VIEW_NAVIGATOR_VERTICES;
+            stats.indicesCount = VIEW_NAVIGATOR_INDICES;
+            stats.trianglesCount = VIEW_NAVIGATOR_TRIANGLES;
+            return stats;
+        }
+
+        void BeginFrame()
+        {
+            _frameStart = std::chrono::high_resolution_clock::now();
+            _drawCallsCount = 0;
+            _sceneGeometry = GeometryStats();
+            _objectGeometry = GeometryStats();
+            _isFrameActive = true;
+        }
+
+        void EndFrame()
+        {
+            const auto curTime = std::chrono::high_resolution_clock::now();
+            _lastFrameTimeMs = std::chrono::duration<double, std::milli>(curTime - _frameStart).count();
+            _lastDrawCallsCount = _drawCallsCount;
+            _isFrameActive = false;
+        }
+
+        void AddDrawCall()
+        {
+            if (_isFrameActive)
+                ++_drawCallsCount;
+        }
+
+        void AddGeometry(const GeometryStats& stats, GeometryScope scope)
+        {
+            if (!_isFrameActive)
+                return;
+
+            if (scope == GeometryScope::Scene || scope == GeometryScope::SceneAndObject)
+                _sceneGeometry.Add(stats);
+
+            if (scope == GeometryScope::Object || scope == GeometryScope::SceneAndObject)
+                _objectGeometry.Add(stats);
+        }
+
+        void AddModelGeometry(const GLModel& model, GeometryScope scope,
+                              const std::pair<size_t, size_t>& range = std::make_pair<size_t, size_t>(0, -1))
+        {
+            AddGeometry(GetModelGeometryStats(model, range), scope);
+        }
+
+        double get_frame_time_ms() const { return _lastFrameTimeMs; }
+        size_t get_draw_calls_count() const { return _lastDrawCallsCount; }
+        const GeometryStats& get_scene_geometry() const { return _sceneGeometry; }
+        const GeometryStats& get_object_geometry() const { return _objectGeometry; }
         void increment_fps_counter() { ++m_fps_running; }
         int get_fps() { return m_fps_out; }
         int get_fps_and_reset_if_needed() {
@@ -407,6 +542,7 @@ class GLCanvas3D
 
     };
 
+private:
     class Labels
     {
         bool m_enabled{ false };
@@ -876,6 +1012,21 @@ public:
     bool is_dragging() const { return m_gizmos.is_dragging() || m_moving; }
 
     void render(bool only_init = false);
+    void AddRenderStatsDrawCall() { m_render_stats.AddDrawCall(); }
+    void AddRenderStatsGeometry(size_t verticesCount, size_t indicesCount, size_t trianglesCount,
+                                RenderStats::GeometryScope scope)
+    {
+        RenderStats::GeometryStats stats;
+        stats.verticesCount = verticesCount;
+        stats.indicesCount = indicesCount;
+        stats.trianglesCount = trianglesCount;
+        m_render_stats.AddGeometry(stats, scope);
+    }
+    void AddRenderStatsModel(const GLModel& model, RenderStats::GeometryScope scope,
+                             const std::pair<size_t, size_t>& range = std::make_pair<size_t, size_t>(0, -1))
+    {
+        m_render_stats.AddModelGeometry(model, scope, range);
+    }
     bool is_rendering_enabled()
     {
         return m_enable_render;

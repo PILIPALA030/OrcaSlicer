@@ -1,6 +1,7 @@
 #include <GL/glew.h>
 
 #include "3DScene.hpp"
+#include "GLCanvas3D.hpp"
 #include "GLShader.hpp"
 #include "GUI_App.hpp"
 #include "GUI_Colors.hpp"
@@ -103,6 +104,25 @@ Slic3r::ColorRGBA adjust_color_for_rendering(const Slic3r::ColorRGBA& colors)
 }
 
 namespace Slic3r {
+
+static GUI::GLCanvas3D* GetRenderStatsCanvas()
+{
+    GUI::Plater* plater = GUI::wxGetApp().plater();
+    if (plater == nullptr)
+        return nullptr;
+
+    return plater->get_current_canvas3D();
+}
+
+using RenderStatsGeometryScope = GUI::GLCanvas3D::RenderStats::GeometryScope;
+
+static void AddModelRenderStats(const GUI::GLModel& model, RenderStatsGeometryScope scope,
+                                const std::pair<size_t, size_t>& range = std::make_pair<size_t, size_t>(0, -1))
+{
+    GUI::GLCanvas3D* canvas = GetRenderStatsCanvas();
+    if (canvas != nullptr)
+        canvas->AddRenderStatsModel(model, scope, range);
+}
 
 const float GLVolume::SinkingContours::HalfWidth = 0.25f;
 
@@ -470,10 +490,13 @@ void GLVolume::render_with_outline(const GUI::Size& cnv_size)
         glsafe(::glFramebufferTexture2D(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_TEXTURE_2D, depth_tex, 0));
     }
     glsafe(::glClear(GL_DEPTH_BUFFER_BIT));
-    if (tverts_range == std::make_pair<size_t, size_t>(0, -1))
+    if (tverts_range == std::make_pair<size_t, size_t>(0, -1)) {
+        AddModelRenderStats(model, RenderStatsGeometryScope::SceneAndObject);
         model.render();
-    else
+    } else {
+        AddModelRenderStats(model, RenderStatsGeometryScope::SceneAndObject, this->tverts_range);
         model.render(this->tverts_range);
+    }
     glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
 
     // 2nd. render pass, just a normal render with the depth buffer passed as a texture
@@ -587,16 +610,22 @@ void GLVolume::simple_render(GLShaderProgram*        shader,
                     }
                 }
             }
-            if (tverts_range == std::make_pair<size_t, size_t>(0, -1))
+            if (tverts_range == std::make_pair<size_t, size_t>(0, -1)) {
+                AddModelRenderStats(m, RenderStatsGeometryScope::SceneAndObject);
                 m.render();
-            else
+            } else {
+                AddModelRenderStats(m, RenderStatsGeometryScope::SceneAndObject, this->tverts_range);
                 m.render(this->tverts_range);
+            }
         }
     } else {
-        if (tverts_range == std::make_pair<size_t, size_t>(0, -1))
+        if (tverts_range == std::make_pair<size_t, size_t>(0, -1)) {
+            AddModelRenderStats(model, RenderStatsGeometryScope::SceneAndObject);
             model.render();
-        else
+        } else {
+            AddModelRenderStats(model, RenderStatsGeometryScope::SceneAndObject, this->tverts_range);
             model.render(this->tverts_range);
+        }
     }
     if (this->is_left_handed())
         glFrontFace(GL_CCW);
@@ -638,6 +667,7 @@ void GLWipeTowerVolume::render()
         } else {
             this->model_per_colors[i].set_color(model.get_color());
         }
+        AddModelRenderStats(this->model_per_colors[i], RenderStatsGeometryScope::SceneAndObject);
         this->model_per_colors[i].render();
     }
 

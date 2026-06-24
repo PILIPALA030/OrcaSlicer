@@ -138,6 +138,7 @@ protected:
         this->m_vertices_VBO_ids.clear();
         this->m_triangle_indices_VBO_ids.clear();
         this->m_triangle_indices_sizes.clear();
+        this->m_verticesSizes.clear();
 
         for (TrianglePatch& patch : this->m_triangle_patches)
         {
@@ -159,6 +160,7 @@ protected:
     // When the triangle indices are loaded into the graphics card as Vertex Buffer Objects,
     // the above mentioned std::vectors are cleared and the following variables keep their original length.
     std::vector<size_t>         m_triangle_indices_sizes;
+    std::vector<size_t>         m_verticesSizes;
 
     // IDs of the Vertex Array Objects, into which the geometry has been loaded.
     // Zero if the VBOs are not sent to GPU yet.

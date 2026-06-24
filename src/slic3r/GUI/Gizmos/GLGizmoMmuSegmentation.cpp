@@ -21,6 +21,37 @@
 
 namespace Slic3r::GUI {
 
+static void AddDrawCallRenderStats()
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+
+    GLCanvas3D* canvas = plater->get_current_canvas3D();
+    if (canvas != nullptr)
+        canvas->AddRenderStatsDrawCall();
+}
+
+static void AddGeometryRenderStats(size_t verticesCount, size_t indicesCount, size_t trianglesCount,
+                                   GLCanvas3D::RenderStats::GeometryScope scope)
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+
+    GLCanvas3D* canvas = plater->get_current_canvas3D();
+    if (canvas != nullptr)
+        canvas->AddRenderStatsGeometry(verticesCount, indicesCount, trianglesCount, scope);
+}
+
+static size_t GetUniqueTriangleIndicesCount(const std::vector<int>& triangleIndices)
+{
+    std::vector<int> uniqueIndices = triangleIndices;
+    std::sort(uniqueIndices.begin(), uniqueIndices.end());
+    uniqueIndices.erase(std::unique(uniqueIndices.begin(), uniqueIndices.end()), uniqueIndices.end());
+    return uniqueIndices.size();
+}
+
 static inline void show_notification_extruders_limit_exceeded()
 {
     wxGetApp()
@@ -1158,6 +1189,12 @@ void GLMmSegmentationGizmo3DScene::render(size_t triangle_indices_idx) const
         this->triangle_indices_sizes[triangle_indices_idx] > 0) {
         glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, this->triangle_indices_VBO_ids[triangle_indices_idx]));
         glsafe(::glDrawElements(GL_TRIANGLES, GLsizei(this->triangle_indices_sizes[triangle_indices_idx]), GL_UNSIGNED_INT, nullptr));
+        AddDrawCallRenderStats();
+        const size_t indicesCount = this->triangle_indices_sizes[triangle_indices_idx];
+        const size_t verticesCount = triangle_indices_idx < this->triangleVerticesSizes.size() ?
+                                     this->triangleVerticesSizes[triangle_indices_idx] : 0;
+        AddGeometryRenderStats(verticesCount, indicesCount, indicesCount / 3,
+                               GLCanvas3D::RenderStats::GeometryScope::SceneAndObject);
         glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
     }
 
@@ -1183,11 +1220,13 @@ void GLMmSegmentationGizmo3DScene::finalize_triangle_indices()
 {
     triangle_indices_VBO_ids.resize(this->triangle_patches.size());
     triangle_indices_sizes.resize(this->triangle_patches.size());
+    triangleVerticesSizes.resize(this->triangle_patches.size());
     assert(std::all_of(triangle_indices_VBO_ids.cbegin(), triangle_indices_VBO_ids.cend(), [](const auto &ti_VBO_id) { return ti_VBO_id == 0; }));
 
     for (size_t buffer_idx = 0; buffer_idx < this->triangle_patches.size(); ++buffer_idx) {
         std::vector<int>& triangle_indices = this->triangle_patches[buffer_idx].triangle_indices;
         triangle_indices_sizes[buffer_idx] = triangle_indices.size();
+        triangleVerticesSizes[buffer_idx] = GetUniqueTriangleIndicesCount(triangle_indices);
         if (!triangle_indices.empty()) {
             glsafe(::glGenBuffers(1, &this->triangle_indices_VBO_ids[buffer_idx]));
             glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, this->triangle_indices_VBO_ids[buffer_idx]));
