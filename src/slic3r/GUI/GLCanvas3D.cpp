@@ -2042,18 +2042,18 @@ void GLCanvas3D::render(bool only_init)
     _render_overlays();
 
     if (wxGetApp().plater()->is_render_statistic_dialog_visible()) {
-        ImGui::SetNextWindowCollapsed(true, ImGuiCond_Appearing);
-        ImGui::ShowMetricsWindow();
+        // ImGui::ShowMetricsWindow();
 
         ImGuiWrapper& imgui = *wxGetApp().imgui();
         imgui.begin(std::string("Render statistics"), ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
         imgui.text("FPS (SwapBuffers() calls per second):");
         ImGui::SameLine();
         imgui.text(std::to_string(m_render_stats.get_fps_and_reset_if_needed()));
-        ImGui::Separator();
         imgui.text("Frame time:");
         ImGui::SameLine();
-        imgui.text(std::to_string(m_render_stats.get_frame_time_ms()) + " ms");
+        const ImGuiIO& io = ImGui::GetIO();
+        const double frameTimeMs = io.Framerate > 0.0f ? 1000.0 / static_cast<double>(io.Framerate) : 0.0;
+        imgui.text(std::to_string(frameTimeMs) + " ms");
         imgui.text("Draw calls:");
         ImGui::SameLine();
         imgui.text(std::to_string(m_render_stats.get_draw_calls_count()));
@@ -2070,13 +2070,13 @@ void GLCanvas3D::render(bool only_init)
         imgui.text(std::string("  Vertices: ") + std::to_string(objectGeometry.verticesCount));
         imgui.text(std::string("  Indices: ") + std::to_string(objectGeometry.indicesCount));
         imgui.text(std::string("  Triangles: ") + std::to_string(objectGeometry.trianglesCount));
-        ImGui::Separator();
-        imgui.text("Compressed textures:");
-        ImGui::SameLine();
-        imgui.text(OpenGLManager::are_compressed_textures_supported() ? "supported" : "not supported");
-        imgui.text("Max texture size:");
-        ImGui::SameLine();
-        imgui.text(std::to_string(OpenGLManager::get_gl_info().get_max_tex_size()));
+        // ImGui::Separator();
+        // imgui.text("Compressed textures:");
+        // ImGui::SameLine();
+        // imgui.text(OpenGLManager::are_compressed_textures_supported() ? "supported" : "not supported");
+        // imgui.text("Max texture size:");
+        // ImGui::SameLine();
+        // imgui.text(std::to_string(OpenGLManager::get_gl_info().get_max_tex_size()));
         imgui.end();
     }
 

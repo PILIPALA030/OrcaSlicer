@@ -537,6 +537,17 @@ void ImGuiWrapper::new_frame()
         init_font(true);
     }
 
+    const std::chrono::steady_clock::time_point curTime = std::chrono::steady_clock::now();
+    ImGuiIO& io = ImGui::GetIO();
+    if (_hasLastFrameTime) {
+        const double deltaSeconds = std::chrono::duration<double>(curTime - _lastFrameTime).count();
+        io.DeltaTime = static_cast<float>(deltaSeconds > 0.0 ? deltaSeconds : 1.0 / 60.0);
+    } else {
+        io.DeltaTime = 1.0f / 60.0f;
+        _hasLastFrameTime = true;
+    }
+    _lastFrameTime = curTime;
+
     ImGui::NewFrame();
     m_new_frame_open = true;
 }

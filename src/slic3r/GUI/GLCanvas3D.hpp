@@ -418,11 +418,9 @@ public:
 
     private:
         std::chrono::time_point<std::chrono::high_resolution_clock> m_measuring_start;
-        std::chrono::time_point<std::chrono::high_resolution_clock> _frameStart;
         size_t _drawCallsCount{ 0 };
         GeometryStats _sceneGeometry;
         GeometryStats _objectGeometry;
-        double _lastFrameTimeMs{ 0.0 };
         size_t _lastDrawCallsCount{ 0 };
         bool _isFrameActive{ false };
         int m_fps_out = -1;
@@ -484,7 +482,6 @@ public:
 
         void BeginFrame()
         {
-            _frameStart = std::chrono::high_resolution_clock::now();
             _drawCallsCount = 0;
             _sceneGeometry = GeometryStats();
             _objectGeometry = GeometryStats();
@@ -493,8 +490,6 @@ public:
 
         void EndFrame()
         {
-            const auto curTime = std::chrono::high_resolution_clock::now();
-            _lastFrameTimeMs = std::chrono::duration<double, std::milli>(curTime - _frameStart).count();
             _lastDrawCallsCount = _drawCallsCount;
             _isFrameActive = false;
         }
@@ -523,7 +518,6 @@ public:
             AddGeometry(GetModelGeometryStats(model, range), scope);
         }
 
-        double get_frame_time_ms() const { return _lastFrameTimeMs; }
         size_t get_draw_calls_count() const { return _lastDrawCallsCount; }
         const GeometryStats& get_scene_geometry() const { return _sceneGeometry; }
         const GeometryStats& get_object_geometry() const { return _objectGeometry; }

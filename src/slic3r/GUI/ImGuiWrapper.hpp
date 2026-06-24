@@ -4,6 +4,7 @@
 #include <string>
 #include <map>
 #include <cstdlib>
+#include <chrono>
 
 #include <imgui/imgui.h>
 
@@ -61,6 +62,8 @@ class ImGuiWrapper
     unsigned m_mouse_buttons{ 0 };
     bool m_disabled{ false };
     bool m_new_frame_open{ false };
+    std::chrono::steady_clock::time_point _lastFrameTime;
+    bool _hasLastFrameTime{ false };
 #if ENABLE_ENHANCED_IMGUI_SLIDER_FLOAT
     bool m_requires_extra_frame{ false };
 #endif // ENABLE_ENHANCED_IMGUI_SLIDER_FLOAT
