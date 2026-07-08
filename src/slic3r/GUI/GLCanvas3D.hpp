@@ -55,6 +55,8 @@ namespace CustomGCode { struct Item; }
 namespace GUI {
 
 class Bed3D;
+class GLSubTextureBindRenderer;
+class GLToolbarBackgroundTextureCache;
 class PartPlateList;
 
 #if ENABLE_RETINA_GL
@@ -530,6 +532,8 @@ private:
     mutable IMToolbar m_sel_plate_toolbar;
     mutable GLToolbar m_assemble_view_toolbar;
     mutable IMReturnToolbar m_return_toolbar;
+    std::unique_ptr<GLToolbarBackgroundTextureCache> m_toolbarBackgroundTextureCache;
+    std::unique_ptr<GLSubTextureBindRenderer> m_subTextureBindRenderer;
     mutable float m_paint_toolbar_width;
 
     //BBS: add canvas type for assemble view usage
@@ -1137,6 +1141,8 @@ public:
 private:
     bool _is_shown_on_screen() const;
 
+    const GLTexture* _get_shared_toolbar_background_texture();
+    bool _init_toolbar_background(GLToolbar& toolbar, const BackgroundTexture::Metadata& background_data);
     void _switch_toolbars_icon_filename();
     bool _init_toolbars();
     bool _init_main_toolbar();
@@ -1183,6 +1189,7 @@ private:
     void _render_volumes_for_picking(const Camera& camera) const;
     void _render_current_gizmo() const;
     void _render_gizmos_overlay();
+    void _render_prepare_top_toolbars();
     void _render_main_toolbar();
     void _render_imgui_select_plate_toolbar();
     void _render_assemble_view_toolbar() const;

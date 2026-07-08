@@ -74,6 +74,7 @@ class ObjectSettings;
 class ObjectLayers;
 class ObjectList;
 class GLCanvas3D;
+class GLTexture;
 class Mouse3DController;
 class NotificationManager;
 class DailyTipsWindow;
@@ -621,7 +622,7 @@ public:
     void enable_view_toolbar(bool enable);
 #endif
 
-    bool init_collapse_toolbar();
+    bool init_collapse_toolbar(const GLTexture* shared_background_texture = nullptr);
 
     const Camera& get_camera() const;
     Camera& get_camera();

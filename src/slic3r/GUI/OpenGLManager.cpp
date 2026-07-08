@@ -215,6 +215,7 @@ bool OpenGLManager::s_compressed_textures_supported = false;
 bool OpenGLManager::s_force_power_of_two_textures = false;
 OpenGLManager::EMultisampleState OpenGLManager::s_multisample = OpenGLManager::EMultisampleState::Unknown;
 OpenGLManager::EFramebufferType OpenGLManager::s_framebuffers_type = OpenGLManager::EFramebufferType::Unknown;
+OpenGLManager::EVertexArrayType OpenGLManager::s_vertex_arrays_type = OpenGLManager::EVertexArrayType::Unknown;
 
 #ifdef __APPLE__
 // Part of hack to remove crash when closing the application on OSX 10.9.5 when building against newer wxWidgets
@@ -236,6 +237,60 @@ OpenGLManager::~OpenGLManager()
 #ifdef __APPLE__
     }
 #endif //__APPLE__
+}
+
+void OpenGLManager::gen_vertex_arrays(int count, unsigned int* arrays)
+{
+    if (count <= 0 || arrays == nullptr)
+        return;
+
+    switch (s_vertex_arrays_type)
+    {
+    case EVertexArrayType::CoreOrArb:
+        glsafe(::glGenVertexArrays(static_cast<GLsizei>(count), arrays));
+        break;
+    case EVertexArrayType::Apple:
+        glsafe(::glGenVertexArraysAPPLE(static_cast<GLsizei>(count), arrays));
+        break;
+    default:
+    case EVertexArrayType::Unknown:
+        break;
+    }
+}
+
+void OpenGLManager::bind_vertex_array(unsigned int array_id)
+{
+    switch (s_vertex_arrays_type)
+    {
+    case EVertexArrayType::CoreOrArb:
+        glsafe(::glBindVertexArray(array_id));
+        break;
+    case EVertexArrayType::Apple:
+        glsafe(::glBindVertexArrayAPPLE(array_id));
+        break;
+    default:
+    case EVertexArrayType::Unknown:
+        break;
+    }
+}
+
+void OpenGLManager::delete_vertex_arrays(int count, const unsigned int* arrays)
+{
+    if (count <= 0 || arrays == nullptr)
+        return;
+
+    switch (s_vertex_arrays_type)
+    {
+    case EVertexArrayType::CoreOrArb:
+        glsafe(::glDeleteVertexArrays(static_cast<GLsizei>(count), arrays));
+        break;
+    case EVertexArrayType::Apple:
+        glsafe(::glDeleteVertexArraysAPPLE(static_cast<GLsizei>(count), arrays));
+        break;
+    default:
+    case EVertexArrayType::Unknown:
+        break;
+    }
 }
 
 bool OpenGLManager::init_gl(bool popup_error)
@@ -264,6 +319,19 @@ bool OpenGLManager::init_gl(bool popup_error)
         else {
             s_framebuffers_type = EFramebufferType::Unknown;
             BOOST_LOG_TRIVIAL(warning) << "Found Framebuffer Type unknown!"<< std::endl;
+        }
+
+        if (GLEW_VERSION_3_0 || GLEW_ARB_vertex_array_object) {
+            s_vertex_arrays_type = EVertexArrayType::CoreOrArb;
+            BOOST_LOG_TRIVIAL(info) << "Found Vertex Array Object Type Core/ARB." << std::endl;
+        }
+        else if (GLEW_APPLE_vertex_array_object) {
+            s_vertex_arrays_type = EVertexArrayType::Apple;
+            BOOST_LOG_TRIVIAL(info) << "Found Vertex Array Object Type APPLE." << std::endl;
+        }
+        else {
+            s_vertex_arrays_type = EVertexArrayType::Unknown;
+            BOOST_LOG_TRIVIAL(warning) << "Found Vertex Array Object Type unknown!" << std::endl;
         }
 
         bool valid_version = s_gl_info.is_version_greater_or_equal_to(2, 0);
