@@ -239,6 +239,11 @@ OpenGLManager::~OpenGLManager()
 #endif //__APPLE__
 }
 
+bool OpenGLManager::VaoStoresElementBufferBinding()
+{
+    return s_vertex_arrays_type == EVertexArrayType::CoreOrArb;
+}
+
 void OpenGLManager::gen_vertex_arrays(int count, unsigned int* arrays)
 {
     if (count <= 0 || arrays == nullptr)

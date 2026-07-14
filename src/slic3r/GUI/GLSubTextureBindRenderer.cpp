@@ -74,6 +74,11 @@ bool GLSubTextureBindRenderer::Begin()
     if (OpenGLManager::are_vertex_arrays_supported() && EnsureVao())
     {
         OpenGLManager::bind_vertex_array(_gpuObjects.vaoId);
+        if (!OpenGLManager::VaoStoresElementBufferBinding())
+        {
+            glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, _gpuObjects.iboId));
+        }
+
         _usingVao = true;
     }
     else
@@ -108,6 +113,11 @@ void GLSubTextureBindRenderer::End()
 
     if (_usingVao)
     {
+        if (!OpenGLManager::VaoStoresElementBufferBinding())
+        {
+            glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
+        }
+
         OpenGLManager::bind_vertex_array(0);
     }
     else
@@ -231,7 +241,11 @@ bool GLSubTextureBindRenderer::EnsureVao()
 
     OpenGLManager::bind_vertex_array(_gpuObjects.vaoId);
     glsafe(::glBindBuffer(GL_ARRAY_BUFFER, _gpuObjects.vboId));
-    glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, _gpuObjects.iboId));
+    if (OpenGLManager::VaoStoresElementBufferBinding())
+    {
+        glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, _gpuObjects.iboId));
+    }
+
     glsafe(::glVertexAttribPointer(positionAttribId, UNIT_QUAD_POSITION_COMPONENTS, GL_FLOAT, GL_FALSE,
         UNIT_QUAD_POSITION_COMPONENTS * sizeof(float), nullptr));
     glsafe(::glEnableVertexAttribArray(positionAttribId));

@@ -111,6 +111,7 @@ public:
     static bool are_framebuffers_supported() { return (s_framebuffers_type != EFramebufferType::Unknown); }
     static EFramebufferType get_framebuffers_type() { return s_framebuffers_type; }
     static bool are_vertex_arrays_supported() { return s_vertex_arrays_type != EVertexArrayType::Unknown; }
+    static bool VaoStoresElementBufferBinding();
     static void gen_vertex_arrays(int count, unsigned int* arrays);
     static void bind_vertex_array(unsigned int array_id);
     static void delete_vertex_arrays(int count, const unsigned int* arrays);
