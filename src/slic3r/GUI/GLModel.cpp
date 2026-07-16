@@ -582,7 +582,7 @@ bool GLModel::init_from_file(const std::string& filename)
 
 void GLModel::reset()
 {
-    delete_vao();
+    DeleteVao();
 
     // release gpu memory
     if (m_render_data.ibo_id > 0) {
@@ -654,20 +654,20 @@ void GLModel::render(const std::pair<size_t, size_t>& range)
             return;
     }
 
-    if (OpenGLManager::are_vertex_arrays_supported()) {
+    if (OpenGLManager::VertexArraysSupported()) {
         if (m_render_data.vao_id == 0)
-            init_vao();
+            InitVao();
 
         if (m_render_data.vao_id != 0) {
-            render_vao(range, shader);
+            RenderVao(range, shader);
             return;
         }
     }
 
-    render_legacy(range, shader);
+    RenderLegacy(range, shader);
 }
 
-void GLModel::render_legacy(const std::pair<size_t, size_t>& range, GLShaderProgram* shader)
+void GLModel::RenderLegacy(const std::pair<size_t, size_t>& range, GLShaderProgram* shader)
 {
     if (shader == nullptr)
         return;
@@ -726,9 +726,9 @@ void GLModel::render_legacy(const std::pair<size_t, size_t>& range, GLShaderProg
     glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
 }
 
-bool GLModel::init_vao()
+bool GLModel::InitVao()
 {
-    if (!OpenGLManager::are_vertex_arrays_supported())
+    if (!OpenGLManager::VertexArraysSupported())
         return false;
 
     if (m_render_data.vbo_id == 0 || m_render_data.ibo_id == 0)
@@ -736,66 +736,55 @@ bool GLModel::init_vao()
 
     const Geometry& data = m_render_data.geometry;
     const size_t vertex_stride_bytes = Geometry::vertex_stride_bytes(data.format);
-    const bool storesElementBuffer = OpenGLManager::VaoStoresElementBufferBinding();
 
-    OpenGLManager::gen_vertex_arrays(1, &m_render_data.vao_id);
+    glsafe(::glGenVertexArrays(static_cast<GLsizei>(1), &m_render_data.vao_id));
     if (m_render_data.vao_id == 0)
         return false;
 
-    OpenGLManager::bind_vertex_array(m_render_data.vao_id);
+    glsafe(::glBindVertexArray(m_render_data.vao_id));
     glsafe(::glBindBuffer(GL_ARRAY_BUFFER, m_render_data.vbo_id));
+    glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_render_data.ibo_id));
 
     if (Geometry::has_position(data.format)) {
-        glsafe(::glVertexAttribPointer(GLAttributeLocation::POSITION,
-            static_cast<GLint>(Geometry::position_stride_floats(data.format)),
-            GL_FLOAT,
-            GL_FALSE,
-            static_cast<GLsizei>(vertex_stride_bytes),
+        glsafe(::glVertexAttribPointer(
+            GLAttributeLocation::POSITION, static_cast<GLint>(Geometry::position_stride_floats(data.format)),
+            GL_FLOAT, GL_FALSE, static_cast<GLsizei>(vertex_stride_bytes),
             reinterpret_cast<const void*>(Geometry::position_offset_bytes(data.format))));
         glsafe(::glEnableVertexAttribArray(GLAttributeLocation::POSITION));
     }
 
     if (Geometry::has_normal(data.format)) {
-        glsafe(::glVertexAttribPointer(GLAttributeLocation::NORMAL,
-            static_cast<GLint>(Geometry::normal_stride_floats(data.format)),
-            GL_FLOAT,
-            GL_FALSE,
-            static_cast<GLsizei>(vertex_stride_bytes),
+        glsafe(::glVertexAttribPointer(
+            GLAttributeLocation::NORMAL, static_cast<GLint>(Geometry::normal_stride_floats(data.format)),
+            GL_FLOAT, GL_FALSE, static_cast<GLsizei>(vertex_stride_bytes),
             reinterpret_cast<const void*>(Geometry::normal_offset_bytes(data.format))));
         glsafe(::glEnableVertexAttribArray(GLAttributeLocation::NORMAL));
     }
 
     if (Geometry::has_tex_coord(data.format)) {
-        glsafe(::glVertexAttribPointer(GLAttributeLocation::TEX_COORD,
-            static_cast<GLint>(Geometry::tex_coord_stride_floats(data.format)),
-            GL_FLOAT,
-            GL_FALSE,
-            static_cast<GLsizei>(vertex_stride_bytes),
+        glsafe(::glVertexAttribPointer(
+            GLAttributeLocation::TEX_COORD, static_cast<GLint>(Geometry::tex_coord_stride_floats(data.format)),
+            GL_FLOAT, GL_FALSE, static_cast<GLsizei>(vertex_stride_bytes),
             reinterpret_cast<const void*>(Geometry::tex_coord_offset_bytes(data.format))));
         glsafe(::glEnableVertexAttribArray(GLAttributeLocation::TEX_COORD));
     }
 
-    if (storesElementBuffer)
-    {
-        glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_render_data.ibo_id));
-    }
-
-    OpenGLManager::bind_vertex_array(0);
+    glsafe(::glBindVertexArray(0));
     glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
 
     return true;
 }
 
-void GLModel::delete_vao()
+void GLModel::DeleteVao()
 {
     if (m_render_data.vao_id == 0)
         return;
 
-    OpenGLManager::delete_vertex_arrays(1, &m_render_data.vao_id);
+    glsafe(::glDeleteVertexArrays(static_cast<GLsizei>(1), &m_render_data.vao_id));
     m_render_data.vao_id = 0;
 }
 
-void GLModel::render_vao(const std::pair<size_t, size_t>& range, GLShaderProgram* shader)
+void GLModel::RenderVao(const std::pair<size_t, size_t>& range, GLShaderProgram* shader)
 {
     if (shader == nullptr)
         return;
@@ -803,27 +792,15 @@ void GLModel::render_vao(const std::pair<size_t, size_t>& range, GLShaderProgram
     const Geometry& data = m_render_data.geometry;
     const GLenum mode = get_primitive_mode(data.format);
     const GLenum index_type = get_index_type(data);
-    const bool storesElementBuffer = OpenGLManager::VaoStoresElementBufferBinding();
 
     shader->set_uniform("uniform_color", data.color);
 
-    OpenGLManager::bind_vertex_array(m_render_data.vao_id);
-    if (!storesElementBuffer)
-    {
-        glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_render_data.ibo_id));
-    }
+    glsafe(::glBindVertexArray(m_render_data.vao_id));
 
-    glsafe(::glDrawElements(mode,
-        static_cast<GLsizei>(range.second - range.first),
-        index_type,
-        reinterpret_cast<const void*>(range.first * Geometry::index_stride_bytes(data))));
+    glsafe(::glDrawElements(mode, static_cast<GLsizei>(range.second - range.first), index_type,
+                            reinterpret_cast<const void*>(range.first * Geometry::index_stride_bytes(data))));
 
-    if (!storesElementBuffer)
-    {
-        glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
-    }
-
-    OpenGLManager::bind_vertex_array(0);
+    glsafe(::glBindVertexArray(0));
 }
 
 void GLModel::render_instanced(unsigned int instances_vbo, unsigned int instances_count)

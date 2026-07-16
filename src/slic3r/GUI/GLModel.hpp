@@ -216,10 +216,10 @@ namespace GUI {
     private:
         bool send_to_gpu();
         void UpdateTexCoordBounds();
-        bool init_vao();
-        void delete_vao();
-        void render_legacy(const std::pair<size_t, size_t>& range, GLShaderProgram* shader);
-        void render_vao(const std::pair<size_t, size_t>& range, GLShaderProgram* shader);
+        bool InitVao();
+        void DeleteVao();
+        void RenderLegacy(const std::pair<size_t, size_t>& range, GLShaderProgram* shader);
+        void RenderVao(const std::pair<size_t, size_t>& range, GLShaderProgram* shader);
     };
     bool contains(const BuildVolume& volume, const GLModel& model, bool ignore_bottom = true);
 

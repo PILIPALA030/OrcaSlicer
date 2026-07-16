@@ -40,9 +40,8 @@ namespace {
 // Non-owning pointer temporarily set from GLCanvas3D::m_subTextureBindRenderer.get().
 GLSubTextureBindRenderer* s_activeSubTextureBindRenderer = nullptr;
 
-std::vector<unsigned char> GenerateNextRawMipmapLevel(const std::vector<unsigned char>& sourceData,
-                                                      int sourceWidth, int sourceHeight,
-                                                      int targetWidth, int targetHeight)
+std::vector<unsigned char> GenerateNextRawMipmapLevel(const std::vector<unsigned char>& sourceData, int sourceWidth,
+                                                      int sourceHeight, int targetWidth, int targetHeight)
 {
     std::vector<unsigned char> targetData(static_cast<size_t>(targetWidth) * static_cast<size_t>(targetHeight) * 4, 0);
     if (sourceData.empty() || sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0)
@@ -254,7 +253,8 @@ bool GLTexture::load_from_raw_data(std::vector<unsigned char> data, unsigned int
             mipData = GenerateNextRawMipmapLevel(mipData, lod_w, lod_h, nextLodW, nextLodH);
             lod_w = nextLodW;
             lod_h = nextLodH;
-            glsafe(::glTexImage2D(GL_TEXTURE_2D, level, GL_RGBA, (GLsizei)lod_w, (GLsizei)lod_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, (const void*)mipData.data()));
+            glsafe(::glTexImage2D(GL_TEXTURE_2D, level, GL_RGBA, (GLsizei)lod_w, (GLsizei)lod_h, 0, GL_RGBA,
+                                  GL_UNSIGNED_BYTE, (const void*)mipData.data()));
         }
 
         glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, level));

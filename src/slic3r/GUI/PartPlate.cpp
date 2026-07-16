@@ -183,12 +183,7 @@ bool CalcAtlasUvTransform(const GLModel& model, const PartPlateIconAtlas::Region
 
     const float scaleU = (region.u1 - region.u0) / sourceWidth;
     const float scaleV = (region.v1 - region.v0) / sourceHeight;
-    uvTransform = {
-        region.u0 - minCoord.x() * scaleU,
-        region.v0 - minCoord.y() * scaleV,
-        scaleU,
-        scaleV
-    };
+    uvTransform = { region.u0 - minCoord.x() * scaleU, region.v0 - minCoord.y() * scaleV, scaleU, scaleV };
     return true;
 }
 
@@ -223,8 +218,7 @@ PartPlateIconAtlas::IconType GetPlateNameEditIconType(int hoverId)
 
 PartPlateIconAtlas::IconType GetMoveFrontIconType(int hoverId)
 {
-    return hoverId == 7 ? PartPlateIconAtlas::IconType::MoveFrontHovered :
-                          PartPlateIconAtlas::IconType::MoveFront;
+    return hoverId == 7 ? PartPlateIconAtlas::IconType::MoveFrontHovered : PartPlateIconAtlas::IconType::MoveFront;
 }
 
 PartPlateIconAtlas::IconType GetPlateSettingsIconType(int hoverId, bool hasPlateSettings)

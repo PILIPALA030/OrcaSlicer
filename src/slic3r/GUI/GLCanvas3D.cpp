@@ -7954,8 +7954,7 @@ void GLCanvas3D::_render_prepare_top_toolbars()
     if (sidebar_docking_dir != Sidebar::None) {
         GLToolbar& collapse_toolbar = plater.get_collapse_toolbar();
         const float left = sidebar_docking_dir == Sidebar::Right ?
-            0.5f * canvas_width - static_cast<float>(collapse_toolbar.get_width()) :
-            -0.5f * canvas_width;
+            0.5f * canvas_width - static_cast<float>(collapse_toolbar.get_width()) : -0.5f * canvas_width;
         collapse_toolbar.set_position(top, left);
         appendToolbar(collapse_toolbar, GLToolbarItem::Action);
     }
