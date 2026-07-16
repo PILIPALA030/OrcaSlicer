@@ -88,15 +88,6 @@ int resolve_sparse_infill_filament(const ConfigLike &config, int inherited_spars
     return sparse_opt != nullptr && sparse_opt->getInt() > 0 ? sparse_opt->getInt() : inherited_sparse_infill_filament;
 }
 
-std::string FormatPlateIndexText(int plateIndex)
-{
-    const int displayIndex = plateIndex + 1;
-    if (displayIndex < 10)
-        return std::string("0") + std::to_string(displayIndex);
-
-    return std::to_string(displayIndex);
-}
-
 struct RasterizedTile
 {
     std::vector<unsigned char> rgba;
@@ -142,63 +133,6 @@ bool RasterizeAtlasSvgSource(const std::string& filename, int rasterSize, Raster
 
     nsvgDeleteRasterizer(rasterizer);
     nsvgDelete(image);
-    return IsRasterizedTileValid(tile);
-}
-
-bool RasterizeAtlasTextSource(const std::string& text, RasterizedTile& tile)
-{
-    tile = RasterizedTile();
-    if (text.empty())
-        return false;
-
-    const int fontSize = wxGetApp().em_unit() * PARTPLATE_ICON_SIZE;
-    if (fontSize <= 0)
-        return false;
-
-    wxFont font = Label::sysFont(fontSize, true);
-    const wxString label = from_u8(text);
-    wxMemoryDC measureDc;
-    wxCoord textWidth = 0;
-    wxCoord textHeight = 0;
-    measureDc.SetFont(font);
-    measureDc.GetMultiLineTextExtent(label, &textWidth, &textHeight);
-
-    if (textWidth <= 0 || textHeight <= 0)
-        return false;
-
-    tile.width = static_cast<int>(next_highest_power_of_2(static_cast<uint32_t>(textWidth)));
-    tile.height = static_cast<int>(next_highest_power_of_2(static_cast<uint32_t>(textHeight)));
-    tile.rgba.assign(static_cast<size_t>(tile.width) * static_cast<size_t>(tile.height) * 4, 0);
-
-    wxBitmap bitmap(tile.width, tile.height);
-    wxMemoryDC memDc;
-    memDc.SelectObject(bitmap);
-    memDc.SetFont(font);
-    memDc.SetBackground(wxBrush(*wxBLACK));
-    memDc.Clear();
-    memDc.SetTextForeground(*wxWHITE);
-    memDc.DrawLabel(label, wxRect(0, 0, textWidth, textHeight), wxALIGN_CENTER);
-    memDc.SelectObject(wxNullBitmap);
-
-    wxImage image = bitmap.ConvertToImage();
-    const unsigned char* source = image.GetData();
-    if (source == nullptr)
-        return false;
-
-    const wxColour foreground(0xf2, 0x75, 0x4e, 0xff);
-    for (int row = 0; row < tile.height; ++row)
-    {
-        unsigned char* target = tile.rgba.data() + 4 * static_cast<size_t>(row) * static_cast<size_t>(tile.width);
-        for (int col = 0; col < tile.width; ++col)
-        {
-            *target++ = foreground.Red();
-            *target++ = foreground.Green();
-            *target++ = foreground.Blue();
-            *target++ = static_cast<unsigned char>(std::min<int>(255, *source));
-            source += 3;
-        }
-    }
-
     return IsRasterizedTileValid(tile);
 }
 
@@ -348,19 +282,6 @@ bool PartPlateIconAtlas::GetRegion(IconType type, Region& region) const
     return true;
 }
 
-bool PartPlateIconAtlas::GetPlateIndexRegion(int plateIndex, Region& region) const
-{
-    if (plateIndex < 0 || plateIndex >= MAX_PLATE_COUNT)
-        return false;
-
-    return GetRegion(GetPlateIndexIconType(plateIndex), region);
-}
-
-PartPlateIconAtlas::IconType PartPlateIconAtlas::GetPlateIndexIconType(int plateIndex)
-{
-    return static_cast<IconType>(static_cast<int>(IconType::PlateIndex01) + plateIndex);
-}
-
 bool PartPlateIconAtlas::BuildSources(bool darkMode, std::vector<Source>& sources) const
 {
     sources.clear();
@@ -370,8 +291,7 @@ bool PartPlateIconAtlas::BuildSources(bool darkMode, std::vector<Source>& source
     {
         Source source;
         source.type = type;
-        source.sourceType = SourceType::Svg;
-        source.value = path + filename;
+        source.filename = path + filename;
         sources.emplace_back(source);
     };
 
@@ -398,14 +318,6 @@ bool PartPlateIconAtlas::BuildSources(bool darkMode, std::vector<Source>& source
     addSvgSource(IconType::PlateNameEdit, darkMode ? "plate_name_edit_dark.svg" : "plate_name_edit.svg");
     addSvgSource(IconType::PlateNameEditHovered,
                  darkMode ? "plate_name_edit_hover_dark.svg" : "plate_name_edit_hover.svg");
-
-    for (int plateIndex = 0; plateIndex < MAX_PLATE_COUNT; ++plateIndex) {
-        Source source;
-        source.type = GetPlateIndexIconType(plateIndex);
-        source.sourceType = SourceType::Text;
-        source.value = FormatPlateIndexText(plateIndex);
-        sources.emplace_back(source);
-    }
 
     return !sources.empty();
 }
@@ -444,12 +356,10 @@ bool PartPlateIconAtlas::BuildTexture(const std::vector<Source>& sources, int ic
         {
             const Source& source = sources[sourceIndex];
             RasterizedTile tile;
-            const bool loaded = source.sourceType == SourceType::Svg ?
-                RasterizeAtlasSvgSource(source.value, rasterSize, tile) :
-                RasterizeAtlasTextSource(source.value, tile);
+            const bool loaded = RasterizeAtlasSvgSource(source.filename, rasterSize, tile);
             if (!loaded)
             {
-                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(":load atlas source %1% failed") % source.value;
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(":load atlas source %1% failed") % source.filename;
                 return false;
             }
 
@@ -1366,17 +1276,13 @@ void PartPlate::InvalidateRightIconBatch()
     _rightIconBatchKeyValid = false;
 }
 
-PartPlate::RightIconBatchKey PartPlate::BuildRightIconBatchKey(bool showRightButtons, bool showPlateIndex,
-                                                               int hoverId, bool hasPlateSettings) const
+PartPlate::RightIconBatchKey PartPlate::BuildRightIconBatchKey(int hoverId, bool hasPlateSettings) const
 {
     RightIconBatchKey key;
     key.hoverId = hoverId;
-    key.plateIndex = m_plate_index;
     key.locked = is_locked();
     key.hasPlateSettings = hasPlateSettings;
     key.renderPlateSettings = m_partplate_list != nullptr && m_partplate_list->render_plate_settings;
-    key.showRightButtons = showRightButtons;
-    key.showPlateIndex = showPlateIndex;
     key.atlasVersion = m_partplate_list != nullptr ? m_partplate_list->m_iconAtlas.GetVersion() : 0;
     return key;
 }
@@ -1385,12 +1291,9 @@ bool PartPlate::IsSameRightIconBatchKey(const RightIconBatchKey& key) const
 {
     return _rightIconBatchKeyValid &&
         _rightIconBatchKey.hoverId == key.hoverId &&
-        _rightIconBatchKey.plateIndex == key.plateIndex &&
         _rightIconBatchKey.locked == key.locked &&
         _rightIconBatchKey.hasPlateSettings == key.hasPlateSettings &&
         _rightIconBatchKey.renderPlateSettings == key.renderPlateSettings &&
-        _rightIconBatchKey.showRightButtons == key.showRightButtons &&
-        _rightIconBatchKey.showPlateIndex == key.showPlateIndex &&
         _rightIconBatchKey.atlasVersion == key.atlasVersion;
 }
 
@@ -1441,19 +1344,6 @@ bool PartPlate::AppendRightIconBatchIcon(GLModel::Geometry& geometry, const GLMo
     return AppendRightIconBatchModel(geometry, model, region);
 }
 
-bool PartPlate::AppendRightIconBatchPlateIndex(GLModel::Geometry& geometry, const GLModel& model,
-                                               int plateIndex) const
-{
-    if (m_partplate_list == nullptr || !m_partplate_list->m_iconAtlas.IsValid())
-        return false;
-
-    PartPlateIconAtlas::Region region;
-    if (!m_partplate_list->m_iconAtlas.GetPlateIndexRegion(plateIndex, region))
-        return false;
-
-    return AppendRightIconBatchModel(geometry, model, region);
-}
-
 bool PartPlate::RebuildRightIconBatchModel(const RightIconBatchKey& key)
 {
     _rightIconBatchModel.reset();
@@ -1461,23 +1351,16 @@ bool PartPlate::RebuildRightIconBatchModel(const RightIconBatchKey& key)
     GLModel::Geometry geometry;
     geometry.format = { GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3T2 };
 
-    if (key.showRightButtons)
-    {
-        if (!AppendRightIconBatchIcon(geometry, m_del_icon.model, GetCloseIconType(key.hoverId)) ||
-            !AppendRightIconBatchIcon(geometry, m_orient_icon.model, GetOrientIconType(key.hoverId)) ||
-            !AppendRightIconBatchIcon(geometry, m_arrange_icon.model, GetArrangeIconType(key.hoverId)) ||
-            !AppendRightIconBatchIcon(geometry, m_lock_icon.model, GetLockIconType(key.hoverId, key.locked)) ||
-            !AppendRightIconBatchIcon(geometry, m_plate_name_edit_icon.model, GetPlateNameEditIconType(key.hoverId)) ||
-            !AppendRightIconBatchIcon(geometry, m_move_front_icon.model, GetMoveFrontIconType(key.hoverId)))
-            return false;
+    if (!AppendRightIconBatchIcon(geometry, m_del_icon.model, GetCloseIconType(key.hoverId)) ||
+        !AppendRightIconBatchIcon(geometry, m_orient_icon.model, GetOrientIconType(key.hoverId)) ||
+        !AppendRightIconBatchIcon(geometry, m_arrange_icon.model, GetArrangeIconType(key.hoverId)) ||
+        !AppendRightIconBatchIcon(geometry, m_lock_icon.model, GetLockIconType(key.hoverId, key.locked)) ||
+        !AppendRightIconBatchIcon(geometry, m_plate_name_edit_icon.model, GetPlateNameEditIconType(key.hoverId)) ||
+        !AppendRightIconBatchIcon(geometry, m_move_front_icon.model, GetMoveFrontIconType(key.hoverId)))
+        return false;
 
-        if (key.renderPlateSettings &&
-            !AppendRightIconBatchIcon(geometry, m_plate_settings_icon.model,
-                                      GetPlateSettingsIconType(key.hoverId, key.hasPlateSettings)))
-            return false;
-    }
-
-    if (key.showPlateIndex && !AppendRightIconBatchPlateIndex(geometry, m_plate_idx_icon, key.plateIndex))
+    if (key.renderPlateSettings && !AppendRightIconBatchIcon(geometry, m_plate_settings_icon.model,
+									GetPlateSettingsIconType(key.hoverId, key.hasPlateSettings)))
         return false;
 
     if (geometry.is_empty())
@@ -1592,8 +1475,7 @@ void PartPlate::render_icons(bool bottom, bool only_name, int hover_id)
         if (!only_name) {
             bool rightIconsRendered = false;
             if (useIconAtlas) {
-                const bool showPlateIndex = m_plate_index >= 0 && m_plate_index < MAX_PLATE_COUNT;
-                const RightIconBatchKey key = BuildRightIconBatchKey(true, showPlateIndex, hover_id, hasPlateSettings);
+                const RightIconBatchKey key = BuildRightIconBatchKey(hover_id, hasPlateSettings);
                 rightIconsRendered = RenderRightIconBatch(key);
                 if (rightIconsRendered) {
                     ShowRightIconTooltip(hover_id);
@@ -1671,11 +1553,10 @@ void PartPlate::render_icons(bool bottom, bool only_name, int hover_id)
                                                 m_partplate_list->m_plate_settings_changed_texture);
                     }
                 }
-
-                if (m_plate_index >= 0 && m_plate_index < MAX_PLATE_COUNT) {
-                    render_icon_texture(m_plate_idx_icon, m_partplate_list->m_idx_textures[m_plate_index]);
-                }
             }
+
+            if (m_plate_index >= 0 && m_plate_index < MAX_PLATE_COUNT)
+                render_icon_texture(m_plate_idx_icon, m_partplate_list->m_idx_textures[m_plate_index]);
         }
 		render_plate_name_texture();
 
@@ -1703,17 +1584,8 @@ void PartPlate::render_only_numbers(bool bottom)
         glsafe(::glEnable(GL_BLEND));
         glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
 
-        if (m_plate_index >=0 && m_plate_index < MAX_PLATE_COUNT) {
-            if (m_partplate_list != nullptr && m_partplate_list->m_iconAtlas.IsValid()) {
-                const RightIconBatchKey key = BuildRightIconBatchKey(false, true, -1, false);
-                if (!RenderRightIconBatch(key)) {
-                    render_icon_texture(m_plate_idx_icon, m_partplate_list->m_idx_textures[m_plate_index]);
-                }
-            }
-            else {
-                render_icon_texture(m_plate_idx_icon, m_partplate_list->m_idx_textures[m_plate_index]);
-            }
-        }
+        if (m_partplate_list != nullptr && m_plate_index >= 0 && m_plate_index < MAX_PLATE_COUNT)
+            render_icon_texture(m_plate_idx_icon, m_partplate_list->m_idx_textures[m_plate_index]);
 
         glsafe(::glDisable(GL_BLEND));
 

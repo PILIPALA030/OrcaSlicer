@@ -98,43 +98,7 @@ public:
         PlateSettingsHovered,
         PlateSettingsChangedHovered,
         PlateNameEdit,
-        PlateNameEditHovered,
-        PlateIndex01,
-        PlateIndex02,
-        PlateIndex03,
-        PlateIndex04,
-        PlateIndex05,
-        PlateIndex06,
-        PlateIndex07,
-        PlateIndex08,
-        PlateIndex09,
-        PlateIndex10,
-        PlateIndex11,
-        PlateIndex12,
-        PlateIndex13,
-        PlateIndex14,
-        PlateIndex15,
-        PlateIndex16,
-        PlateIndex17,
-        PlateIndex18,
-        PlateIndex19,
-        PlateIndex20,
-        PlateIndex21,
-        PlateIndex22,
-        PlateIndex23,
-        PlateIndex24,
-        PlateIndex25,
-        PlateIndex26,
-        PlateIndex27,
-        PlateIndex28,
-        PlateIndex29,
-        PlateIndex30,
-        PlateIndex31,
-        PlateIndex32,
-        PlateIndex33,
-        PlateIndex34,
-        PlateIndex35,
-        PlateIndex36
+        PlateNameEditHovered
     };
 
     struct Region
@@ -151,23 +115,14 @@ public:
     unsigned int GetTextureId() const;
     unsigned int GetVersion() const;
     bool GetRegion(IconType type, Region& region) const;
-    bool GetPlateIndexRegion(int plateIndex, Region& region) const;
 
 private:
-    enum class SourceType : unsigned char
-    {
-        Svg,
-        Text
-    };
-
     struct Source
     {
         IconType type{ IconType::Close };
-        SourceType sourceType{ SourceType::Svg };
-        std::string value;
+        std::string filename;
     };
 
-    static IconType GetPlateIndexIconType(int plateIndex);
     bool BuildSources(bool darkMode, std::vector<Source>& sources) const;
     bool BuildTexture(const std::vector<Source>& sources, int iconSize);
 
@@ -268,12 +223,9 @@ private:
     struct RightIconBatchKey
     {
         int hoverId{ -1 };
-        int plateIndex{ -1 };
         bool locked{ false };
         bool hasPlateSettings{ false };
         bool renderPlateSettings{ false };
-        bool showRightButtons{ false };
-        bool showPlateIndex{ false };
         unsigned int atlasVersion{ 0 };
     };
 
@@ -309,15 +261,12 @@ private:
     // void render_right_arrow(const ColorRGBA render_color, bool use_lighting) const;
     void render_icon_texture(GLModel &buffer, GLTexture &texture);
     void InvalidateRightIconBatch();
-    RightIconBatchKey BuildRightIconBatchKey(bool showRightButtons, bool showPlateIndex,
-                                             int hoverId, bool hasPlateSettings) const;
+    RightIconBatchKey BuildRightIconBatchKey(int hoverId, bool hasPlateSettings) const;
     bool IsSameRightIconBatchKey(const RightIconBatchKey& key) const;
     bool AppendRightIconBatchModel(GLModel::Geometry& geometry, const GLModel& model,
                                    const PartPlateIconAtlas::Region& region) const;
     bool AppendRightIconBatchIcon(GLModel::Geometry& geometry, const GLModel& model,
                                   PartPlateIconAtlas::IconType iconType) const;
-    bool AppendRightIconBatchPlateIndex(GLModel::Geometry& geometry, const GLModel& model,
-                                        int plateIndex) const;
     bool RebuildRightIconBatchModel(const RightIconBatchKey& key);
     bool RenderRightIconBatch(const RightIconBatchKey& key);
     void ShowRightIconTooltip(int hoverId);
