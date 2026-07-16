@@ -196,9 +196,15 @@ bool GLSubTextureBindRenderer::EnsureGpuObjects()
         return false;
     }
 
+    const bool vertexArraysSupported = OpenGLManager::VertexArraysSupported();
+    GLint previousIbo = 0;
+    if (vertexArraysSupported)
+        glsafe(::glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &previousIbo));
+
     glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, _gpuObjects.iboId));
     glsafe(::glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(UNIT_QUAD_INDICES), UNIT_QUAD_INDICES, GL_STATIC_DRAW));
-    glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
+    const GLuint restoredIbo = vertexArraysSupported ? static_cast<GLuint>(previousIbo) : 0;
+    glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, restoredIbo));
 
     _gpuObjects.indexType = GL_UNSIGNED_INT;
     _gpuObjects.indexCount = UNIT_QUAD_INDEX_COUNT;

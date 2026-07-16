@@ -899,6 +899,11 @@ bool GLModel::send_to_gpu()
     data.vertices = std::vector<float>();
 
     // indices
+    const bool vertexArraysSupported = OpenGLManager::VertexArraysSupported();
+    GLint previousIbo = 0;
+    if (vertexArraysSupported)
+        glsafe(::glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &previousIbo));
+
     glsafe(::glGenBuffers(1, &m_render_data.ibo_id));
     glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_render_data.ibo_id));
     const size_t indices_count = data.indices.size();
@@ -910,7 +915,6 @@ bool GLModel::send_to_gpu()
         }
         data.index_type = Geometry::EIndexType::UBYTE;
         glsafe(::glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices_count * sizeof(unsigned char), reduced_indices.data(), GL_STATIC_DRAW));
-        glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
     }
     else if (m_render_data.vertices_count <= 65536) {
         // convert indices to unsigned short to save gpu memory
@@ -920,13 +924,14 @@ bool GLModel::send_to_gpu()
         }
         data.index_type = Geometry::EIndexType::USHORT;
         glsafe(::glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices_count * sizeof(unsigned short), reduced_indices.data(), GL_STATIC_DRAW));
-        glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
     }
     else {
         data.index_type = Geometry::EIndexType::UINT;
         glsafe(::glBufferData(GL_ELEMENT_ARRAY_BUFFER, data.indices_size_bytes(), data.indices.data(), GL_STATIC_DRAW));
-        glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
     }
+
+    const GLuint restoredIbo = vertexArraysSupported ? static_cast<GLuint>(previousIbo) : 0;
+    glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, restoredIbo));
     m_render_data.indices_count = indices_count;
     data.indices = std::vector<unsigned int>();
 
