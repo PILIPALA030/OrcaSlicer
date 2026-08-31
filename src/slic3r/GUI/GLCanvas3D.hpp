@@ -342,6 +342,10 @@ class GLCanvas3D
         bool dragging;
         Vec2d position;
         Vec3d scene_position;
+        // Actual Volume surface hit used to validate drag initiation.
+        Vec3d volumeHitPosition;
+        // Volume index associated with volumeHitPosition, or -1 when unavailable.
+        int volumeHitIndex;
         Drag drag;
         bool ignore_left_up;
         bool ignore_right_up;
@@ -522,7 +526,18 @@ private:
     {
         EPickingQueryStatus status{EPickingQueryStatus::Unavailable};
         SceneRaycaster::HitResult hit;
+        // Center coordinate of the selected framebuffer pixel in top-left screen space.
+        Vec2d samplePosition{Vec2d::Zero()};
+        // Squared framebuffer-pixel distance from the mouse center.
+        int screenDistanceSquared{0};
         float depth{1.0f};
+    };
+
+    struct PickingPassResult
+    {
+        SceneRaycaster::HitResult hit;
+        // Mouse-ray position used as the drag interaction anchor.
+        Vec3d interactionPosition{Vec3d(DBL_MAX, DBL_MAX, DBL_MAX)};
     };
 
     bool m_is_dark = false;
@@ -1185,9 +1200,14 @@ private:
 
     void UpdateVolumeClippingState();
     bool RenderPickingBuffer(const Camera& camera);
-    VolumePickResult QueryVolumeFromPickingBuffer(const Vec2d& screenPosition, const Camera& camera);
-    SceneRaycaster::HitResult QueryHybridPickingHit(const Vec2d& screenPosition, const Camera& camera,
-                                                    const ClippingPlane& clippingPlane);
+    VolumePickResult QueryVolumeFromPickingBuffer(const Vec2d& screenPosition, const Camera& camera, int toleranceRadiusPx);
+    PickingPassResult QueryHybridPickingHit(const Vec2d& screenPosition, const Camera& camera, const ClippingPlane& clippingPlane,
+                                            int volumeToleranceRadiusPx);
+
+    /**
+     * @brief Projects a Volume surface hit onto the original mouse ray using the active drag-plane semantics.
+     */
+    Vec3d ComputeVolumeDragAnchor(const Vec2d& screenPosition, const Vec3d& surfacePosition, const Camera& camera);
     bool RaycastVolume(int volumeIndex, const Vec2d& screenPosition, const Camera& camera,
                        const ClippingPlane* clippingPlane, SceneRaycaster::HitResult& hit) const;
     void ResolveSelectedVolumeOverlap(const Vec2d& screenPosition, const Camera& camera,
@@ -1195,7 +1215,7 @@ private:
     void ApplyPickingHit(const SceneRaycaster::HitResult& hit);
     bool ShouldRenderVolumeForPicking(const GLVolume& volume) const;
 
-    std::optional<SceneRaycaster::HitResult> _picking_pass();
+    std::optional<PickingPassResult> _picking_pass();
     void _rectangular_selection_picking_pass();
     void _render_background();
     void _render_bed(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool show_axes);

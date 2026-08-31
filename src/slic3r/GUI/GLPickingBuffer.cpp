@@ -123,6 +123,24 @@ bool GLPickingBuffer::ReadPoint(int x, int y, PointSample& sample) const
     return true;
 }
 
+bool GLPickingBuffer::ReadDepthPoint(int x, int y, GLfloat& depth) const
+{
+    if (!ValidateRect(x, y, 1, 1))
+        return false;
+
+    GLint previousDrawFramebuffer = 0;
+    GLint previousReadFramebuffer = 0;
+    GetFramebufferBindings(previousDrawFramebuffer, previousReadFramebuffer);
+    (void)previousDrawFramebuffer;
+    BindFramebuffer(GL_READ_FRAMEBUFFER, _framebuffer);
+    Slic3r::ScopeGuard restoreFramebuffer([this, previousReadFramebuffer]() {
+        BindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previousReadFramebuffer));
+    });
+
+    glsafe(::glReadPixels(x, y, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depth));
+    return true;
+}
+
 bool GLPickingBuffer::ReadColorRect(int x, int y, int width, int height, std::vector<ColorPixel>& pixels) const
 {
     pixels.clear();

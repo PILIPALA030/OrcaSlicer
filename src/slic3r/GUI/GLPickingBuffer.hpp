@@ -68,6 +68,11 @@ public:
     void EndRender();
 
     bool ReadPoint(int x, int y, PointSample& sample) const;
+
+    /**
+     * @brief Reads one depth value from the picking framebuffer.
+     */
+    bool ReadDepthPoint(int x, int y, GLfloat& depth) const;
     bool ReadColorRect(int x, int y, int width, int height, std::vector<ColorPixel>& pixels) const;
 
 private:
