@@ -3,6 +3,7 @@
 
 #include <boost/container/small_vector.hpp>
 #include <boost/log/trivial.hpp>
+#include <atomic>
 #include <cstddef>
 #include <tbb/parallel_for.h>
 
@@ -231,6 +232,51 @@ int TriangleSelector::select_unsplit_triangle(const Vec3f &hit, int facet_idx) c
     Vec3i32 neighbors = m_neighbors[facet_idx];
     assert(this->verify_triangle_neighbors(m_triangles[facet_idx], neighbors));
     return this->select_unsplit_triangle(hit, facet_idx, neighbors);
+}
+
+bool TriangleSelector::SetLeafState(int triangleIndex, EnforcerBlockerType state)
+{
+    if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
+        return false;
+
+    Triangle& triangle = m_triangles[triangleIndex];
+    if (!triangle.valid() || triangle.is_split() || triangle.get_state() == state)
+        return false;
+
+    const int sourceTriangle = triangle.source_triangle;
+    triangle.set_state(state);
+    ++m_stateRevision;
+    OnSelectorMutation(MutationKind::State, sourceTriangle);
+    return true;
+}
+
+void TriangleSelector::NotifyTopologyMutation(int sourceTriangle)
+{
+    if (sourceTriangle < 0 || sourceTriangle >= m_orig_size_indices)
+        return;
+
+    ++m_topologyRevision;
+    OnSelectorMutation(MutationKind::Topology, sourceTriangle);
+}
+
+void TriangleSelector::NotifyAllStateMutation()
+{
+    ++m_stateRevision;
+    OnSelectorMutation(MutationKind::AllState, -1);
+}
+
+void TriangleSelector::NotifyIndexRebuild()
+{
+    ++m_triangleIndexRevision;
+    OnSelectorMutation(MutationKind::IndexRebuild, -1);
+}
+
+void TriangleSelector::NotifyFullReset()
+{
+    ++m_topologyRevision;
+    ++m_triangleIndexRevision;
+    ++m_stateRevision;
+    OnSelectorMutation(MutationKind::FullReset, -1);
 }
 
 void TriangleSelector::select_patch(int facet_start, std::unique_ptr<Cursor> &&cursor, EnforcerBlockerType new_state, const Transform3d& trafo_no_translate, bool triangle_splitting, float highlight_by_angle_deg)
@@ -922,7 +968,7 @@ bool TriangleSelector::select_triangle_recursive(int facet_idx, const Vec3i32 &n
     if (num_of_inside_vertices == 3) {
         // dump any subdivision and select whole triangle
         undivide_triangle(facet_idx);
-        tr->set_state(type);
+        SetLeafState(facet_idx, type);
     } else {
         // the triangle is partially inside, let's recursively divide it
         // (if not already) and try selecting its children.
@@ -936,7 +982,7 @@ bool TriangleSelector::select_triangle_recursive(int facet_idx, const Vec3i32 &n
         if (triangle_splitting)
             split_triangle(facet_idx, neighbors);
         else if (!m_triangles[facet_idx].is_split())
-            m_triangles[facet_idx].set_state(type);
+            SetLeafState(facet_idx, type);
         tr = &m_triangles[facet_idx]; // might have been invalidated by split_triangle().
 
         int num_of_children = tr->number_of_split_sides() + 1;
@@ -960,7 +1006,7 @@ void TriangleSelector::set_facet(int facet_idx, EnforcerBlockerType state)
     assert(facet_idx < m_orig_size_indices);
     undivide_triangle(facet_idx);
     assert(! m_triangles[facet_idx].is_split());
-    m_triangles[facet_idx].set_state(state);
+    SetLeafState(facet_idx, state);
 }
 
 // called by select_patch()->select_triangle()...select_triangle()
@@ -976,6 +1022,7 @@ void TriangleSelector::split_triangle(int facet_idx, const Vec3i32 &neighbors)
     assert(this->verify_triangle_neighbors(*tr, neighbors));
 
     EnforcerBlockerType old_type = tr->get_state();
+    const int sourceTriangle = tr->source_triangle;
 
     // If we got here, we are about to actually split the triangle.
     const double limit_squared = m_edge_limit_sqr;
@@ -1019,6 +1066,7 @@ void TriangleSelector::split_triangle(int facet_idx, const Vec3i32 &neighbors)
         sides_to_split.size() == 2 ? side_to_keep : sides_to_split[0]);
 
     perform_split(facet_idx, neighbors, old_type);
+    NotifyTopologyMutation(sourceTriangle);
 }
 
 // Is pointer in a triangle?
@@ -1134,6 +1182,7 @@ void TriangleSelector::undivide_triangle(int facet_idx)
     Triangle& tr = m_triangles[facet_idx];
 
     if (tr.is_split()) {
+        const int sourceTriangle = tr.source_triangle;
         for (int i = 0; i <= tr.number_of_split_sides(); ++i) {
             int       child    = tr.children[i];
             Triangle &child_tr = m_triangles[child];
@@ -1163,10 +1212,11 @@ void TriangleSelector::undivide_triangle(int facet_idx)
             ++m_invalid_triangles;
         }
         tr.set_division(0, 0); // not split
+        NotifyTopologyMutation(sourceTriangle);
     }
 }
 
-void TriangleSelector::remove_useless_children(int facet_idx)
+bool TriangleSelector::remove_useless_children(int facet_idx)
 {
     // Check that all children are leafs of the same type. If not, try to
     // make them (recursive call). Remove them if sucessful.
@@ -1177,14 +1227,16 @@ void TriangleSelector::remove_useless_children(int facet_idx)
     if (! tr.is_split()) {
         // This is a leaf, there nothing to do. This can happen during the
         // first (non-recursive call). Shouldn't otherwise.
-        return;
+        return false;
     }
+
+    bool topologyChanged = false;
 
     // Call this for all non-leaf children.
     for (int child_idx=0; child_idx<=tr.number_of_split_sides(); ++child_idx) {
         assert(child_idx < int(m_triangles.size()) && m_triangles[child_idx].valid());
         if (m_triangles[tr.children[child_idx]].is_split())
-            remove_useless_children(tr.children[child_idx]);
+            topologyChanged |= remove_useless_children(tr.children[child_idx]);
     }
 
 
@@ -1192,16 +1244,17 @@ void TriangleSelector::remove_useless_children(int facet_idx)
     EnforcerBlockerType first_child_type = EnforcerBlockerType::NONE;
     for (int child_idx=0; child_idx<=tr.number_of_split_sides(); ++child_idx) {
         if (m_triangles[tr.children[child_idx]].is_split())
-            return;
+            return topologyChanged;
         if (child_idx == 0)
             first_child_type = m_triangles[tr.children[0]].get_state();
         else if (m_triangles[tr.children[child_idx]].get_state() != first_child_type)
-            return;
+            return topologyChanged;
     }
 
     // If we got here, the children can be removed.
     undivide_triangle(facet_idx);
-    tr.set_state(first_child_type);
+    SetLeafState(facet_idx, first_child_type);
+    return true;
 }
 
 void TriangleSelector::garbage_collect()
@@ -1256,6 +1309,7 @@ void TriangleSelector::garbage_collect()
     m_invalid_triangles = 0;
     m_free_triangles_head = -1;
     m_free_vertices_head = -1;
+    NotifyIndexRebuild();
 }
 
 void TriangleSelector::remap_triangle_state(const EnforcerBlockerStateMap& state_map)
@@ -1263,15 +1317,24 @@ void TriangleSelector::remap_triangle_state(const EnforcerBlockerStateMap& state
     if (m_triangles.empty())
         return;
 
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, m_triangles.size()), [this, &state_map](const tbb::blocked_range<size_t>& range) {
+    std::atomic<bool> stateChanged(false);
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, m_triangles.size()),
+                      [this, &state_map, &stateChanged](const tbb::blocked_range<size_t>& range) {
         for (size_t i = range.begin(); i != range.end(); ++i) {
             Triangle& tr = m_triangles[i];
-            if (tr.valid()) {
-                const auto current_state = static_cast<size_t>(tr.get_state());
-                tr.set_state(state_map[current_state]);
+            if (tr.valid() && !tr.is_split()) {
+                const size_t currentState = static_cast<size_t>(tr.get_state());
+                const EnforcerBlockerType newState = state_map[currentState];
+                if (newState != tr.get_state()) {
+                    tr.set_state(newState);
+                    stateChanged.store(true, std::memory_order_relaxed);
+                }
             }
         }
     });
+
+    if (stateChanged.load(std::memory_order_relaxed))
+        NotifyAllStateMutation();
 }
 
 TriangleSelector::TriangleSelector(const TriangleMesh& mesh, float edge_limit)
@@ -1297,6 +1360,7 @@ void TriangleSelector::reset()
     }
     m_orig_size_vertices = int(m_vertices.size());
     m_orig_size_indices  = int(m_triangles.size());
+    NotifyFullReset();
 }
 
 void TriangleSelector::set_edge_limit(float edge_limit)
@@ -1873,6 +1937,8 @@ void TriangleSelector::deserialize(const TriangleSplittingData& data,
                 break;
         }
     }
+
+    NotifyFullReset();
 }
 
 void TriangleSelector::TriangleSplittingData::update_used_states(const size_t bitstream_start_idx) {
@@ -1987,9 +2053,11 @@ void TriangleSelector::seed_fill_unselect_all_triangles()
 
 void TriangleSelector::seed_fill_apply_on_triangles(EnforcerBlockerType new_state)
 {
-    for (Triangle &triangle : m_triangles)
+    for (size_t triangleIndex = 0; triangleIndex < m_triangles.size(); ++triangleIndex) {
+        Triangle& triangle = m_triangles[triangleIndex];
         if (!triangle.is_split() && triangle.is_selected_by_seed_fill())
-            triangle.set_state(new_state);
+            SetLeafState(static_cast<int>(triangleIndex), new_state);
+    }
 
     for (Triangle &triangle : m_triangles)
         if (triangle.is_split() && triangle.valid()) {

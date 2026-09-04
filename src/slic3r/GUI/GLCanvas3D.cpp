@@ -1558,6 +1558,12 @@ GLCanvas3D::GLCanvas3D(wxGLCanvas* canvas, Bed3D &bed)
 
 GLCanvas3D::~GLCanvas3D()
 {
+    const bool contextCurrent = m_canvas != nullptr && _set_current();
+    if (contextCurrent) {
+        m_gizmos.ReleasePainterGlResources();
+        wxGetApp().get_opengl_manager().FlushPendingBufferDeletes();
+    }
+
     const bool hasSelectionHighlightResources =
         m_selectionHighlightResources.fullResolutionMaskFramebuffer != 0 ||
         m_selectionHighlightResources.fullResolutionMaskTexture != 0 ||
@@ -1571,7 +1577,7 @@ GLCanvas3D::~GLCanvas3D()
         m_selectionHighlightResources.glowBlurPingPongTexture != 0 ||
         m_selectionHighlightResources.glowFramebuffer != 0 ||
         m_selectionHighlightResources.glowTexture != 0;
-    if (hasSelectionHighlightResources && m_canvas != nullptr && _set_current())
+    if (hasSelectionHighlightResources && contextCurrent)
         ReleaseSelectionHighlightResources();
 
     reset_volumes(ResetVolumesMode::CanvasDestruction);
@@ -2908,6 +2914,8 @@ void GLCanvas3D::render(bool only_init)
     // ensures this canvas is current and initialized
     if (!_is_shown_on_screen() || !_set_current() || !wxGetApp().init_opengl())
         return;
+
+    wxGetApp().get_opengl_manager().FlushPendingBufferDeletes();
 
     if (!is_initialized() && !init())
         return;

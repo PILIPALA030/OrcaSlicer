@@ -58,6 +58,15 @@ GLGizmosManager::GLGizmosManager(GLCanvas3D& parent)
     m_timer_set_color.Bind(wxEVT_TIMER, &GLGizmosManager::on_set_color_timer, this);
 }
 
+void GLGizmosManager::ReleasePainterGlResources()
+{
+    for (const std::unique_ptr<GLGizmoBase>& gizmo : m_gizmos) {
+        GLGizmoPainterBase* painter = dynamic_cast<GLGizmoPainterBase*>(gizmo.get());
+        if (painter != nullptr)
+            painter->ReleaseTriangleSelectorGlResources();
+    }
+}
+
 std::vector<size_t> GLGizmosManager::get_selectable_idxs() const
 {
     std::vector<size_t> out;

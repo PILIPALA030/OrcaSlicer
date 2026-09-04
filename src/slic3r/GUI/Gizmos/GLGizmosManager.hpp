@@ -254,6 +254,8 @@ public:
 
     bool is_dragging() const;
 
+    void ReleasePainterGlResources();
+
     //BBS
     void* get_icon_texture_id(MENU_ICON_NAME icon) {
         if (icon_list.find((int)icon) != icon_list.end())

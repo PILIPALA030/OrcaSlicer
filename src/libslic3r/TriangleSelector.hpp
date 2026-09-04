@@ -5,6 +5,7 @@
 
 
 #include <cfloat>
+#include <cstdint>
 #include "Point.hpp"
 #include "TriangleMesh.hpp"
 
@@ -299,6 +300,13 @@ public:
     // stay valid, a ptr to it is saved and used.
     explicit TriangleSelector(const TriangleMesh& mesh, float edge_limit = 0.6f);
 
+    uint64_t GetTopologyRevision() const noexcept { return m_topologyRevision; }
+    uint64_t GetTriangleIndexRevision() const noexcept { return m_triangleIndexRevision; }
+    uint64_t GetStateRevision() const noexcept { return m_stateRevision; }
+
+    // Changes a valid leaf state and emits a precise mutation notification.
+    bool SetLeafState(int triangleIndex, EnforcerBlockerType state);
+
     // Returns the facet_idx of the unsplit triangle containing the "hit". Returns -1 if the triangle isn't found.
     [[nodiscard]] int select_unsplit_triangle(const Vec3f &hit, int facet_idx) const;
     [[nodiscard]] int select_unsplit_triangle(const Vec3f &hit, int facet_idx, const Vec3i32 &neighbors) const;
@@ -375,6 +383,17 @@ public:
     void seed_fill_apply_on_triangles(EnforcerBlockerType new_state);
 
 protected:
+    enum class MutationKind : uint8_t
+    {
+        State,
+        Topology,
+        AllState,
+        IndexRebuild,
+        FullReset
+    };
+
+    virtual void OnSelectorMutation(MutationKind kind, int sourceTriangle) {}
+
     // Triangle and info about how it's split.
     class Triangle {
     public:
@@ -473,6 +492,10 @@ protected:
     int m_orig_size_vertices = 0;
     int m_orig_size_indices = 0;
 
+    uint64_t m_topologyRevision = 1;
+    uint64_t m_triangleIndexRevision = 1;
+    uint64_t m_stateRevision = 1;
+
     std::unique_ptr<Cursor> m_cursor;
     // Zero indicates an uninitialized state.
     float m_old_cursor_radius_sqr = 0;
@@ -483,7 +506,11 @@ private:
     bool select_triangle_recursive(int facet_idx, const Vec3i32 &neighbors, EnforcerBlockerType type, bool triangle_splitting);
     void undivide_triangle(int facet_idx);
     void split_triangle(int facet_idx, const Vec3i32 &neighbors);
-    void remove_useless_children(int facet_idx); // No hidden meaning. Triangles are meant.
+    bool remove_useless_children(int facet_idx); // No hidden meaning. Triangles are meant.
+    void NotifyTopologyMutation(int sourceTriangle);
+    void NotifyAllStateMutation();
+    void NotifyIndexRebuild();
+    void NotifyFullReset();
     bool is_facet_clipped(int facet_idx, const ClippingPlane &clp) const;
     int  push_triangle(int a, int b, int c, int source_triangle, EnforcerBlockerType state = EnforcerBlockerType{0});
     void perform_split(int facet_idx, const Vec3i32 &neighbors, EnforcerBlockerType old_state);

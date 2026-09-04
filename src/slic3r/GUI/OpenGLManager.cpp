@@ -15,6 +15,10 @@
 
 #include <wx/glcanvas.h>
 #include <wx/msgdlg.h>
+#include <wx/thread.h>
+
+#include <algorithm>
+#include <cassert>
 
 #ifdef __APPLE__
 // Part of hack to remove crash when closing the application on OSX 10.9.5 when building against newer wxWidgets
@@ -223,6 +227,7 @@ OpenGLManager::OSInfo OpenGLManager::s_os_info;
 
 OpenGLManager::~OpenGLManager()
 {
+    assert(m_pendingBufferDeletes.empty());
     m_shaders_manager.shutdown();
 
 #ifdef __APPLE__
@@ -329,6 +334,34 @@ wxGLContext* OpenGLManager::init_glcontext(wxGLCanvas& canvas)
 #endif //__APPLE__
     }
     return m_context;
+}
+
+void OpenGLManager::EnqueueBufferDeletes(std::vector<unsigned int>&& bufferIds)
+{
+    assert(wxIsMainThread());
+    size_t duplicateCount = 0;
+    for (unsigned int bufferId : bufferIds) {
+        if (bufferId == 0)
+            continue;
+        if (std::find(m_pendingBufferDeletes.begin(), m_pendingBufferDeletes.end(), bufferId) ==
+            m_pendingBufferDeletes.end()) {
+            m_pendingBufferDeletes.push_back(bufferId);
+        } else {
+            ++duplicateCount;
+        }
+    }
+    assert(duplicateCount == 0);
+}
+
+void OpenGLManager::FlushPendingBufferDeletes()
+{
+    assert(wxIsMainThread());
+    if (m_pendingBufferDeletes.empty())
+        return;
+
+    const size_t flushedCount = m_pendingBufferDeletes.size();
+    glsafe(::glDeleteBuffers(static_cast<GLsizei>(flushedCount), m_pendingBufferDeletes.data()));
+    m_pendingBufferDeletes.clear();
 }
 
 wxGLCanvas* OpenGLManager::create_wxglcanvas(wxWindow& parent)

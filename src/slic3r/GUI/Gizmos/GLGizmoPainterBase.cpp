@@ -13,10 +13,49 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 
 namespace Slic3r::GUI {
+
+namespace {
+
+constexpr size_t RENDER_CHUNK_ROOT_TARGET = 8192;
+constexpr size_t RENDER_CHUNK_BUILD_BATCH_SIZE = 4;
+constexpr size_t MAX_COLOR_UPLOAD_RANGES = 8;
+
+uint32_t ExpandMortonBits(uint32_t value)
+{
+    value &= 0x000003ffu;
+    value = (value | (value << 16)) & 0x030000ffu;
+    value = (value | (value << 8)) & 0x0300f00fu;
+    value = (value | (value << 4)) & 0x030c30c3u;
+    value = (value | (value << 2)) & 0x09249249u;
+    return value;
+}
+
+float NormalizeMortonCoordinate(float value, float minimum, float extent)
+{
+    if (extent <= EPSILON)
+        return 0.5f;
+
+    return std::clamp((value - minimum) / extent, 0.0f, 1.0f);
+}
+
+uint32_t CalculateMortonCode(const Vec3f& point, const Vec3f& minimum, const Vec3f& extent)
+{
+    const uint32_t x = static_cast<uint32_t>(NormalizeMortonCoordinate(point.x(), minimum.x(), extent.x()) * 1023.0f);
+    const uint32_t y = static_cast<uint32_t>(NormalizeMortonCoordinate(point.y(), minimum.y(), extent.y()) * 1023.0f);
+    const uint32_t z = static_cast<uint32_t>(NormalizeMortonCoordinate(point.z(), minimum.z(), extent.z()) * 1023.0f);
+    return ExpandMortonBits(x) | (ExpandMortonBits(y) << 1) | (ExpandMortonBits(z) << 2);
+}
+
+} // namespace
 
 std::shared_ptr<GLModel> GLGizmoPainterBase::s_sphere = nullptr;
 
@@ -29,8 +68,34 @@ GLGizmoPainterBase::GLGizmoPainterBase(GLCanvas3D& parent, const std::string& ic
 
 GLGizmoPainterBase::~GLGizmoPainterBase()
 {
+    DetachTriangleSelectorGlResources();
     if (s_sphere != nullptr)
         s_sphere.reset();
+}
+
+void GLGizmoPainterBase::DetachTriangleSelectorGlResources()
+{
+    std::vector<unsigned int> bufferIds;
+    for (const std::unique_ptr<TriangleSelectorGUI>& selector : m_triangle_selectors) {
+        TriangleSelectorPatch* patchSelector = dynamic_cast<TriangleSelectorPatch*>(selector.get());
+        if (patchSelector == nullptr)
+            continue;
+
+        std::vector<unsigned int> selectorIds = patchSelector->DetachGlResources();
+        bufferIds.insert(bufferIds.end(), selectorIds.begin(), selectorIds.end());
+    }
+
+    if (!bufferIds.empty())
+        wxGetApp().get_opengl_manager().EnqueueBufferDeletes(std::move(bufferIds));
+}
+
+void GLGizmoPainterBase::ReleaseTriangleSelectorGlResources()
+{
+    for (const std::unique_ptr<TriangleSelectorGUI>& selector : m_triangle_selectors) {
+        TriangleSelectorPatch* patchSelector = dynamic_cast<TriangleSelectorPatch*>(selector.get());
+        if (patchSelector != nullptr)
+            patchSelector->ReleaseGlResources();
+    }
 }
 
 void GLGizmoPainterBase::data_changed(bool is_serializing)
@@ -928,17 +993,26 @@ bool GLGizmoPainterBase::on_mouse(const wxMouseEvent &mouse_event)
 
     const Selection &selection = m_parent.get_selection();
     int selected_object_idx = selection.get_object_idx();
-    if (mouse_event.LeftDown()) {
+    if (mouse_event.LeftDown())
+    {
         if ((!control_down || grabber_contains_mouse) &&            
             gizmo_event(SLAGizmoEventType::LeftDown, mouse_pos, mouse_event.ShiftDown(), mouse_event.AltDown(), false))
+        {
             // the gizmo got the event and took some action, there is no need
             // to do anything more
+            m_parent.set_as_dirty();
             return true;
-    } else if (mouse_event.RightDown()){
+        }
+    }
+    else if (mouse_event.RightDown())
+    {
         if (!control_down && selected_object_idx != -1 &&
-            gizmo_event(SLAGizmoEventType::RightDown, mouse_pos, false, false, false)) 
+            gizmo_event(SLAGizmoEventType::RightDown, mouse_pos, false, false, false))
+        {
             // event was taken care of
+            m_parent.set_as_dirty();
             return true;
+        }
     } else if (mouse_event.Dragging()) {
         if (m_parent.get_move_volume_id() != -1)
             // don't allow dragging objects with the Sla gizmo on
@@ -1085,6 +1159,7 @@ void GLGizmoPainterBase::on_set_state()
         on_shutdown();
         m_old_mo_id = -1;
         //m_iva.release_geometry();
+        DetachTriangleSelectorGlResources();
         m_triangle_selectors.clear();
 
         //Camera& camera = wxGetApp().plater()->get_camera();
@@ -1150,6 +1225,7 @@ void TriangleSelectorGUI::render(ImGuiWrapper* imgui, const Transform3d& matrix)
     if (! shader)
         return;
     assert(shader->get_name() == "gouraud" || shader->get_name() == "mm_gouraud");
+    shader->set_uniform("use_vertex_color", false);
 
     for (auto iva : {std::make_pair(&m_iva_enforcers, enforcers_color),
                      std::make_pair(&m_iva_blockers, blockers_color)}) {
@@ -1247,13 +1323,197 @@ bool TrianglePatch::is_fragment() const
 
 float TriangleSelectorPatch::gap_area = TriangleSelectorPatch::GapAreaMin;
 
+TriangleSelectorPatch::TriangleSelectorPatch(const TriangleMesh& mesh, const std::vector<ColorRGBA> ebtColors,
+                                             float edgeLimit, bool useRenderChunks)
+    : TriangleSelectorGUI(mesh, edgeLimit)
+    , m_ebt_colors(ebtColors)
+    , m_useRenderChunks(useRenderChunks)
+{
+    if (m_useRenderChunks)
+        BuildRenderChunkLayout();
+}
+
+TriangleSelectorPatch::~TriangleSelectorPatch()
+{
+#ifndef NDEBUG
+    for (const RenderChunk& chunk : m_renderChunks) {
+        assert(chunk.geometryVbo == 0);
+        assert(chunk.colorVbo == 0);
+    }
+    assert(std::all_of(m_vertices_VBO_ids.begin(), m_vertices_VBO_ids.end(), [](unsigned int id) { return id == 0; }));
+    assert(std::all_of(m_triangle_indices_VBO_ids.begin(), m_triangle_indices_VBO_ids.end(), [](unsigned int id) { return id == 0; }));
+#endif
+}
+
+void TriangleSelectorPatch::set_ebt_colors(const std::vector<ColorRGBA> ebtColors)
+{
+    if (m_ebt_colors == ebtColors)
+        return;
+
+    m_ebt_colors = ebtColors;
+    m_allColorDirty = true;
+    m_update_render_data = true;
+    m_paint_changed = true;
+}
+
+void TriangleSelectorPatch::OnSelectorMutation(MutationKind kind, int sourceTriangle)
+{
+    switch (kind) {
+    case MutationKind::State:
+        if (sourceTriangle >= 0)
+            MarkRootDirty(static_cast<uint32_t>(sourceTriangle), DirtyLevel::State);
+        break;
+    case MutationKind::Topology:
+        if (sourceTriangle >= 0)
+            MarkRootDirty(static_cast<uint32_t>(sourceTriangle), DirtyLevel::Topology);
+        break;
+    case MutationKind::AllState:
+        m_allColorDirty = true;
+        break;
+    case MutationKind::IndexRebuild:
+        break;
+    case MutationKind::FullReset:
+        MarkAllChunksTopologyDirty();
+        break;
+    }
+
+    m_update_render_data = true;
+    m_paint_changed = true;
+}
+
+void TriangleSelectorPatch::BuildRenderChunkLayout()
+{
+    m_renderChunks.clear();
+    m_sourceToChunk.assign(static_cast<size_t>(m_orig_size_indices), 0);
+    m_rootDrawInfo.assign(static_cast<size_t>(m_orig_size_indices), RootDrawInfo());
+    m_rootDirty.assign(static_cast<size_t>(m_orig_size_indices), DirtyLevel::Clean);
+    m_dirtyRoots.clear();
+    m_dirtyChunks.clear();
+    m_renderChunksInitialized = false;
+    m_update_render_data = true;
+    m_paint_changed = true;
+
+    if (m_orig_size_indices <= 0 || m_mesh.its.vertices.empty()) {
+        m_chunkInDirtyList.clear();
+        return;
+    }
+
+    Vec3f minimum = m_mesh.its.vertices.front();
+    Vec3f maximum = minimum;
+    for (const stl_vertex& vertex : m_mesh.its.vertices) {
+        minimum = minimum.cwiseMin(vertex);
+        maximum = maximum.cwiseMax(vertex);
+    }
+    const Vec3f extent = maximum - minimum;
+
+    std::vector<std::pair<uint32_t, uint32_t>> sortedRoots;
+    sortedRoots.reserve(static_cast<size_t>(m_orig_size_indices));
+    for (int source = 0; source < m_orig_size_indices; ++source) {
+        const stl_triangle_vertex_indices& indices = m_mesh.its.indices[static_cast<size_t>(source)];
+        const Vec3f centroid = (m_mesh.its.vertices[indices[0]] + m_mesh.its.vertices[indices[1]] +
+                                m_mesh.its.vertices[indices[2]]) / 3.0f;
+        sortedRoots.emplace_back(CalculateMortonCode(centroid, minimum, extent), static_cast<uint32_t>(source));
+    }
+
+    std::sort(sortedRoots.begin(), sortedRoots.end(), [](const std::pair<uint32_t, uint32_t>& left,
+                                                         const std::pair<uint32_t, uint32_t>& right) {
+        return left.first != right.first ? left.first < right.first : left.second < right.second;
+    });
+
+    const size_t chunkCount = (sortedRoots.size() + RENDER_CHUNK_ROOT_TARGET - 1) / RENDER_CHUNK_ROOT_TARGET;
+    m_renderChunks.resize(chunkCount);
+    for (size_t sortedIndex = 0; sortedIndex < sortedRoots.size(); ++sortedIndex) {
+        const uint32_t source = sortedRoots[sortedIndex].second;
+        const uint32_t chunkId = static_cast<uint32_t>(sortedIndex / RENDER_CHUNK_ROOT_TARGET);
+        m_renderChunks[chunkId].sourceRoots.push_back(source);
+        m_sourceToChunk[source] = chunkId;
+    }
+
+    m_chunkInDirtyList.assign(chunkCount, 0);
+    MarkAllChunksTopologyDirty();
+}
+
+std::optional<ColorRGBA> TriangleSelectorPatch::FinalRenderColorForState(EnforcerBlockerType state) const
+{
+    const int colorIndex = static_cast<int>(state);
+    if (colorIndex < 0 || static_cast<size_t>(colorIndex) >= m_ebt_colors.size())
+        return std::nullopt;
+
+    return adjust_color_for_rendering(m_ebt_colors[static_cast<size_t>(colorIndex)]);
+}
+
+void TriangleSelectorPatch::AppendTriangleColor(std::vector<uint8_t>& colors, EnforcerBlockerType state) const
+{
+    const std::optional<ColorRGBA> color = FinalRenderColorForState(state);
+    const std::array<uint8_t, 4> rgba = color.has_value() ?
+        std::array<uint8_t, 4>{color->r_uchar(), color->g_uchar(), color->b_uchar(), color->a_uchar()} :
+        std::array<uint8_t, 4>{0, 0, 0, 0};
+
+    for (size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex)
+        colors.insert(colors.end(), rgba.begin(), rgba.end());
+
+}
+
+void TriangleSelectorPatch::AppendTriangleLeaves(int triangleIndex, bool showWireframe, ChunkBuildResult& result) const
+{
+    if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
+        return;
+
+    const Triangle& triangle = m_triangles[triangleIndex];
+    if (!triangle.valid())
+        return;
+
+    if (triangle.is_split()) {
+        for (int childIndex = 0; childIndex <= triangle.number_of_split_sides(); ++childIndex)
+            AppendTriangleLeaves(triangle.children[childIndex], showWireframe, result);
+        return;
+    }
+
+    for (size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex) {
+        const Vec3f& vertex = m_vertices[triangle.verts_idxs[vertexIndex]].v;
+        result.geometryStaging.push_back(vertex.x());
+        result.geometryStaging.push_back(vertex.y());
+        result.geometryStaging.push_back(vertex.z());
+        if (showWireframe) {
+            result.geometryStaging.push_back(vertexIndex == 0 ? 1.0f : 0.0f);
+            result.geometryStaging.push_back(vertexIndex == 1 ? 1.0f : 0.0f);
+            result.geometryStaging.push_back(vertexIndex == 2 ? 1.0f : 0.0f);
+        }
+    }
+
+    AppendTriangleColor(result.colorsRgba, triangle.get_state());
+    result.vertexCount += 3;
+}
+
+TriangleSelectorPatch::ChunkBuildResult TriangleSelectorPatch::BuildChunkCpu(uint32_t chunkId, bool showWireframe) const
+{
+    ChunkBuildResult result;
+    if (chunkId >= m_renderChunks.size())
+        return result;
+
+    const RenderChunk& chunk = m_renderChunks[chunkId];
+    const size_t floatsPerVertex = showWireframe ? 6 : 3;
+    result.geometryStaging.reserve(chunk.sourceRoots.size() * 3 * floatsPerVertex);
+    result.colorsRgba.reserve(chunk.sourceRoots.size() * 3 * 4);
+    result.rootDrawInfos.reserve(chunk.sourceRoots.size());
+
+    for (uint32_t source : chunk.sourceRoots) {
+        RootDrawInfo drawInfo;
+        drawInfo.firstVertex = result.vertexCount;
+        AppendTriangleLeaves(static_cast<int>(source), showWireframe, result);
+        drawInfo.vertexCount = result.vertexCount - drawInfo.firstVertex;
+        result.rootDrawInfos.push_back(drawInfo);
+    }
+
+    return result;
+}
+
 void TriangleSelectorPatch::render(ImGuiWrapper* imgui, const Transform3d& matrix)
 {
-    static bool last_show_wireframe = false;
-    if (last_show_wireframe != wxGetApp().plater()->is_show_wireframe()) {
-        last_show_wireframe  = wxGetApp().plater()->is_show_wireframe();
+    const bool showWireframe = m_need_wireframe && wxGetApp().plater()->is_wireframe_enabled() &&
+                               wxGetApp().plater()->is_show_wireframe();
+    if (m_lastShowWireframe != showWireframe) {
         m_update_render_data = true;
-        m_paint_changed      = true;
     }
     if (m_update_render_data) {
         update_render_data();
@@ -1264,41 +1524,35 @@ void TriangleSelectorPatch::render(ImGuiWrapper* imgui, const Transform3d& matri
     if (!shader)
         return;
     assert(shader->get_name() == "gouraud" || shader->get_name() == "mm_gouraud");
-    bool  show_wireframe = false;
-    if (wxGetApp().plater()->is_wireframe_enabled()) {
-        if (m_need_wireframe && wxGetApp().plater()->is_show_wireframe()) {
-            //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", show_wireframe on");
-            shader->set_uniform("show_wireframe", true);
-            show_wireframe = true;
-        }
-        else {
-            //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", show_wireframe off");
-            shader->set_uniform("show_wireframe", false);
-        }
-    }
+    shader->set_uniform("show_wireframe", showWireframe);
 
-    for (size_t buffer_idx = 0; buffer_idx < m_triangle_patches.size(); ++buffer_idx) {
-        if (this->has_VBOs(buffer_idx)) {
-            const TrianglePatch& patch = m_triangle_patches[buffer_idx];
-            ColorRGBA color;
-            if (patch.is_fragment() && !patch.neighbor_types.empty()) {
-                size_t color_idx = (size_t)*patch.neighbor_types.begin();
-                if (color_idx >= m_ebt_colors.size())
-                    continue;
-                color = m_ebt_colors[color_idx];
-                color.a(0.85);
+    if (m_filter_state || !m_useRenderChunks) {
+        shader->set_uniform("use_vertex_color", false);
+        for (size_t bufferIndex = 0; bufferIndex < m_triangle_patches.size(); ++bufferIndex) {
+            if (this->has_VBOs(bufferIndex)) {
+                const TrianglePatch& patch = m_triangle_patches[bufferIndex];
+                ColorRGBA color;
+                if (patch.is_fragment() && !patch.neighbor_types.empty()) {
+                    size_t color_idx = (size_t)*patch.neighbor_types.begin();
+                    if (color_idx >= m_ebt_colors.size())
+                        continue;
+                    color = m_ebt_colors[color_idx];
+                    color.a(0.85);
+                }
+                else {
+                    size_t color_idx = (size_t)patch.type;
+                    if (color_idx >= m_ebt_colors.size())
+                        continue;
+                    color = m_ebt_colors[color_idx];
+                }
+                //to make black not too hard too see
+                ColorRGBA new_color = adjust_color_for_rendering(color);
+                shader->set_uniform("uniform_color", new_color);
+                this->render(static_cast<int>(bufferIndex), showWireframe);
             }
-            else {
-                size_t color_idx = (size_t)patch.type;
-                if (color_idx >= m_ebt_colors.size())
-                    continue;
-                color = m_ebt_colors[color_idx];
-            }
-            //to make black not too hard too see
-            ColorRGBA new_color = adjust_color_for_rendering(color);
-            shader->set_uniform("uniform_color", new_color);
-            this->render(buffer_idx, show_wireframe);
         }
+    } else {
+        RenderChunks(showWireframe);
     }
 
     render_paint_contour(matrix);
@@ -1364,7 +1618,7 @@ void TriangleSelectorPatch::update_selector_triangles()
 
         EnforcerBlockerType type = *patch.neighbor_types.begin();
         for (int facet_idx : patch.facet_indices) {
-            m_triangles[facet_idx].set_state(type);
+            SetLeafState(facet_idx, type);
         }
     }
 }
@@ -1496,16 +1750,29 @@ void TriangleSelectorPatch::set_filter_state(bool is_filter_state)
     if (!m_filter_state && is_filter_state) {
         m_filter_state = is_filter_state;
         this->release_geometry();
+        m_paint_changed = true;
         update_render_data();
     }
 
+    if (m_filter_state && !is_filter_state)
+        this->release_geometry();
+
     m_filter_state = is_filter_state;
+    m_update_render_data = true;
 }
 
 void TriangleSelectorPatch::update_render_data()
 {
-    //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", m_paint_changed=%1%, m_triangle_patches.size %2%")%m_paint_changed%m_triangle_patches.size();
-    if (m_paint_changed || (m_triangle_patches.size() == 0)) {
+    const bool showWireframe = m_need_wireframe && wxGetApp().plater()->is_wireframe_enabled() &&
+                               wxGetApp().plater()->is_show_wireframe();
+    if (m_useRenderChunks && !m_filter_state) {
+        UpdateRenderChunks(showWireframe);
+        m_paint_changed = false;
+        update_paint_contour();
+        return;
+    }
+
+    if (m_paint_changed || m_triangle_patches.empty()) {
         this->release_geometry();
 
         /*m_patch_vertices.reserve(m_vertices.size() * 3);
@@ -1527,7 +1794,333 @@ void TriangleSelectorPatch::update_render_data()
 
     //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", before paint_contour");
     update_paint_contour();
-    //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", exit");
+}
+
+void TriangleSelectorPatch::EnsureVboCapacity(unsigned int target, unsigned int& vboId, size_t& capacityBytes,
+                                              size_t requiredBytes, unsigned int usage)
+{
+    if (requiredBytes == 0)
+        return;
+
+    if (vboId == 0)
+        glsafe(::glGenBuffers(1, &vboId));
+
+    glsafe(::glBindBuffer(static_cast<GLenum>(target), vboId));
+    if (requiredBytes > capacityBytes) {
+        const size_t grownCapacity = capacityBytes == 0 ? requiredBytes : capacityBytes + capacityBytes / 2;
+        capacityBytes = std::max(requiredBytes, grownCapacity);
+        glsafe(::glBufferData(static_cast<GLenum>(target), static_cast<GLsizeiptr>(capacityBytes), nullptr,
+                              static_cast<GLenum>(usage)));
+    }
+}
+
+void TriangleSelectorPatch::UploadChunk(uint32_t chunkId, ChunkBuildResult&& result)
+{
+    if (chunkId >= m_renderChunks.size())
+        return;
+
+    RenderChunk& chunk = m_renderChunks[chunkId];
+    if (result.rootDrawInfos.size() != chunk.sourceRoots.size())
+        return;
+
+    for (size_t rootIndex = 0; rootIndex < chunk.sourceRoots.size(); ++rootIndex)
+        m_rootDrawInfo[chunk.sourceRoots[rootIndex]] = result.rootDrawInfos[rootIndex];
+
+    chunk.vertexCount = result.vertexCount;
+    chunk.colorsRgba = std::move(result.colorsRgba);
+
+    const size_t geometryBytes = result.geometryStaging.size() * sizeof(float);
+    EnsureVboCapacity(GL_ARRAY_BUFFER, chunk.geometryVbo, chunk.geometryCapacityBytes, geometryBytes, GL_DYNAMIC_DRAW);
+    if (geometryBytes > 0) {
+        glsafe(::glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(geometryBytes), result.geometryStaging.data()));
+    }
+
+    const size_t colorBytes = chunk.colorsRgba.size() * sizeof(uint8_t);
+    EnsureVboCapacity(GL_ARRAY_BUFFER, chunk.colorVbo, chunk.colorCapacityBytes, colorBytes, GL_DYNAMIC_DRAW);
+    if (colorBytes > 0) {
+        glsafe(::glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(colorBytes), chunk.colorsRgba.data()));
+    }
+
+    glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
+}
+
+void TriangleSelectorPatch::MarkRootDirty(uint32_t source, DirtyLevel level)
+{
+    if (source >= m_rootDirty.size() || level == DirtyLevel::Clean)
+        return;
+
+    DirtyLevel& current = m_rootDirty[source];
+    if (current == DirtyLevel::Clean)
+        m_dirtyRoots.push_back(source);
+
+    if (static_cast<uint8_t>(level) > static_cast<uint8_t>(current))
+        current = level;
+}
+
+void TriangleSelectorPatch::MarkAllChunksTopologyDirty()
+{
+    for (uint32_t chunkId = 0; chunkId < m_renderChunks.size(); ++chunkId) {
+        RenderChunk& chunk = m_renderChunks[chunkId];
+        chunk.dirty = DirtyLevel::Topology;
+        if (m_chunkInDirtyList[chunkId] == 0) {
+            m_chunkInDirtyList[chunkId] = 1;
+            m_dirtyChunks.push_back(chunkId);
+        }
+    }
+}
+
+void TriangleSelectorPatch::AggregateDirtyRoots()
+{
+    for (uint32_t source : m_dirtyRoots) {
+        if (source >= m_sourceToChunk.size())
+            continue;
+
+        const uint32_t chunkId = m_sourceToChunk[source];
+        if (chunkId >= m_renderChunks.size())
+            continue;
+
+        RenderChunk& chunk = m_renderChunks[chunkId];
+        const DirtyLevel rootLevel = m_rootDirty[source];
+        if (static_cast<uint8_t>(rootLevel) > static_cast<uint8_t>(chunk.dirty))
+            chunk.dirty = rootLevel;
+        if (rootLevel == DirtyLevel::State)
+            chunk.stateDirtyRoots.push_back(source);
+        if (m_chunkInDirtyList[chunkId] == 0) {
+            m_chunkInDirtyList[chunkId] = 1;
+            m_dirtyChunks.push_back(chunkId);
+        }
+    }
+}
+
+void TriangleSelectorPatch::RewriteTriangleColors(int triangleIndex, RenderChunk& chunk, uint32_t& vertexOffset) const
+{
+    if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
+        return;
+
+    const Triangle& triangle = m_triangles[triangleIndex];
+    if (!triangle.valid())
+        return;
+
+    if (triangle.is_split()) {
+        for (int childIndex = 0; childIndex <= triangle.number_of_split_sides(); ++childIndex)
+            RewriteTriangleColors(triangle.children[childIndex], chunk, vertexOffset);
+        return;
+    }
+
+    const std::optional<ColorRGBA> color = FinalRenderColorForState(triangle.get_state());
+    const std::array<uint8_t, 4> rgba = color.has_value() ?
+        std::array<uint8_t, 4>{color->r_uchar(), color->g_uchar(), color->b_uchar(), color->a_uchar()} :
+        std::array<uint8_t, 4>{0, 0, 0, 0};
+    for (size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex) {
+        const size_t byteOffset = static_cast<size_t>(vertexOffset) * 4;
+        if (byteOffset + rgba.size() > chunk.colorsRgba.size())
+            return;
+        std::copy(rgba.begin(), rgba.end(), chunk.colorsRgba.begin() + byteOffset);
+        ++vertexOffset;
+    }
+}
+
+void TriangleSelectorPatch::RewriteRootColors(uint32_t source)
+{
+    if (source >= m_sourceToChunk.size() || source >= m_rootDrawInfo.size())
+        return;
+
+    const uint32_t chunkId = m_sourceToChunk[source];
+    if (chunkId >= m_renderChunks.size())
+        return;
+
+    RenderChunk& chunk = m_renderChunks[chunkId];
+    const RootDrawInfo& drawInfo = m_rootDrawInfo[source];
+    uint32_t vertexOffset = drawInfo.firstVertex;
+    RewriteTriangleColors(static_cast<int>(source), chunk, vertexOffset);
+    assert(vertexOffset == drawInfo.firstVertex + drawInfo.vertexCount);
+    chunk.dirtyColorRanges.push_back({drawInfo.firstVertex, drawInfo.firstVertex + drawInfo.vertexCount});
+}
+
+void TriangleSelectorPatch::RewriteChunkColors(uint32_t chunkId)
+{
+    if (chunkId >= m_renderChunks.size())
+        return;
+
+    RenderChunk& chunk = m_renderChunks[chunkId];
+    chunk.colorsRgba.assign(static_cast<size_t>(chunk.vertexCount) * 4, 0);
+    for (uint32_t source : chunk.sourceRoots) {
+        const RootDrawInfo& drawInfo = m_rootDrawInfo[source];
+        uint32_t vertexOffset = drawInfo.firstVertex;
+        RewriteTriangleColors(static_cast<int>(source), chunk, vertexOffset);
+        assert(vertexOffset == drawInfo.firstVertex + drawInfo.vertexCount);
+    }
+    chunk.dirtyColorRanges.push_back({0, chunk.vertexCount});
+}
+
+void TriangleSelectorPatch::MergeDirtyRanges(RenderChunk& chunk) const
+{
+    if (chunk.dirtyColorRanges.size() < 2)
+        return;
+
+    std::sort(chunk.dirtyColorRanges.begin(), chunk.dirtyColorRanges.end(), [](const DirtyRange& left,
+                                                                               const DirtyRange& right) {
+        return left.beginVertex < right.beginVertex;
+    });
+
+    size_t outputIndex = 0;
+    for (size_t inputIndex = 1; inputIndex < chunk.dirtyColorRanges.size(); ++inputIndex) {
+        DirtyRange& output = chunk.dirtyColorRanges[outputIndex];
+        const DirtyRange& input = chunk.dirtyColorRanges[inputIndex];
+        if (input.beginVertex <= output.endVertex) {
+            output.endVertex = std::max(output.endVertex, input.endVertex);
+        } else {
+            ++outputIndex;
+            chunk.dirtyColorRanges[outputIndex] = input;
+        }
+    }
+    chunk.dirtyColorRanges.resize(outputIndex + 1);
+}
+
+void TriangleSelectorPatch::UploadColorAdaptive(uint32_t chunkId, ColorUploadReason reason)
+{
+    if (chunkId >= m_renderChunks.size())
+        return;
+
+    RenderChunk& chunk = m_renderChunks[chunkId];
+    if (chunk.colorsRgba.empty() || chunk.dirtyColorRanges.empty())
+        return;
+
+    MergeDirtyRanges(chunk);
+    size_t dirtyBytes = 0;
+    for (const DirtyRange& range : chunk.dirtyColorRanges)
+        dirtyBytes += static_cast<size_t>(range.endVertex - range.beginVertex) * 4;
+
+    const size_t totalBytes = chunk.colorsRgba.size();
+    EnsureVboCapacity(GL_ARRAY_BUFFER, chunk.colorVbo, chunk.colorCapacityBytes, totalBytes, GL_DYNAMIC_DRAW);
+    if (reason == ColorUploadReason::AllColor || chunk.dirtyColorRanges.size() > MAX_COLOR_UPLOAD_RANGES ||
+        dirtyBytes * 2 >= totalBytes) {
+        glsafe(::glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(totalBytes), chunk.colorsRgba.data()));
+    } else {
+        assert(reason == ColorUploadReason::State);
+        for (const DirtyRange& range : chunk.dirtyColorRanges) {
+            const size_t byteOffset = static_cast<size_t>(range.beginVertex) * 4;
+            const size_t byteSize = static_cast<size_t>(range.endVertex - range.beginVertex) * 4;
+            glsafe(::glBufferSubData(GL_ARRAY_BUFFER, static_cast<GLintptr>(byteOffset), static_cast<GLsizeiptr>(byteSize),
+                                   chunk.colorsRgba.data() + byteOffset));
+        }
+    }
+    glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
+}
+
+void TriangleSelectorPatch::ClearRenderDirtyState()
+{
+    for (uint32_t source : m_dirtyRoots) {
+        if (source < m_rootDirty.size())
+            m_rootDirty[source] = DirtyLevel::Clean;
+    }
+    for (RenderChunk& chunk : m_renderChunks) {
+        chunk.dirty = DirtyLevel::Clean;
+        chunk.stateDirtyRoots.clear();
+        chunk.dirtyColorRanges.clear();
+    }
+    std::fill(m_chunkInDirtyList.begin(), m_chunkInDirtyList.end(), 0);
+    m_dirtyRoots.clear();
+    m_dirtyChunks.clear();
+    m_allColorDirty = false;
+}
+
+void TriangleSelectorPatch::UpdateRenderChunks(bool showWireframe)
+{
+    if (m_lastShowWireframe != showWireframe && m_renderChunksInitialized)
+        MarkAllChunksTopologyDirty();
+    m_lastShowWireframe = showWireframe;
+
+    if (!m_renderChunksInitialized) {
+        for (size_t batchBegin = 0; batchBegin < m_renderChunks.size(); batchBegin += RENDER_CHUNK_BUILD_BATCH_SIZE) {
+            const size_t batchEnd = std::min(batchBegin + RENDER_CHUNK_BUILD_BATCH_SIZE, m_renderChunks.size());
+            std::vector<ChunkBuildResult> results(batchEnd - batchBegin);
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, results.size()), [&](const tbb::blocked_range<size_t>& range) {
+                for (size_t resultIndex = range.begin(); resultIndex != range.end(); ++resultIndex)
+                    results[resultIndex] = BuildChunkCpu(static_cast<uint32_t>(batchBegin + resultIndex), showWireframe);
+            });
+            for (size_t resultIndex = 0; resultIndex < results.size(); ++resultIndex)
+                UploadChunk(static_cast<uint32_t>(batchBegin + resultIndex), std::move(results[resultIndex]));
+        }
+        m_renderChunksInitialized = true;
+        ClearRenderDirtyState();
+        return;
+    }
+
+    AggregateDirtyRoots();
+    if (m_allColorDirty) {
+        for (uint32_t chunkId = 0; chunkId < m_renderChunks.size(); ++chunkId) {
+            RenderChunk& chunk = m_renderChunks[chunkId];
+            if (chunk.dirty == DirtyLevel::Topology) {
+                UploadChunk(chunkId, BuildChunkCpu(chunkId, showWireframe));
+            } else {
+                RewriteChunkColors(chunkId);
+                UploadColorAdaptive(chunkId, ColorUploadReason::AllColor);
+            }
+        }
+    } else {
+        for (uint32_t chunkId : m_dirtyChunks) {
+            RenderChunk& chunk = m_renderChunks[chunkId];
+            if (chunk.dirty == DirtyLevel::Topology) {
+                UploadChunk(chunkId, BuildChunkCpu(chunkId, showWireframe));
+                continue;
+            }
+            for (uint32_t source : chunk.stateDirtyRoots)
+                RewriteRootColors(source);
+            UploadColorAdaptive(chunkId, ColorUploadReason::State);
+        }
+    }
+    ClearRenderDirtyState();
+}
+
+void TriangleSelectorPatch::RenderChunks(bool showWireframe)
+{
+    GLShaderProgram* shader = wxGetApp().get_current_shader();
+    if (shader == nullptr)
+        return;
+
+    shader->set_uniform("use_vertex_color", true);
+    const GLint positionId = shader->get_attrib_location("v_position");
+    const GLint barycentricId = shader->get_attrib_location("v_barycentric");
+    const GLint colorId = shader->get_attrib_location("v_color");
+    const GLsizei geometryStride = static_cast<GLsizei>((showWireframe ? 6 : 3) * sizeof(float));
+
+    for (const RenderChunk& chunk : m_renderChunks) {
+        if (chunk.vertexCount == 0 || chunk.geometryVbo == 0 || chunk.colorVbo == 0)
+            continue;
+
+        glsafe(::glBindBuffer(GL_ARRAY_BUFFER, chunk.geometryVbo));
+        if (positionId != -1) {
+            glsafe(::glVertexAttribPointer(positionId, 3, GL_FLOAT, GL_FALSE, geometryStride, nullptr));
+            glsafe(::glEnableVertexAttribArray(positionId));
+        }
+        if (barycentricId != -1) {
+            if (showWireframe) {
+                glsafe(::glVertexAttribPointer(barycentricId, 3, GL_FLOAT, GL_FALSE, geometryStride,
+                                               reinterpret_cast<const void*>(3 * sizeof(float))));
+                glsafe(::glEnableVertexAttribArray(barycentricId));
+            } else {
+                glsafe(::glDisableVertexAttribArray(barycentricId));
+                glsafe(::glVertexAttrib3f(barycentricId, 1.0f, 1.0f, 1.0f));
+            }
+        }
+
+        glsafe(::glBindBuffer(GL_ARRAY_BUFFER, chunk.colorVbo));
+        if (colorId != -1) {
+            glsafe(::glVertexAttribPointer(colorId, 4, GL_UNSIGNED_BYTE, GL_TRUE, 4 * sizeof(uint8_t), nullptr));
+            glsafe(::glEnableVertexAttribArray(colorId));
+        }
+
+        glsafe(::glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(chunk.vertexCount)));
+        if (positionId != -1)
+            glsafe(::glDisableVertexAttribArray(positionId));
+        if (barycentricId != -1 && showWireframe)
+            glsafe(::glDisableVertexAttribArray(barycentricId));
+        if (colorId != -1)
+            glsafe(::glDisableVertexAttribArray(colorId));
+    }
+    glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
+    shader->set_uniform("use_vertex_color", false);
 }
 
 void TriangleSelectorPatch::render(int triangle_indices_idx, bool show_wireframe)
@@ -1578,6 +2171,61 @@ void TriangleSelectorPatch::render(int triangle_indices_idx, bool show_wireframe
         glsafe(::glDisableVertexAttribArray(barycentric_id));
 
     glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
+}
+
+void TriangleSelectorPatch::ReleaseRenderChunks()
+{
+    for (RenderChunk& chunk : m_renderChunks) {
+        if (chunk.geometryVbo != 0) {
+            glsafe(::glDeleteBuffers(1, &chunk.geometryVbo));
+        }
+        if (chunk.colorVbo != 0) {
+            glsafe(::glDeleteBuffers(1, &chunk.colorVbo));
+        }
+        chunk.geometryVbo = 0;
+        chunk.colorVbo = 0;
+        chunk.geometryCapacityBytes = 0;
+        chunk.colorCapacityBytes = 0;
+    }
+    m_renderChunksInitialized = false;
+    m_update_render_data = true;
+}
+
+void TriangleSelectorPatch::ReleaseGlResources()
+{
+    ReleaseRenderChunks();
+    release_geometry();
+}
+
+std::vector<unsigned int> TriangleSelectorPatch::DetachGlResources()
+{
+    std::vector<unsigned int> bufferIds;
+    bufferIds.reserve(m_renderChunks.size() * 2 + m_vertices_VBO_ids.size() + m_triangle_indices_VBO_ids.size());
+    for (RenderChunk& chunk : m_renderChunks) {
+        if (chunk.geometryVbo != 0)
+            bufferIds.push_back(chunk.geometryVbo);
+        if (chunk.colorVbo != 0)
+            bufferIds.push_back(chunk.colorVbo);
+        chunk.geometryVbo = 0;
+        chunk.colorVbo = 0;
+        chunk.geometryCapacityBytes = 0;
+        chunk.colorCapacityBytes = 0;
+    }
+    for (unsigned int& vboId : m_vertices_VBO_ids) {
+        if (vboId != 0)
+            bufferIds.push_back(vboId);
+        vboId = 0;
+    }
+    for (unsigned int& vboId : m_triangle_indices_VBO_ids) {
+        if (vboId != 0)
+            bufferIds.push_back(vboId);
+        vboId = 0;
+    }
+    m_renderChunksInitialized = false;
+    m_update_render_data = true;
+    m_paint_changed = true;
+    clear();
+    return bufferIds;
 }
 
 void TriangleSelectorPatch::release_geometry()

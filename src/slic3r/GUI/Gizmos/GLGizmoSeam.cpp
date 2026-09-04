@@ -350,6 +350,7 @@ void GLGizmoSeam::update_from_model_object(bool first_update)
     wxBusyCursor wait;
 
     const ModelObject* mo = m_c->selection_info()->model_object();
+    DetachTriangleSelectorGlResources();
     m_triangle_selectors.clear();
 
     int volume_id = -1;

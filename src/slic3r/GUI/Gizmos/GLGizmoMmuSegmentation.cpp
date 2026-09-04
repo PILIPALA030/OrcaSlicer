@@ -1007,6 +1007,7 @@ void GLGizmoMmuSegmentation::update_model_object()
 void GLGizmoMmuSegmentation::init_model_triangle_selectors()
 {
     const ModelObject *mo = m_c->selection_info()->model_object();
+    DetachTriangleSelectorGlResources();
     m_triangle_selectors.clear();
     m_volumes_extruder_idxs.clear();
 
@@ -1030,7 +1031,8 @@ void GLGizmoMmuSegmentation::init_model_triangle_selectors()
 
         // This mesh does not account for the possible Z up SLA offset.
         const TriangleMesh* mesh = &mv->mesh();
-        m_triangle_selectors.emplace_back(std::make_unique<TriangleSelectorPatch>(*mesh, ebt_colors, 0.2));
+        m_triangle_selectors.emplace_back(
+            std::make_unique<TriangleSelectorPatch>(*mesh, ebt_colors, 0.2, true));
         // Reset of TriangleSelector is done inside TriangleSelectorMmGUI's constructor, so we don't need it to perform it again in deserialize().
         EnforcerBlockerType max_ebt = (EnforcerBlockerType)std::min(m_extruders_colors.size(), (size_t)EnforcerBlockerType::ExtruderMax);
         m_triangle_selectors.back()->deserialize(mv->mmu_segmentation_facets.get_data(), false, max_ebt);

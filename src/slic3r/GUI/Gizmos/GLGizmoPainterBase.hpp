@@ -13,6 +13,8 @@
 #include <GL/glew.h>
 
 #include <memory>
+#include <cstdint>
+#include <optional>
 
 
 namespace Slic3r::GUI {
@@ -99,9 +101,9 @@ struct TrianglePatch {
 
 class TriangleSelectorPatch : public TriangleSelectorGUI {
 public:
-    explicit TriangleSelectorPatch(const TriangleMesh& mesh, const std::vector<ColorRGBA> ebt_colors, float edge_limit = 0.6f)
-        : TriangleSelectorGUI(mesh, edge_limit), m_ebt_colors(ebt_colors) {}
-    virtual ~TriangleSelectorPatch() = default;
+    explicit TriangleSelectorPatch(const TriangleMesh& mesh, const std::vector<ColorRGBA> ebtColors,
+                                   float edgeLimit = 0.6f, bool useRenderChunks = false);
+    ~TriangleSelectorPatch() override;
 
     // Render current selection. Transformation matrices are supposed
     // to be already set.
@@ -112,8 +114,12 @@ public:
     void update_selector_triangles();
     void update_triangles_per_patch();
 
-    void set_ebt_colors(const std::vector<ColorRGBA> ebt_colors) { m_ebt_colors = ebt_colors; }
+    void set_ebt_colors(const std::vector<ColorRGBA> ebtColors);
     void set_filter_state(bool is_filter_state);
+
+    void ReleaseRenderChunks();
+    void ReleaseGlResources();
+    std::vector<unsigned int> DetachGlResources();
 
     constexpr static float GapAreaMin = 0.f;
     constexpr static float GapAreaMax = 5.f;
@@ -131,6 +137,8 @@ protected:
     // Finalize the initialization of the indices, upload the indices to OpenGL VBO objects
     // and possibly releasing it if it has been loaded into the VBOs.
     void finalize_triangle_indices();
+
+    void OnSelectorMutation(MutationKind kind, int sourceTriangle) override;
 
     void clear()
     {
@@ -171,8 +179,86 @@ protected:
     bool                        m_filter_state = false;
 
 private:
+    enum class DirtyLevel : uint8_t
+    {
+        Clean,
+        State,
+        Topology
+    };
+
+    struct DirtyRange
+    {
+        uint32_t beginVertex = 0;
+        uint32_t endVertex = 0;
+    };
+
+    struct RootDrawInfo
+    {
+        uint32_t firstVertex = 0;
+        uint32_t vertexCount = 0;
+    };
+
+    struct RenderChunk
+    {
+        std::vector<uint32_t> sourceRoots;
+        std::vector<uint8_t> colorsRgba;
+        unsigned int geometryVbo = 0;
+        unsigned int colorVbo = 0;
+        size_t geometryCapacityBytes = 0;
+        size_t colorCapacityBytes = 0;
+        uint32_t vertexCount = 0;
+        DirtyLevel dirty = DirtyLevel::Clean;
+        std::vector<uint32_t> stateDirtyRoots;
+        std::vector<DirtyRange> dirtyColorRanges;
+    };
+
+    struct ChunkBuildResult
+    {
+        std::vector<float> geometryStaging;
+        std::vector<uint8_t> colorsRgba;
+        std::vector<RootDrawInfo> rootDrawInfos;
+        uint32_t vertexCount = 0;
+    };
+
+    enum class ColorUploadReason : uint8_t
+    {
+        AllColor,
+        State
+    };
+
     void update_render_data();
     void render(int buffer_idx, bool show_wireframe=false);
+    void BuildRenderChunkLayout();
+    void UpdateRenderChunks(bool showWireframe);
+    ChunkBuildResult BuildChunkCpu(uint32_t chunkId, bool showWireframe) const;
+    void AppendTriangleLeaves(int triangleIndex, bool showWireframe, ChunkBuildResult& result) const;
+    void UploadChunk(uint32_t chunkId, ChunkBuildResult&& result);
+    void EnsureVboCapacity(unsigned int target, unsigned int& vboId, size_t& capacityBytes, size_t requiredBytes,
+                           unsigned int usage);
+    void RenderChunks(bool showWireframe);
+    void MarkRootDirty(uint32_t source, DirtyLevel level);
+    void MarkAllChunksTopologyDirty();
+    void AggregateDirtyRoots();
+    void RewriteChunkColors(uint32_t chunkId);
+    void RewriteRootColors(uint32_t source);
+    void RewriteTriangleColors(int triangleIndex, RenderChunk& chunk, uint32_t& vertexOffset) const;
+    void MergeDirtyRanges(RenderChunk& chunk) const;
+    void UploadColorAdaptive(uint32_t chunkId, ColorUploadReason reason);
+    void ClearRenderDirtyState();
+    std::optional<ColorRGBA> FinalRenderColorForState(EnforcerBlockerType state) const;
+    void AppendTriangleColor(std::vector<uint8_t>& colors, EnforcerBlockerType state) const;
+
+    std::vector<RenderChunk> m_renderChunks;
+    std::vector<uint32_t> m_sourceToChunk;
+    std::vector<RootDrawInfo> m_rootDrawInfo;
+    std::vector<DirtyLevel> m_rootDirty;
+    std::vector<uint32_t> m_dirtyRoots;
+    std::vector<uint8_t> m_chunkInDirtyList;
+    std::vector<uint32_t> m_dirtyChunks;
+    bool m_renderChunksInitialized = false;
+    bool m_useRenderChunks = false;
+    bool m_allColorDirty = false;
+    bool m_lastShowWireframe = false;
 };
 
 
@@ -206,6 +292,9 @@ public:
     virtual const float get_cursor_height_min() const { return CursorHeightMin; }
     virtual const float get_cursor_height_max() const { return CursorHeightMax; }
     virtual const float get_cursor_height_step() const { return CursorHeightStep; }
+
+    void ReleaseTriangleSelectorGlResources();
+    void DetachTriangleSelectorGlResources();
 
     /// <summary>
     /// Implement when want to process mouse events in gizmo
