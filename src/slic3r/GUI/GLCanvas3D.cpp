@@ -9114,9 +9114,9 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
                             shader->set_uniform("show_wireframe", false);
                     }*/
                     //BBS:add assemble view related logic
-                    // do not cull backfaces to show broken geometry, if any
+                    // Cull back faces while rendering Volumes to reduce fragment processing.
                 const Camera& camera = wxGetApp().plater()->get_camera();
-                    m_volumes.render(type, m_picking_enabled, camera, [this, canvas_type](const GLVolume& volume) {
+                    m_volumes.render(type, false, camera, [this, canvas_type](const GLVolume& volume) {
                         if (canvas_type == ECanvasType::CanvasAssembleView) {
                             return !volume.is_modifier && !volume.is_wipe_tower;
                         }
@@ -9476,13 +9476,13 @@ bool GLCanvas3D::_render_volumes_for_picking(const Camera& camera) const
     if (shader == nullptr)
         return false;
 
-    // do not cull backfaces to show broken geometry, if any
+    // Cull back faces to reduce the Picking FBO geometry workload.
     const GLboolean cullFaceEnabled = glIsEnabled(GL_CULL_FACE);
-    Slic3r::ScopeGuard restoreCullFace([cullFaceEnabled]() 
+    Slic3r::ScopeGuard restoreCullFace([cullFaceEnabled]()
     {
         RestoreCapability(GL_CULL_FACE, cullFaceEnabled);
     });
-    glsafe(::glDisable(GL_CULL_FACE));
+    glsafe(::glEnable(GL_CULL_FACE));
 
     const Transform3d& view_matrix = camera.get_view_matrix();
     shader->start_using();

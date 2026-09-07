@@ -363,9 +363,9 @@ public:
     // LOD mesh simplification (async, uses quadric edge collapse)
     bool SimplifyMesh(const TriangleMesh& mesh, std::shared_ptr<GUI::GLModel> model, std::shared_ptr<std::atomic<bool>> readyFlag, LODLevel lod) const;
     bool SimplifyMesh(const indexed_triangle_set& its, std::shared_ptr<GUI::GLModel> model, std::shared_ptr<std::atomic<bool>> readyFlag, LODLevel lod) const;
-    // Main-thread handoff: enable rendering of LOD models whose background
-    // initialization has completed (see SimplifyMesh). Call once per frame.
-    void promote_ready_lod_models();
+    // Main-thread handoff: enable LOD models whose background initialization has completed.
+    // Returns true when the model used by the current LOD level changes.
+    bool promote_ready_lod_models();
 
     void                set_bounding_boxes_as_dirty();
 
@@ -502,13 +502,13 @@ public:
     GLVolume* new_nontoolpath_volume(const ColorRGBA& rgba);
 
     int get_selection_support_threshold_angle(bool&) const;
-    // Render the volumes by OpenGL.
-    void render(ERenderType                           type,
-                 bool                                  disable_cullface,
-                 const GUI::Camera&                    camera,
-                 std::function<bool(const GLVolume &)> filter_func   = std::function<bool(const GLVolume &)>(),
-                 bool                                  partly_inside_enable =true
-           ) const;
+    // Render the volumes by OpenGL. Returns true when the active LOD state changes.
+    bool render(ERenderType                           type,
+                bool                                  disable_cullface,
+                const GUI::Camera&                    camera,
+                std::function<bool(const GLVolume &)> filter_func   = std::function<bool(const GLVolume &)>(),
+                bool                                  partly_inside_enable =true
+          ) const;
 
     // Clear the geometry. Volumes are unregistered from the LOD sharing map
     // (release_volume) before being deleted.
