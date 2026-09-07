@@ -1546,6 +1546,7 @@ GLCanvas3D::GLCanvas3D(wxGLCanvas* canvas, Bed3D &bed)
     , m_initialized(false)
     , m_apply_zoom_to_volumes_filter(false)
     , m_picking_enabled(false)
+    , m_pickingBufferDirty(true)
     , m_moving_enabled(false)
     , m_dynamic_background_enabled(false)
     , m_multisample_allowed(false)
@@ -2392,6 +2393,7 @@ void GLCanvas3D::reset_volumes(ResetVolumesMode mode)
         m_selection.clear();
     m_volumes.clear();
     m_dirty = true;
+    InvalidatePickingBuffer();
 
     if (mode == ResetVolumesMode::CanvasDestruction)
         return;
@@ -2447,6 +2449,7 @@ ModelInstanceEPrintVolumeState GLCanvas3D::check_volumes_outside_state() const
 
 void GLCanvas3D::toggle_selected_volume_visibility(bool selected_visible)
 {
+    InvalidatePickingBuffer();
     m_render_sla_auxiliaries = !selected_visible;
     if (selected_visible) {
         const Selection::IndicesList &idxs = m_selection.get_volume_idxs();
@@ -2480,6 +2483,7 @@ void GLCanvas3D::toggle_sla_auxiliaries_visibility(bool visible, const ModelObje
         return;
 
     m_render_sla_auxiliaries = visible;
+    InvalidatePickingBuffer();
 
     std::vector<std::shared_ptr<SceneRaycasterItem>>* raycasters = get_raycasters_for_picking(SceneRaycaster::EType::Volume);
 
@@ -2500,6 +2504,7 @@ void GLCanvas3D::toggle_sla_auxiliaries_visibility(bool visible, const ModelObje
 
 void GLCanvas3D::toggle_model_objects_visibility(bool visible, const ModelObject* mo, int instance_idx, const ModelVolume* mv)
 {
+    InvalidatePickingBuffer();
     std::vector<std::shared_ptr<SceneRaycasterItem>>* raycasters = get_raycasters_for_picking(SceneRaycaster::EType::Volume);
     for (GLVolume* vol : m_volumes.volumes) {
         // BBS: add partplate logic
@@ -2623,6 +2628,7 @@ void GLCanvas3D::set_color_by(const std::string& value)
 void GLCanvas3D::refresh_camera_scene_box()
 {
     wxGetApp().plater()->get_camera().set_scene_box(scene_bounding_box());
+    InvalidatePickingBuffer();
 }
 
 BoundingBoxf3 GLCanvas3D::volumes_bounding_box(bool current_plate_only) const
@@ -2736,6 +2742,8 @@ void GLCanvas3D::enable_legend_texture(bool enable)
 
 void GLCanvas3D::enable_picking(bool enable)
 {
+    if (m_picking_enabled != enable)
+        InvalidatePickingBuffer();
     m_picking_enabled = enable;
 
     // Orca: invalidate hover state when dragging is toggled, otherwise if we turned off dragging
@@ -2872,6 +2880,7 @@ void GLCanvas3D::ZoomToFit()
 void GLCanvas3D::select_view(const std::string& direction)
 {
     wxGetApp().plater()->get_camera().select_view(direction);
+    InvalidatePickingBuffer();
     if (m_canvas != nullptr)
         m_canvas->Refresh();
 }
@@ -2990,16 +2999,26 @@ void GLCanvas3D::render(bool only_init)
     camera.apply_projection(_max_bounding_box(true, true, true));
     camera.UpdateFrustum();
     UpdateVolumeClippingState();
+    for (GLVolume* volume : m_volumes.volumes)
+    {
+        if (volume != nullptr && volume->promote_ready_lod_models())
+            InvalidatePickingBuffer();
+    }
 
     const bool isRectanglePicking = m_rectangle_selection.is_dragging();
     const bool isRegularPicking = !m_mouse.dragging && m_mouse.position != Vec2d(DBL_MAX, DBL_MAX) && !m_gizmos.is_dragging();
     const bool isGpuPointPicking = ENABLE_GPU_VOLUME_PICKING != 0 && isRegularPicking;
     const bool shouldRenderPickingBuffer = m_picking_enabled && (isRectanglePicking || isGpuPointPicking);
+    const bool pickingBufferSizeChanged = !m_pickingBuffer.IsReady() || m_pickingBuffer.GetWidth() != camera.get_viewport()[2] ||
+                                          m_pickingBuffer.GetHeight() != camera.get_viewport()[3];
+    const bool shouldUpdatePickingBuffer = shouldRenderPickingBuffer && (m_pickingBufferDirty || pickingBufferSizeChanged);
 
-    // Keep the picking buffer synchronized on frames that consume it.
-    if (shouldRenderPickingBuffer && !RenderPickingBuffer(camera) && m_pickingBuffer.IsReady())
+    if (shouldUpdatePickingBuffer)
     {
-        m_pickingBuffer.Reset();
+        const bool rendered = RenderPickingBuffer(camera);
+        if (!rendered && m_pickingBuffer.IsReady())
+            m_pickingBuffer.Reset();
+        m_pickingBufferDirty = !rendered;
     }
 
     wxGetApp().imgui()->new_frame();
@@ -3428,6 +3447,8 @@ void GLCanvas3D::ensure_on_bed(unsigned int object_idx, bool allow_negative_z)
         if (it != instances_min_z.end())
             volume->set_instance_offset(Z, volume->get_instance_offset(Z) - it->second);
     }
+    if (!instances_min_z.empty())
+        InvalidatePickingBuffer();
 }
 
 
@@ -3449,6 +3470,7 @@ void GLCanvas3D::set_gcode_options_visibility_from_flags(unsigned int flags)
 void GLCanvas3D::set_volumes_z_range(const std::array<double, 2>& range)
 {
     m_volumes.set_range(range[0] - 1e-6, range[1] + 1e-6);
+    InvalidatePickingBuffer();
 }
 
 std::vector<int> GLCanvas3D::load_object(const ModelObject& model_object, int obj_idx, std::vector<int> instance_idxs, bool lodEnabled)
@@ -3458,7 +3480,11 @@ std::vector<int> GLCanvas3D::load_object(const ModelObject& model_object, int ob
             instance_idxs.emplace_back(i);
         }
     }
-    return m_volumes.load_object(&model_object, obj_idx, instance_idxs, m_color_by, m_initialized, true, lodEnabled);
+    const std::vector<int> loadedVolumeIndices =
+        m_volumes.load_object(&model_object, obj_idx, instance_idxs, m_color_by, m_initialized, true, lodEnabled);
+    if (!loadedVolumeIndices.empty())
+        InvalidatePickingBuffer();
+    return loadedVolumeIndices;
 }
 
 std::vector<int> GLCanvas3D::load_object(const Model& model, int obj_idx, bool lodEnabled)
@@ -3498,6 +3524,7 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
     if (!m_initialized)
         return;
 
+    InvalidatePickingBuffer();
     _set_current();
 
     m_hover_volume_idxs.clear();
@@ -4241,6 +4268,7 @@ void GLCanvas3D::unbind_event_handlers()
 void GLCanvas3D::on_size(wxSizeEvent& evt)
 {
     m_dirty = true;
+    InvalidatePickingBuffer();
 }
 
 void GLCanvas3D::on_idle(wxIdleEvent& evt)
@@ -4256,6 +4284,8 @@ void GLCanvas3D::on_idle(wxIdleEvent& evt)
     m_dirty |= wxGetApp().plater()->get_collapse_toolbar().update_items_state();
     _update_imgui_select_plate_toolbar();
     bool mouse3d_controller_applied = wxGetApp().plater()->get_mouse3d_controller().apply(wxGetApp().plater()->get_camera());
+    if (mouse3d_controller_applied)
+        InvalidatePickingBuffer();
     m_dirty |= mouse3d_controller_applied;
     m_dirty |= wxGetApp().plater()->get_notification_manager()->update_notifications(*this);
     auto gizmo = wxGetApp().plater()->get_view3D_canvas3D()->get_gizmos_manager().get_current();
@@ -4715,6 +4745,7 @@ void GLCanvas3D::on_key(wxKeyEvent& evt)
             trafo_type.set_relative();
             m_selection.translate(displacement, trafo_type);
             m_dirty = true;
+            InvalidatePickingBuffer();
         }
     );}
 
@@ -4860,6 +4891,7 @@ void GLCanvas3D::on_key(wxKeyEvent& evt)
                         m_selection.setup_cache();
                         m_selection.rotate(Vec3d(0.0, 0.0, angle_z_rad), TransformationType(TransformationType::World_Relative_Joint));
                         m_dirty = true;
+                        InvalidatePickingBuffer();
 //                        wxGetApp().obj_manipul()->set_dirty();
                     };
 
@@ -5009,6 +5041,7 @@ void GLCanvas3D::on_mouse_wheel(wxMouseEvent& evt)
                     volume->set_bounding_boxes_as_dirty();
                 }
                 GLVolume::explosion_ratio = m_explosion_ratio;
+                InvalidatePickingBuffer();
             }
         }
         return;
@@ -5175,6 +5208,7 @@ void GLCanvas3D::on_gesture(wxGestureEvent &evt)
         camera.auto_type(Camera::EType::Perspective);
     }
     m_dirty = true;
+    InvalidatePickingBuffer();
 }
 
 void GLCanvas3D::on_mouse(wxMouseEvent& evt)
@@ -5520,6 +5554,7 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
                 TransformationType trafo_type;
                 trafo_type.set_relative();
                 m_selection.translate(cur_pos - m_mouse.drag.start_position_3D, trafo_type);
+                InvalidatePickingBuffer();
                 if (current_printer_technology() == ptFFF && (fff_print()->config().print_sequence == PrintSequence::ByObject))
                     update_sequential_clearance();
                 // BBS
@@ -5615,6 +5650,7 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
 
                 camera.auto_type(Camera::EType::Perspective);
                 m_dirty = true;
+                InvalidatePickingBuffer();
                 m_mouse.ignore_right_up = true;  // will be reset on button up event even if not right button is pressed
             }
 
@@ -5640,6 +5676,7 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
 
                 camera.set_target(camera.get_target() + orig - cur_pos);
                 m_dirty = true;
+                InvalidatePickingBuffer();
                 m_mouse.ignore_right_up = true;  // will be reset on button up event even if not right button is pressed
             }
 
@@ -6001,6 +6038,7 @@ void GLCanvas3D::do_move(const std::string& snapshot_type)
     wxGetApp().plater()->notify_filament_usage_changed();
 
     m_dirty = true;
+    InvalidatePickingBuffer();
 }
 
 void GLCanvas3D::do_rotate(const std::string& snapshot_type)
@@ -6095,6 +6133,7 @@ void GLCanvas3D::do_rotate(const std::string& snapshot_type)
         post_event(SimpleEvent(EVT_GLCANVAS_INSTANCE_ROTATED));
 
     m_dirty = true;
+    InvalidatePickingBuffer();
 }
 
 void GLCanvas3D::do_scale(const std::string& snapshot_type)
@@ -6180,6 +6219,7 @@ void GLCanvas3D::do_scale(const std::string& snapshot_type)
         post_event(SimpleEvent(EVT_GLCANVAS_INSTANCE_SCALED));
 
     m_dirty = true;
+    InvalidatePickingBuffer();
 }
 
 void GLCanvas3D::do_center()
@@ -6188,6 +6228,7 @@ void GLCanvas3D::do_center()
         return;
 
     m_selection.center();
+    InvalidatePickingBuffer();
 }
 
 void GLCanvas3D::do_drop()
@@ -6196,6 +6237,7 @@ void GLCanvas3D::do_drop()
         return;
 
     m_selection.drop();
+    InvalidatePickingBuffer();
 }
 
 void GLCanvas3D::do_center_plate(const int plate_idx) {
@@ -6203,6 +6245,7 @@ void GLCanvas3D::do_center_plate(const int plate_idx) {
         return;
 
     m_selection.center_plate(plate_idx);
+    InvalidatePickingBuffer();
 }
 
 void GLCanvas3D::do_mirror(const std::string& snapshot_type)
@@ -6287,6 +6330,7 @@ void GLCanvas3D::do_mirror(const std::string& snapshot_type)
     post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
 
     m_dirty = true;
+    InvalidatePickingBuffer();
 }
 
 void GLCanvas3D::update_gizmos_on_off_state()
@@ -7070,6 +7114,7 @@ void GLCanvas3D::_render_3d_navigator()
             }
         }
 
+        InvalidatePickingBuffer();
         request_extra_frame();
     }
 
@@ -8122,12 +8167,14 @@ void GLCanvas3D::_zoom_to_box(const BoundingBoxf3& box, double margin_factor)
 {
     wxGetApp().plater()->get_camera().zoom_to_box(box, margin_factor);
     m_dirty = true;
+    InvalidatePickingBuffer();
 }
 
 void GLCanvas3D::_update_camera_zoom(double zoom)
 {
     wxGetApp().plater()->get_camera().update_zoom(zoom);
     m_dirty = true;
+    InvalidatePickingBuffer();
 }
 
 void GLCanvas3D::_refresh_if_shown_on_screen()
@@ -8142,8 +8189,15 @@ void GLCanvas3D::_refresh_if_shown_on_screen()
     }
 }
 
+void GLCanvas3D::InvalidatePickingBuffer()
+{
+    m_pickingBufferDirty = true;
+}
+
 void GLCanvas3D::UpdateVolumeClippingState()
 {
+    const std::array<float, 2> previousZRange = m_volumes.get_z_range();
+    const std::array<double, 4> previousClippingPlane = m_volumes.get_clipping_plane();
     m_camera_clipping_plane = m_gizmos.get_clipping_plane();
 
     if (m_use_clipping_planes) {
@@ -8160,6 +8214,9 @@ void GLCanvas3D::UpdateVolumeClippingState()
     } else {
         m_volumes.set_clipping_plane(m_camera_clipping_plane.get_data());
     }
+
+    if (previousZRange != m_volumes.get_z_range() || previousClippingPlane != m_volumes.get_clipping_plane())
+        InvalidatePickingBuffer();
 }
 
 bool GLCanvas3D::RenderPickingBuffer(const Camera& camera)
@@ -9100,10 +9157,12 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
                 if (m_picking_enabled && m_layers_editing.is_enabled() && (m_layers_editing.last_object_id != -1) && (m_layers_editing.object_max_z() > 0.0f)) {
                     int object_id = m_layers_editing.last_object_id;
                 const Camera& camera = wxGetApp().plater()->get_camera();
-                m_volumes.render(type, false, camera, [object_id](const GLVolume& volume) {
+                const bool lodStateChanged = m_volumes.render(type, false, camera, [object_id](const GLVolume& volume) {
                     // Which volume to paint without the layer height profile shader?
                     return volume.is_active && (volume.is_modifier || volume.composite_id.object_id != object_id);
                     });
+                    if (lodStateChanged)
+                        InvalidatePickingBuffer();
                     m_layers_editing.render_volumes(*this, m_volumes);
                 }
                 else {
@@ -9116,7 +9175,8 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
                     //BBS:add assemble view related logic
                     // Cull back faces while rendering Volumes to reduce fragment processing.
                 const Camera& camera = wxGetApp().plater()->get_camera();
-                    m_volumes.render(type, false, camera, [this, canvas_type](const GLVolume& volume) {
+                    const bool lodStateChanged = m_volumes.render(type, false, camera,
+                        [this, canvas_type](const GLVolume& volume) {
                         if (canvas_type == ECanvasType::CanvasAssembleView) {
                             return !volume.is_modifier && !volume.is_wipe_tower;
                         }
@@ -9125,6 +9185,8 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
                         }
                         },
                         partly_inside_enable);
+                    if (lodStateChanged)
+                        InvalidatePickingBuffer();
                 }
             }
             else {
@@ -9151,7 +9213,7 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
             }*/
             const Camera& camera = wxGetApp().plater()->get_camera();
             //BBS:add assemble view related logic
-            m_volumes.render(type, false, camera, [canvas_type](const GLVolume& volume) {
+            const bool lodStateChanged = m_volumes.render(type, false, camera, [canvas_type](const GLVolume& volume) {
                 if (canvas_type == ECanvasType::CanvasAssembleView) {
                     return !volume.is_modifier;
                 }
@@ -9160,6 +9222,8 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
                 }
                 },
                 partly_inside_enable);
+            if (lodStateChanged)
+                InvalidatePickingBuffer();
             if (m_canvas_type == CanvasAssembleView && m_gizmos.m_assemble_view_data->model_objects_clipper()->get_position() > 0) {
                 const GLGizmosManager& gm = get_gizmos_manager();
                 shader->stop_using();
@@ -10436,6 +10500,7 @@ void GLCanvas3D::_render_assemble_control()
             volume->set_bounding_boxes_as_dirty();
         }
         GLVolume::explosion_ratio = m_explosion_ratio;
+        InvalidatePickingBuffer();
     }
 }
 void GLCanvas3D::_render_assemble_info() const

@@ -640,6 +640,8 @@ private:
     bool m_enable_render { true };
     bool m_apply_zoom_to_volumes_filter;
     bool m_picking_enabled;
+    // Invalidated by viewport, camera, pickable Volume, clipping, or active LOD changes.
+    bool m_pickingBufferDirty;
     bool m_moving_enabled;
     bool m_dynamic_background_enabled;
     bool m_multisample_allowed;
@@ -794,7 +796,7 @@ public:
     bool is_initialized() const { return m_initialized; }
 
     void set_context(wxGLContext* context) { m_context = context; }
-    void set_type(ECanvasType type) { m_canvas_type = type; }
+    void set_type(ECanvasType type) { if (m_canvas_type != type) m_pickingBufferDirty = true; m_canvas_type = type; }
     ECanvasType get_canvas_type() { return m_canvas_type; }
 
     wxGLCanvas* get_wxglcanvas() { return m_canvas; }
@@ -823,7 +825,7 @@ public:
     }
 
     float get_explosion_ratio() { return m_explosion_ratio; }
-    void reset_explosion_ratio() { m_explosion_ratio = 1.0; }
+    void reset_explosion_ratio() { if (m_explosion_ratio != 1.0f) m_pickingBufferDirty = true; m_explosion_ratio = 1.0f; }
     void on_change_color_mode(bool is_dark, bool reinit = true);
     const bool get_dark_mode_status() { return m_is_dark; }
     void set_as_dirty();
@@ -878,10 +880,11 @@ public:
         {
             m_clipping_planes[id] = plane;
             m_sla_caps[id].reset();
+            m_pickingBufferDirty = true;
         }
     }
     void reset_clipping_planes_cache() { m_sla_caps[0].triangles.clear(); m_sla_caps[1].triangles.clear(); }
-    void set_use_clipping_planes(bool use) { m_use_clipping_planes = use; }
+    void set_use_clipping_planes(bool use) { m_pickingBufferDirty = true; m_use_clipping_planes = use; }
 
     bool                                get_use_clipping_planes() const { return m_use_clipping_planes; }
     const std::array<ClippingPlane, 2> &get_clipping_planes() const { return m_clipping_planes; };
@@ -1313,6 +1316,7 @@ private:
     void _refresh_if_shown_on_screen();
 
     void UpdateVolumeClippingState();
+    void InvalidatePickingBuffer();
     bool RenderPickingBuffer(const Camera& camera);
     VolumePickResult QueryVolumeFromPickingBuffer(const Vec2d& screenPosition, const Camera& camera, int toleranceRadiusPx);
     PickingPassResult QueryHybridPickingHit(const Vec2d& screenPosition, const Camera& camera, const ClippingPlane& clippingPlane,
