@@ -67,6 +67,15 @@ void GLGizmosManager::ReleasePainterGlResources()
     }
 }
 
+void GLGizmosManager::DetachPainterGlResources()
+{
+    for (const std::unique_ptr<GLGizmoBase>& gizmo : m_gizmos) {
+        GLGizmoPainterBase* painter = dynamic_cast<GLGizmoPainterBase*>(gizmo.get());
+        if (painter != nullptr)
+            painter->DetachTriangleSelectorGlResources();
+    }
+}
+
 std::vector<size_t> GLGizmosManager::get_selectable_idxs() const
 {
     std::vector<size_t> out;

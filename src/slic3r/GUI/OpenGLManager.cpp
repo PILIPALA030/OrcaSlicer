@@ -227,8 +227,14 @@ OpenGLManager::OSInfo OpenGLManager::s_os_info;
 
 OpenGLManager::~OpenGLManager()
 {
-    assert(m_pendingBufferDeletes.empty());
     m_shaders_manager.shutdown();
+
+    if (!m_pendingBufferDeletes.empty()) {
+        // No compatible canvas remains. The driver releases these buffers with the final shared context.
+        BOOST_LOG_TRIVIAL(warning) << m_pendingBufferDeletes.size()
+                                   << " pending buffer IDs will be released with the final OpenGL context";
+        m_pendingBufferDeletes.clear();
+    }
 
 #ifdef __APPLE__
     // This is an ugly hack needed to solve the crash happening when closing the application on OSX 10.9.5 with newer wxWidgets

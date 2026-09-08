@@ -1558,11 +1558,9 @@ GLCanvas3D::GLCanvas3D(wxGLCanvas* canvas, Bed3D &bed)
 
 GLCanvas3D::~GLCanvas3D()
 {
-    const bool contextCurrent = m_canvas != nullptr && _set_current();
-    if (contextCurrent) {
-        m_gizmos.ReleasePainterGlResources();
-        wxGetApp().get_opengl_manager().FlushPendingBufferDeletes();
-    }
+    const bool contextCurrent = ReleasePainterGlResources();
+    if (!contextCurrent)
+        m_gizmos.DetachPainterGlResources();
 
     const bool hasSelectionHighlightResources =
         m_selectionHighlightResources.fullResolutionMaskFramebuffer != 0 ||
@@ -1584,6 +1582,16 @@ GLCanvas3D::~GLCanvas3D()
 
     m_sel_plate_toolbar.del_all_item();
     m_sel_plate_toolbar.del_stats_item();
+}
+
+bool GLCanvas3D::ReleasePainterGlResources()
+{
+    if (m_canvas == nullptr || !_set_current())
+        return false;
+
+    m_gizmos.ReleasePainterGlResources();
+    wxGetApp().get_opengl_manager().FlushPendingBufferDeletes();
+    return true;
 }
 
 void GLCanvas3D::post_event(wxEvent &&event)
