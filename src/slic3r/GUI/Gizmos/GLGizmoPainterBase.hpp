@@ -36,7 +36,7 @@ class TriangleSelectorGUI : public TriangleSelector {
 public:
     explicit TriangleSelectorGUI(const TriangleMesh& mesh, float edge_limit = 0.6f)
         : TriangleSelector(mesh, edge_limit) {}
-    virtual ~TriangleSelectorGUI() = default;
+    virtual ~TriangleSelectorGUI();
 
     virtual void render(ImGuiWrapper* imgui, const Transform3d& matrix);
     //void         render(const Transform3d& matrix) { this->render(nullptr, matrix); }
@@ -79,6 +79,13 @@ private:
 
 protected:
     GLModel                      m_paint_contour;
+
+    /** Releases every GLModel owned by the selector. A compatible context must be current. */
+    void ReleaseOwnedGlResources();
+    /** Detaches every owned buffer ID without issuing OpenGL calls. */
+    void DetachOwnedGlResources(std::vector<unsigned int>& bufferIds);
+    /** Returns whether any selector-owned GLModel still owns a GPU buffer. */
+    bool HasOwnedGlResources() const;
 
     void update_paint_contour();
     void render_paint_contour(const Transform3d& matrix);
@@ -258,7 +265,8 @@ private:
     bool m_renderChunksInitialized = false;
     bool m_useRenderChunks = false;
     bool m_allColorDirty = false;
-    bool m_lastShowWireframe = false;
+    std::optional<bool> _renderChunkWireframeLayout;
+    std::optional<bool> _legacyWireframeLayout;
 };
 
 

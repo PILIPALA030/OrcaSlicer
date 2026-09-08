@@ -1204,6 +1204,54 @@ TriangleSelector::ClippingPlane GLGizmoPainterBase::get_clipping_plane_in_volume
 ColorRGBA TriangleSelectorGUI::enforcers_color = {0.5f, 1.f, 0.5f, 1.f};
 ColorRGBA TriangleSelectorGUI::blockers_color  = {1.f, 0.5f, 0.5f, 1.f};
 
+TriangleSelectorGUI::~TriangleSelectorGUI()
+{
+#ifndef NDEBUG
+    assert(!HasOwnedGlResources());
+#endif
+}
+
+void TriangleSelectorGUI::ReleaseOwnedGlResources()
+{
+    m_iva_enforcers.reset();
+    m_iva_blockers.reset();
+    for (GLModel& seedFill : m_iva_seed_fills)
+        seedFill.reset();
+#ifdef PRUSASLICER_TRIANGLE_SELECTOR_DEBUG
+    for (GLModel& model : m_varrays)
+        model.reset();
+#endif
+    m_paint_contour.reset();
+}
+
+void TriangleSelectorGUI::DetachOwnedGlResources(std::vector<unsigned int>& bufferIds)
+{
+    m_iva_enforcers.DetachGpuBuffers(bufferIds);
+    m_iva_blockers.DetachGpuBuffers(bufferIds);
+    for (GLModel& seedFill : m_iva_seed_fills)
+        seedFill.DetachGpuBuffers(bufferIds);
+#ifdef PRUSASLICER_TRIANGLE_SELECTOR_DEBUG
+    for (GLModel& model : m_varrays)
+        model.DetachGpuBuffers(bufferIds);
+#endif
+    m_paint_contour.DetachGpuBuffers(bufferIds);
+}
+
+bool TriangleSelectorGUI::HasOwnedGlResources() const
+{
+    if (m_iva_enforcers.HasGpuBuffers() || m_iva_blockers.HasGpuBuffers() || m_paint_contour.HasGpuBuffers())
+        return true;
+    if (std::any_of(m_iva_seed_fills.begin(), m_iva_seed_fills.end(),
+                    [](const GLModel& model) { return model.HasGpuBuffers(); }))
+        return true;
+#ifdef PRUSASLICER_TRIANGLE_SELECTOR_DEBUG
+    if (std::any_of(m_varrays.begin(), m_varrays.end(),
+                    [](const GLModel& model) { return model.HasGpuBuffers(); }))
+        return true;
+#endif
+    return false;
+}
+
 ColorRGBA TriangleSelectorGUI::get_seed_fill_color(const ColorRGBA& base_color)
 {
     // BBS
@@ -1342,6 +1390,7 @@ TriangleSelectorPatch::~TriangleSelectorPatch()
     }
     assert(std::all_of(m_vertices_VBO_ids.begin(), m_vertices_VBO_ids.end(), [](unsigned int id) { return id == 0; }));
     assert(std::all_of(m_triangle_indices_VBO_ids.begin(), m_triangle_indices_VBO_ids.end(), [](unsigned int id) { return id == 0; }));
+    assert(!HasOwnedGlResources());
 #endif
 }
 
@@ -1390,6 +1439,7 @@ void TriangleSelectorPatch::BuildRenderChunkLayout()
     m_dirtyRoots.clear();
     m_dirtyChunks.clear();
     m_renderChunksInitialized = false;
+    _renderChunkWireframeLayout.reset();
     m_update_render_data = true;
     m_paint_changed = true;
 
@@ -1512,7 +1562,13 @@ void TriangleSelectorPatch::render(ImGuiWrapper* imgui, const Transform3d& matri
 {
     const bool showWireframe = m_need_wireframe && wxGetApp().plater()->is_wireframe_enabled() &&
                                wxGetApp().plater()->is_show_wireframe();
-    if (m_lastShowWireframe != showWireframe) {
+    const bool useLegacyRenderer = m_filter_state || !m_useRenderChunks;
+    if (useLegacyRenderer &&
+        (!_legacyWireframeLayout.has_value() || *_legacyWireframeLayout != showWireframe)) {
+        m_update_render_data = true;
+        m_paint_changed = true;
+    } else if (!useLegacyRenderer &&
+               (!_renderChunkWireframeLayout.has_value() || *_renderChunkWireframeLayout != showWireframe)) {
         m_update_render_data = true;
     }
     if (m_update_render_data) {
@@ -1789,6 +1845,7 @@ void TriangleSelectorPatch::update_render_data()
             update_triangles_per_type();
         this->finalize_triangle_indices();
 
+        _legacyWireframeLayout = showWireframe;
         m_paint_changed = false;
     }
 
@@ -2027,9 +2084,10 @@ void TriangleSelectorPatch::ClearRenderDirtyState()
 
 void TriangleSelectorPatch::UpdateRenderChunks(bool showWireframe)
 {
-    if (m_lastShowWireframe != showWireframe && m_renderChunksInitialized)
+    const bool wireframeLayoutChanged = !_renderChunkWireframeLayout.has_value() ||
+                                        *_renderChunkWireframeLayout != showWireframe;
+    if (wireframeLayoutChanged && m_renderChunksInitialized)
         MarkAllChunksTopologyDirty();
-    m_lastShowWireframe = showWireframe;
 
     if (!m_renderChunksInitialized) {
         for (size_t batchBegin = 0; batchBegin < m_renderChunks.size(); batchBegin += RENDER_CHUNK_BUILD_BATCH_SIZE) {
@@ -2043,6 +2101,7 @@ void TriangleSelectorPatch::UpdateRenderChunks(bool showWireframe)
                 UploadChunk(static_cast<uint32_t>(batchBegin + resultIndex), std::move(results[resultIndex]));
         }
         m_renderChunksInitialized = true;
+        _renderChunkWireframeLayout = showWireframe;
         ClearRenderDirtyState();
         return;
     }
@@ -2070,6 +2129,7 @@ void TriangleSelectorPatch::UpdateRenderChunks(bool showWireframe)
             UploadColorAdaptive(chunkId, ColorUploadReason::State);
         }
     }
+    _renderChunkWireframeLayout = showWireframe;
     ClearRenderDirtyState();
 }
 
@@ -2095,14 +2155,12 @@ void TriangleSelectorPatch::RenderChunks(bool showWireframe)
             glsafe(::glEnableVertexAttribArray(positionId));
         }
         if (barycentricId != -1) {
-            if (showWireframe) {
-                glsafe(::glVertexAttribPointer(barycentricId, 3, GL_FLOAT, GL_FALSE, geometryStride,
-                                               reinterpret_cast<const void*>(3 * sizeof(float))));
-                glsafe(::glEnableVertexAttribArray(barycentricId));
-            } else {
-                glsafe(::glDisableVertexAttribArray(barycentricId));
-                glsafe(::glVertexAttrib3f(barycentricId, 1.0f, 1.0f, 1.0f));
-            }
+            // Keep the array enabled even without wireframe for the AMD Vega painter workaround.
+            // Position3 is a valid dummy stream when the shader does not consume barycentric values.
+            const void* barycentricOffset = showWireframe ?
+                reinterpret_cast<const void*>(3 * sizeof(float)) : nullptr;
+            glsafe(::glVertexAttribPointer(barycentricId, 3, GL_FLOAT, GL_FALSE, geometryStride, barycentricOffset));
+            glsafe(::glEnableVertexAttribArray(barycentricId));
         }
 
         glsafe(::glBindBuffer(GL_ARRAY_BUFFER, chunk.colorVbo));
@@ -2114,7 +2172,7 @@ void TriangleSelectorPatch::RenderChunks(bool showWireframe)
         glsafe(::glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(chunk.vertexCount)));
         if (positionId != -1)
             glsafe(::glDisableVertexAttribArray(positionId));
-        if (barycentricId != -1 && showWireframe)
+        if (barycentricId != -1)
             glsafe(::glDisableVertexAttribArray(barycentricId));
         if (colorId != -1)
             glsafe(::glDisableVertexAttribArray(colorId));
@@ -2138,23 +2196,19 @@ void TriangleSelectorPatch::render(int triangle_indices_idx, bool show_wireframe
 
     // the following binding is needed to set the vertex attributes
     glsafe(::glBindBuffer(GL_ARRAY_BUFFER, this->m_vertices_VBO_ids[triangle_indices_idx]));
-    const GLint position_id = shader->get_attrib_location("v_position");
-    if (position_id != -1) {
-        if (show_wireframe) {
-            glsafe(::glVertexAttribPointer((GLint) position_id, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (const void *) 0));
-        } else {
-            glsafe(::glVertexAttribPointer((GLint) position_id, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr));
-        }
-        glsafe(::glEnableVertexAttribArray((GLint)position_id));
+    const GLint positionId = shader->get_attrib_location("v_position");
+    const GLsizei geometryStride = static_cast<GLsizei>((show_wireframe ? 6 : 3) * sizeof(float));
+    if (positionId != -1) {
+        glsafe(::glVertexAttribPointer(positionId, 3, GL_FLOAT, GL_FALSE, geometryStride, nullptr));
+        glsafe(::glEnableVertexAttribArray(positionId));
     }
-    GLint barycentric_id = -1;
+    const GLint barycentricId = shader->get_attrib_location("v_barycentric");
     // Orca: This is required even if wireframe is not displayed, otherwise on AMD Vega GPUs the painter gizmo won't render properly
-    /*if (show_wireframe)*/ {
-        barycentric_id = shader->get_attrib_location("v_barycentric");
-        if (barycentric_id != -1) {
-            glsafe(::glVertexAttribPointer((GLint) barycentric_id, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (const void *) (3 * sizeof(float))));
-            glsafe(::glEnableVertexAttribArray((GLint) barycentric_id));
-        }
+    if (barycentricId != -1) {
+        const void* barycentricOffset = show_wireframe ?
+            reinterpret_cast<const void*>(3 * sizeof(float)) : nullptr;
+        glsafe(::glVertexAttribPointer(barycentricId, 3, GL_FLOAT, GL_FALSE, geometryStride, barycentricOffset));
+        glsafe(::glEnableVertexAttribArray(barycentricId));
     }
 
     // Render using the Vertex Buffer Objects.
@@ -2165,10 +2219,10 @@ void TriangleSelectorPatch::render(int triangle_indices_idx, bool show_wireframe
         //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: triangle_indices_idx %2%, bind indices vbo, buffer id %3%")%__LINE__%triangle_indices_idx%this->m_triangle_indices_VBO_ids[triangle_indices_idx];
     }
 
-    if (position_id != -1)
-        glsafe(::glDisableVertexAttribArray(position_id));
-    if (barycentric_id != -1)
-        glsafe(::glDisableVertexAttribArray(barycentric_id));
+    if (positionId != -1)
+        glsafe(::glDisableVertexAttribArray(positionId));
+    if (barycentricId != -1)
+        glsafe(::glDisableVertexAttribArray(barycentricId));
 
     glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
 }
@@ -2188,6 +2242,7 @@ void TriangleSelectorPatch::ReleaseRenderChunks()
         chunk.colorCapacityBytes = 0;
     }
     m_renderChunksInitialized = false;
+    _renderChunkWireframeLayout.reset();
     m_update_render_data = true;
 }
 
@@ -2195,12 +2250,13 @@ void TriangleSelectorPatch::ReleaseGlResources()
 {
     ReleaseRenderChunks();
     release_geometry();
+    ReleaseOwnedGlResources();
 }
 
 std::vector<unsigned int> TriangleSelectorPatch::DetachGlResources()
 {
     std::vector<unsigned int> bufferIds;
-    bufferIds.reserve(m_renderChunks.size() * 2 + m_vertices_VBO_ids.size() + m_triangle_indices_VBO_ids.size());
+    bufferIds.reserve(m_renderChunks.size() * 2 + m_vertices_VBO_ids.size() + m_triangle_indices_VBO_ids.size() + 2);
     for (RenderChunk& chunk : m_renderChunks) {
         if (chunk.geometryVbo != 0)
             bufferIds.push_back(chunk.geometryVbo);
@@ -2221,7 +2277,10 @@ std::vector<unsigned int> TriangleSelectorPatch::DetachGlResources()
             bufferIds.push_back(vboId);
         vboId = 0;
     }
+    DetachOwnedGlResources(bufferIds);
     m_renderChunksInitialized = false;
+    _renderChunkWireframeLayout.reset();
+    _legacyWireframeLayout.reset();
     m_update_render_data = true;
     m_paint_changed = true;
     clear();
@@ -2243,6 +2302,7 @@ void TriangleSelectorPatch::release_geometry()
         triangle_indices_VBO_id = 0;
     }
     this->clear();
+    _legacyWireframeLayout.reset();
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: released geometry")%__LINE__;
 }

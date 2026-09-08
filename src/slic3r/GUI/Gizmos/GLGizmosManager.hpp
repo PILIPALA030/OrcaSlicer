@@ -254,7 +254,10 @@ public:
 
     bool is_dragging() const;
 
+    /** Releases painter-owned buffers while a compatible OpenGL context is current. */
     void ReleasePainterGlResources();
+    /** Detaches painter-owned buffer IDs without issuing OpenGL calls. */
+    void DetachPainterGlResources();
 
     //BBS
     void* get_icon_texture_id(MENU_ICON_NAME icon) {
