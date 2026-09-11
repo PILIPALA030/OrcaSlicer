@@ -228,6 +228,7 @@ void GLGizmoFuzzySkin::on_render_input_window(float x, float y, float bottom_lim
             m_current_tool = tool_ids[i];
             for (auto &triangle_selector : m_triangle_selectors) {
                 triangle_selector->seed_fill_unselect_all_triangles();
+                triangle_selector->SetPointerPreviewEnabled(m_current_tool == ImGui::TriangleButtonIcon);
                 triangle_selector->request_update_render_data();
             }
         }

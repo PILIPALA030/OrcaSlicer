@@ -1075,6 +1075,10 @@ void GLGizmoMmuSegmentation::update_from_model_object(bool first_update)
 
 void GLGizmoMmuSegmentation::tool_changed(wchar_t old_tool, wchar_t new_tool)
 {
+    const bool pointerPreviewEnabled = new_tool == ImGui::TriangleButtonIcon;
+    for (const std::unique_ptr<TriangleSelectorGUI>& triangleSelector : m_triangle_selectors)
+        triangleSelector->SetPointerPreviewEnabled(pointerPreviewEnabled);
+
     if ((old_tool == ImGui::GapFillIcon && new_tool == ImGui::GapFillIcon) ||
         (old_tool != ImGui::GapFillIcon && new_tool != ImGui::GapFillIcon))
         return;

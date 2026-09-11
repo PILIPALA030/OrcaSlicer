@@ -4,8 +4,10 @@
 // #define PRUSASLICER_TRIANGLE_SELECTOR_DEBUG
 
 
+#include <array>
 #include <cfloat>
 #include <cstdint>
+#include <optional>
 #include "Point.hpp"
 #include "TriangleMesh.hpp"
 
@@ -300,12 +302,22 @@ public:
     // stay valid, a ptr to it is saved and used.
     explicit TriangleSelector(const TriangleMesh& mesh, float edge_limit = 0.6f);
 
+    enum class CleanupMode : uint8_t
+    {
+        Immediate,
+        Deferred
+    };
+
     uint64_t GetTopologyRevision() const noexcept { return m_topologyRevision; }
     uint64_t GetTriangleIndexRevision() const noexcept { return m_triangleIndexRevision; }
     uint64_t GetStateRevision() const noexcept { return m_stateRevision; }
 
-    // Changes a valid leaf state and emits a precise mutation notification.
-    bool SetLeafState(int triangleIndex, EnforcerBlockerType state);
+    /** Changes a valid leaf state and either cleans its source root immediately or records it for deferred cleanup. */
+    bool SetLeafState(int triangleIndex, EnforcerBlockerType state, CleanupMode cleanupMode = CleanupMode::Immediate);
+    /** Cleans every source root touched by deferred state changes and reports whether topology changed. */
+    bool FlushDeferredCleanup();
+    /** Returns a copy of the three vertices owned by a valid leaf. */
+    std::optional<std::array<Vec3f, 3>> GetLeafVertices(int triangleIndex) const;
 
     // Returns the facet_idx of the unsplit triangle containing the "hit". Returns -1 if the triangle isn't found.
     [[nodiscard]] int select_unsplit_triangle(const Vec3f &hit, int facet_idx) const;
@@ -502,6 +514,9 @@ protected:
 
     // Private functions:
 private:
+    bool SetLeafStateWithoutCleanup(int triangleIndex, EnforcerBlockerType state, int* sourceTriangle = nullptr);
+    void RecordDeferredCleanupRoot(uint32_t sourceTriangle);
+    void ClearDeferredCleanup();
     bool select_triangle(int facet_idx, EnforcerBlockerType type, bool triangle_splitting);
     bool select_triangle_recursive(int facet_idx, const Vec3i32 &neighbors, EnforcerBlockerType type, bool triangle_splitting);
     void undivide_triangle(int facet_idx);
@@ -548,6 +563,7 @@ private:
 
     void get_seed_fill_contour_recursive(int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<Vec2i32> &edges_out) const;
 
+    std::vector<uint32_t> m_deferredCleanupRoots;
     int m_free_triangles_head { -1 };
     int m_free_vertices_head { -1 };
 };

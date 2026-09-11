@@ -43,6 +43,13 @@ public:
     void         set_wireframe_needed(bool need_wireframe) { m_need_wireframe = need_wireframe; }
     bool         get_wireframe_needed() { return m_need_wireframe; }
 
+    /** Enables or disables the lightweight three-edge Pointer preview path. */
+    void SetPointerPreviewEnabled(bool enabled);
+    /** Updates the Pointer preview from a raycast hit and reports whether its cached leaf changed. */
+    bool UpdatePointerPreview(const Vec3f& hit, int facetIndex);
+    /** Clears the cached Pointer leaf and reports whether visible preview data changed. */
+    bool ClearPointerPreview();
+
     // BBS
     void request_update_render_data(bool paint_changed = false)
     {
@@ -66,13 +73,19 @@ protected:
     bool m_paint_changed = true;
 
     static ColorRGBA get_seed_fill_color(const ColorRGBA &base_color);
+    void OnSelectorMutation(MutationKind kind, int sourceTriangle) override;
 
 private:
     void update_render_data();
+    void InvalidatePointerPreview();
 
     GLModel                m_iva_enforcers;
     GLModel                m_iva_blockers;
     std::array<GLModel, 3> m_iva_seed_fills;
+    std::optional<std::array<Vec3f, 3>> m_pointerPreviewVertices;
+    int m_pointerPreviewLeaf = -1;
+    bool m_pointerPreviewEnabled = false;
+    bool m_pointerPreviewDirty = false;
 #ifdef PRUSASLICER_TRIANGLE_SELECTOR_DEBUG
     std::array<GLModel, 3> m_varrays;
 #endif // PRUSASLICER_TRIANGLE_SELECTOR_DEBUG

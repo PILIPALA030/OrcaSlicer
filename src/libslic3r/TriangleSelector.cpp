@@ -1,6 +1,7 @@
 #include "TriangleSelector.hpp"
 #include "Model.hpp"
 
+#include <algorithm>
 #include <boost/container/small_vector.hpp>
 #include <boost/log/trivial.hpp>
 #include <atomic>
@@ -234,7 +235,7 @@ int TriangleSelector::select_unsplit_triangle(const Vec3f &hit, int facet_idx) c
     return this->select_unsplit_triangle(hit, facet_idx, neighbors);
 }
 
-bool TriangleSelector::SetLeafState(int triangleIndex, EnforcerBlockerType state)
+bool TriangleSelector::SetLeafStateWithoutCleanup(int triangleIndex, EnforcerBlockerType state, int* sourceTriangle)
 {
     if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
         return false;
@@ -243,11 +244,77 @@ bool TriangleSelector::SetLeafState(int triangleIndex, EnforcerBlockerType state
     if (!triangle.valid() || triangle.is_split() || triangle.get_state() == state)
         return false;
 
-    const int sourceTriangle = triangle.source_triangle;
+    const int source = triangle.source_triangle;
     triangle.set_state(state);
     ++m_stateRevision;
-    OnSelectorMutation(MutationKind::State, sourceTriangle);
+    OnSelectorMutation(MutationKind::State, source);
+    if (sourceTriangle != nullptr)
+        *sourceTriangle = source;
     return true;
+}
+
+bool TriangleSelector::SetLeafState(int triangleIndex, EnforcerBlockerType state, CleanupMode cleanupMode)
+{
+    int sourceTriangle = -1;
+    if (!SetLeafStateWithoutCleanup(triangleIndex, state, &sourceTriangle))
+        return false;
+
+    if (cleanupMode == CleanupMode::Deferred)
+        RecordDeferredCleanupRoot(static_cast<uint32_t>(sourceTriangle));
+    else
+        remove_useless_children(sourceTriangle);
+
+    return true;
+}
+
+void TriangleSelector::RecordDeferredCleanupRoot(uint32_t sourceTriangle)
+{
+    if (sourceTriangle < static_cast<uint32_t>(m_orig_size_indices))
+        m_deferredCleanupRoots.push_back(sourceTriangle);
+}
+
+void TriangleSelector::ClearDeferredCleanup()
+{
+    m_deferredCleanupRoots.clear();
+}
+
+bool TriangleSelector::FlushDeferredCleanup()
+{
+    if (m_deferredCleanupRoots.empty())
+        return false;
+
+    std::sort(m_deferredCleanupRoots.begin(), m_deferredCleanupRoots.end());
+    m_deferredCleanupRoots.erase(std::unique(m_deferredCleanupRoots.begin(), m_deferredCleanupRoots.end()),
+                                 m_deferredCleanupRoots.end());
+
+    std::vector<uint32_t> roots;
+    roots.swap(m_deferredCleanupRoots);
+
+    bool topologyChanged = false;
+    for (uint32_t sourceTriangle : roots) {
+        if (sourceTriangle < static_cast<uint32_t>(m_orig_size_indices) && m_triangles[sourceTriangle].valid())
+            topologyChanged |= remove_useless_children(static_cast<int>(sourceTriangle));
+    }
+    return topologyChanged;
+}
+
+std::optional<std::array<Vec3f, 3>> TriangleSelector::GetLeafVertices(int triangleIndex) const
+{
+    if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
+        return std::nullopt;
+
+    const Triangle& triangle = m_triangles[triangleIndex];
+    if (!triangle.valid() || triangle.is_split())
+        return std::nullopt;
+
+    std::array<Vec3f, 3> vertices;
+    for (size_t vertexIndex = 0; vertexIndex < triangle.verts_idxs.size(); ++vertexIndex) {
+        const int meshVertexIndex = triangle.verts_idxs[vertexIndex];
+        if (meshVertexIndex < 0 || meshVertexIndex >= static_cast<int>(m_vertices.size()))
+            return std::nullopt;
+        vertices[vertexIndex] = m_vertices[meshVertexIndex].v;
+    }
+    return vertices;
 }
 
 void TriangleSelector::NotifyTopologyMutation(int sourceTriangle)
@@ -968,7 +1035,7 @@ bool TriangleSelector::select_triangle_recursive(int facet_idx, const Vec3i32 &n
     if (num_of_inside_vertices == 3) {
         // dump any subdivision and select whole triangle
         undivide_triangle(facet_idx);
-        SetLeafState(facet_idx, type);
+        SetLeafStateWithoutCleanup(facet_idx, type);
     } else {
         // the triangle is partially inside, let's recursively divide it
         // (if not already) and try selecting its children.
@@ -982,7 +1049,7 @@ bool TriangleSelector::select_triangle_recursive(int facet_idx, const Vec3i32 &n
         if (triangle_splitting)
             split_triangle(facet_idx, neighbors);
         else if (!m_triangles[facet_idx].is_split())
-            SetLeafState(facet_idx, type);
+            SetLeafStateWithoutCleanup(facet_idx, type);
         tr = &m_triangles[facet_idx]; // might have been invalidated by split_triangle().
 
         int num_of_children = tr->number_of_split_sides() + 1;
@@ -1253,7 +1320,7 @@ bool TriangleSelector::remove_useless_children(int facet_idx)
 
     // If we got here, the children can be removed.
     undivide_triangle(facet_idx);
-    SetLeafState(facet_idx, first_child_type);
+    SetLeafStateWithoutCleanup(facet_idx, first_child_type);
     return true;
 }
 
@@ -1345,6 +1412,7 @@ TriangleSelector::TriangleSelector(const TriangleMesh& mesh, float edge_limit)
 
 void TriangleSelector::reset()
 {
+    ClearDeferredCleanup();
     m_vertices.clear();
     m_triangles.clear();
     m_invalid_triangles = 0;
@@ -1800,6 +1868,7 @@ void TriangleSelector::deserialize(const TriangleSplittingData& data,
                                    EnforcerBlockerType          replace_filament,
                                    const EnforcerBlockerStateMap* state_map)
 {
+    ClearDeferredCleanup();
     if (needs_reset)
         reset(); // dump any current state
     for (auto [triangle_id, ibit] : data.triangles_to_split) {
@@ -2056,7 +2125,7 @@ void TriangleSelector::seed_fill_apply_on_triangles(EnforcerBlockerType new_stat
     for (size_t triangleIndex = 0; triangleIndex < m_triangles.size(); ++triangleIndex) {
         Triangle& triangle = m_triangles[triangleIndex];
         if (!triangle.is_split() && triangle.is_selected_by_seed_fill())
-            SetLeafState(static_cast<int>(triangleIndex), new_state);
+            SetLeafStateWithoutCleanup(static_cast<int>(triangleIndex), new_state);
     }
 
     for (Triangle &triangle : m_triangles)
