@@ -544,6 +544,8 @@ public:
     void set_slope_normal_z(float normal_z) { m_slope.normal_z = normal_z; }
     void set_default_slope_normal_z() { m_slope.normal_z = -::cos(Geometry::deg2rad(90.0f - 45.0f)); }
     void set_show_sinking_contours(bool show) { m_show_sinking_contours = show; }
+    /** @brief Returns whether sinking-contour rendering is enabled for this collection. */
+    bool IsShowingSinkingContours() const { return m_show_sinking_contours; }
 
     // returns true if all the volumes are completely contained in the print volume
     // returns the containment state in the given out_state, if non-null

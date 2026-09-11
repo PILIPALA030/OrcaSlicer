@@ -571,6 +571,28 @@ private:
         unsigned int height{ 0 };
     };
 
+    /** @brief Persistent framebuffer resources containing the static View3D scene color and depth. */
+    struct SceneCacheResources
+    {
+        unsigned int framebuffer{ 0 };
+        unsigned int colorRenderbuffer{ 0 };
+        unsigned int depthStencilRenderbuffer{ 0 };
+        unsigned int width{ 0 };
+        unsigned int height{ 0 };
+        int samples{ 0 };
+    };
+
+    /** @brief Parameters shared by cached and legacy View3D main-scene rendering. */
+    struct MainSceneRenderParams
+    {
+        bool onlyCurrent{ false };
+        bool onlyBody{ false };
+        bool showAxes{ true };
+        bool noPartplate{ false };
+        bool showGrid{ true };
+        int hoverPlateId{ -1 };
+    };
+
     /** @brief Data-driven symmetric samples for one Gaussian blur pass. */
     struct GaussianSampleKernel
     {
@@ -634,6 +656,8 @@ private:
 
     // Screen is only refreshed from the OnIdle handler if it is dirty.
     bool m_dirty;
+    // Requests a frame that may reuse the cached main scene.
+    bool m_overlayDirty{ false };
     bool m_initialized;
     //BBS: add flag to controll rendering
     bool m_render_preview{ true };
@@ -684,6 +708,22 @@ private:
     Slope m_slope;
 
     SelectionHighlightResources m_selectionHighlightResources;
+    SceneCacheResources m_sceneCacheResources;
+    // Identifies the selection membership represented by the cached highlight textures.
+    Selection::IndicesList m_selectionHighlightVolumeIndices;
+    bool m_sceneCacheValid{ false };
+    // Avoids glGetError on the hot path after each Scene Cache copy direction has been validated.
+    bool m_sceneCacheCaptureValidated{ false };
+    bool m_sceneCachePresentValidated{ false };
+    // Defers cache capture while short-lived camera input is producing consecutive FullScene frames.
+    bool m_sceneCacheCaptureDeferred{ false };
+    bool m_selectionHighlightValid{ false };
+    // Suppresses repeated resource allocation attempts for a framebuffer specification that already failed.
+    unsigned int m_sceneCacheFailedWidth{ 0 };
+    unsigned int m_sceneCacheFailedHeight{ 0 };
+    int m_sceneCacheFailedSamples{ -1 };
+    unsigned int m_selectionHighlightFailedWidth{ 0 };
+    unsigned int m_selectionHighlightFailedHeight{ 0 };
 
     OrientSettings m_orient_settings_fff, m_orient_settings_sla;
 
@@ -796,7 +836,7 @@ public:
     bool is_initialized() const { return m_initialized; }
 
     void set_context(wxGLContext* context) { m_context = context; }
-    void set_type(ECanvasType type) { if (m_canvas_type != type) m_pickingBufferDirty = true; m_canvas_type = type; }
+    void set_type(ECanvasType type) { if (m_canvas_type != type) InvalidateSceneAndPickingCaches(); m_canvas_type = type; }
     ECanvasType get_canvas_type() { return m_canvas_type; }
 
     wxGLCanvas* get_wxglcanvas() { return m_canvas; }
@@ -825,7 +865,13 @@ public:
     }
 
     float get_explosion_ratio() { return m_explosion_ratio; }
-    void reset_explosion_ratio() { if (m_explosion_ratio != 1.0f) m_pickingBufferDirty = true; m_explosion_ratio = 1.0f; }
+    void reset_explosion_ratio() {
+        if (m_explosion_ratio != 1.0f) {
+            InvalidateSceneAndPickingCaches();
+            m_dirty = true;
+        }
+        m_explosion_ratio = 1.0f;
+    }
     void on_change_color_mode(bool is_dark, bool reinit = true);
     const bool get_dark_mode_status() { return m_is_dark; }
     void set_as_dirty();
@@ -880,18 +926,32 @@ public:
         {
             m_clipping_planes[id] = plane;
             m_sla_caps[id].reset();
-            m_pickingBufferDirty = true;
+            InvalidatePickingBuffer();
+            InvalidateSceneCache();
+            m_dirty = true;
         }
     }
     void reset_clipping_planes_cache() { m_sla_caps[0].triangles.clear(); m_sla_caps[1].triangles.clear(); }
-    void set_use_clipping_planes(bool use) { m_pickingBufferDirty = true; m_use_clipping_planes = use; }
+    void set_use_clipping_planes(bool use) {
+        InvalidateSceneAndPickingCaches();
+        m_dirty = true;
+        m_use_clipping_planes = use;
+    }
 
     bool                                get_use_clipping_planes() const { return m_use_clipping_planes; }
     const std::array<ClippingPlane, 2> &get_clipping_planes() const { return m_clipping_planes; };
 
-    void set_use_color_clip_plane(bool use) { m_volumes.set_use_color_clip_plane(use); }
-    void set_color_clip_plane(const Vec3d& cp_normal, double offset) { m_volumes.set_color_clip_plane(cp_normal, offset); }
-    void set_color_clip_plane_colors(const std::array<ColorRGBA, 2>& colors) { m_volumes.set_color_clip_plane_colors(colors); }
+    void set_use_color_clip_plane(bool use) { m_volumes.set_use_color_clip_plane(use); InvalidateSceneCache(); m_dirty = true; }
+    void set_color_clip_plane(const Vec3d& cp_normal, double offset) {
+        m_volumes.set_color_clip_plane(cp_normal, offset);
+        InvalidateSceneCache();
+        m_dirty = true;
+    }
+    void set_color_clip_plane_colors(const std::array<ColorRGBA, 2>& colors) {
+        m_volumes.set_color_clip_plane_colors(colors);
+        InvalidateSceneCache();
+        m_dirty = true;
+    }
 
     void set_show_world_axes(bool flag) { m_show_world_axes = flag; }
     void refresh_camera_scene_box();
@@ -956,7 +1016,7 @@ public:
 
     bool is_dragging() const { return m_gizmos.is_dragging() || m_moving; }
 
-    void render(bool only_init = false);
+    void render(bool only_init = false, bool overlayOnly = false);
     bool is_rendering_enabled()
     {
         return m_enable_render;
@@ -1099,6 +1159,8 @@ public:
     void do_mirror(const std::string& snapshot_type);
 
     void update_gizmos_on_off_state();
+    /** @brief Refreshes gizmo state after a pure selection change without invalidating the main scene. */
+    void UpdateGizmosForSelectionChange();
     void reset_all_gizmos() { m_gizmos.reset_all_states(); }
 
     void handle_sidebar_focus_event(const std::string& opt_key, bool focus_on);
@@ -1243,7 +1305,7 @@ public:
 private:
     bool _is_shown_on_screen() const;
 
-    /** @brief Selects and prepares the selection highlight path for the current frame. */
+    /** @brief Selects the selection highlight path for the current frame without rendering it. */
     ESelectionHighlightMode ResolveSelectionHighlightMode();
 
     /**
@@ -1283,8 +1345,11 @@ private:
     /** @brief Generates the main selection edge and its outer Glow from the selection Mask. */
     bool RenderSelectionOutlineTextures();
 
+    /** @brief Rebuilds all cached textures used by the unified selection highlight. */
+    bool UpdateSelectionHighlightCache();
+
     /** @brief Composites the linearly upsampled selection Fill and Outline over the main scene. */
-    void CompositeSelectionHighlight();
+    bool CompositeSelectionHighlight();
 
     /** @brief Renders an occlusion-independent selection Outline through the default framebuffer stencil. */
     void RenderSelectionStencilFallback();
@@ -1313,10 +1378,33 @@ private:
     void _zoom_to_box(const BoundingBoxf3& box, double margin_factor = DefaultCameraZoomToBoxMarginFactor);
     void _update_camera_zoom(double zoom);
 
-    void _refresh_if_shown_on_screen();
+    void _refresh_if_shown_on_screen(bool overlayOnly = false);
 
-    void UpdateVolumeClippingState();
+    bool UpdateVolumeClippingState();
+    /** @brief Invalidates only GPU picking content. */
     void InvalidatePickingBuffer();
+    /** @brief Invalidates only the cached View3D main scene. */
+    void InvalidateSceneCache();
+    /** @brief Invalidates scene and picking caches when both depend on the same mutation. */
+    void InvalidateSceneAndPickingCaches();
+    /** @brief Schedules a frame that may reuse the cached main scene. */
+    void SetOverlayAsDirty();
+    /** @brief Invalidates cached selection highlight data and schedules an overlay frame. */
+    void SetSelectionAsDirty();
+    /** @brief Checks whether the current target and framebuffer format support Scene Cache V1. */
+    bool CanUseSceneCache(const Size& canvasSize, int targetDrawFramebuffer, int& samples) const;
+    /** @brief Creates or reuses Scene Cache framebuffer resources for the requested specification. */
+    bool EnsureSceneCacheResources(const Size& canvasSize, int samples);
+    /** @brief Releases all Scene Cache OpenGL resources. */
+    void ReleaseSceneCacheResources();
+    /** @brief Copies the directly rendered View3D main scene from the window framebuffer into Scene Cache. */
+    bool CaptureSceneCache();
+    /** @brief Copies cached color and depth into the window framebuffer. */
+    bool PresentSceneCache();
+    /** @brief Draws the cacheable View3D scene content directly into the current window framebuffer. */
+    void RenderMainSceneContent(const Camera& camera, const MainSceneRenderParams& params);
+    /** @brief Draws the selection box after scene presentation with explicit depth and blend state. */
+    void RenderSelectionBoxWithExplicitState();
     bool RenderPickingBuffer(const Camera& camera);
     VolumePickResult QueryVolumeFromPickingBuffer(const Vec2d& screenPosition, const Camera& camera, int toleranceRadiusPx);
     PickingPassResult QueryHybridPickingHit(const Vec2d& screenPosition, const Camera& camera, const ClippingPlane& clippingPlane,
@@ -1333,8 +1421,8 @@ private:
     void ApplyPickingHit(const SceneRaycaster::HitResult& hit);
     bool ShouldRenderVolumeForPicking(const GLVolume& volume) const;
 
-    std::optional<PickingPassResult> _picking_pass();
-    void _rectangular_selection_picking_pass();
+    std::optional<PickingPassResult> _picking_pass(bool& sinkingContourSceneChanged);
+    bool _rectangular_selection_picking_pass();
     void _render_background();
     void _render_bed(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool show_axes);
     //BBS: add part plate related logic
@@ -1388,7 +1476,7 @@ private:
     // render thumbnail using the default framebuffer
     void render_thumbnail_legacy(ThumbnailData& thumbnail_data, unsigned int w, unsigned int h, const ThumbnailsParams& thumbnail_params, PartPlateList& partplate_list, ModelObjectPtrs& model_objects, const GLVolumeCollection& volumes, std::vector<ColorRGBA>& extruder_colors, GLShaderProgram* shader, Camera::EType camera_type);
 
-    void _update_volumes_hover_state();
+    bool _update_volumes_hover_state();
 
     // Convert the screen space coordinate to world coordinate on the bed.
     Vec3d _mouse_to_bed_3d(const Point& mouse_pos);
