@@ -6005,7 +6005,7 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
         }
     }
 
-    if (m_moving)
+    if (m_moving && m_mouse.dragging)
         show_sinking_contours();
 
 #ifdef __WXMSW__
@@ -6526,13 +6526,17 @@ void GLCanvas3D::UpdateGizmosForSelectionChange()
 
 void GLCanvas3D::handle_sidebar_focus_event(const std::string& opt_key, bool focus_on)
 {
-    m_sidebar_field = focus_on ? opt_key : "";
+    const std::string sidebarField = focus_on ? opt_key : "";
+    if (m_sidebar_field == sidebarField)
+        return;
+
+    m_sidebar_field = sidebarField;
 
     //BBS: this event was sent from gizmo now, no need to clear gizmo
     //if (!m_sidebar_field.empty())
     //    m_gizmos.reset_all_states();
 
-    m_dirty = true;
+    SetOverlayAsDirty();
 }
 
 void GLCanvas3D::handle_layers_data_focus_event(const t_layer_height_range range, const EditorType type)
@@ -6713,6 +6717,7 @@ void GLCanvas3D::export_toolpaths_to_obj(const char* filename) const
 
 void GLCanvas3D::mouse_up_cleanup()
 {
+    const bool sceneChanged = m_mouse.dragging || m_camera_movement;
     m_moving = false;
     m_camera_movement = false;
     m_mouse.drag.move_volume_idx = -1;
@@ -6721,7 +6726,10 @@ void GLCanvas3D::mouse_up_cleanup()
     m_mouse.dragging = false;
     m_mouse.ignore_left_up = false;
     m_mouse.ignore_right_up = false;
-    m_dirty = true;
+    if (sceneChanged)
+        m_dirty = true;
+    else
+        SetOverlayAsDirty();
 
     if (m_canvas->HasCapture())
         m_canvas->ReleaseMouse();
