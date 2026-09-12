@@ -225,11 +225,10 @@ void GLGizmoFuzzySkin::on_render_input_window(float x, float y, float bottom_lim
         ImGui::PopStyleVar(1);
 
         if (btn_clicked && m_current_tool != tool_ids[i]) {
+            FinishPaintingInteraction();
             m_current_tool = tool_ids[i];
             for (auto &triangle_selector : m_triangle_selectors) {
-                triangle_selector->seed_fill_unselect_all_triangles();
                 triangle_selector->SetPointerPreviewEnabled(m_current_tool == ImGui::TriangleButtonIcon);
-                triangle_selector->request_update_render_data();
             }
         }
 
@@ -271,13 +270,11 @@ void GLGizmoFuzzySkin::on_render_input_window(float x, float y, float bottom_lim
         ImGui::SameLine(sliders_left_width);
         ImGui::PushItemWidth(sliders_width);
         if (m_imgui->bbl_slider_float_style("##smart_fill_angle", &m_smart_fill_angle, SmartFillAngleMin, SmartFillAngleMax, format_str.data(), 1.0f, true))
-            for (auto &triangle_selector : m_triangle_selectors) {
-                triangle_selector->seed_fill_unselect_all_triangles();
-                triangle_selector->request_update_render_data();
-            }
+            FinishPaintingInteraction();
         ImGui::SameLine(drag_left_width + sliders_left_width);
         ImGui::PushItemWidth(1.5 * slider_icon_width);
-        ImGui::BBLDragFloat("##smart_fill_angle_input", &m_smart_fill_angle, 0.05f, 0.0f, 0.0f, "%.2f");
+        if (ImGui::BBLDragFloat("##smart_fill_angle_input", &m_smart_fill_angle, 0.05f, 0.0f, 0.0f, "%.2f"))
+            FinishPaintingInteraction();
     }
 
     ImGui::Separator();
@@ -362,6 +359,7 @@ void GLGizmoFuzzySkin::update_from_model_object(bool first_update)
     wxBusyCursor wait;
 
     const ModelObject *mo = m_c->selection_info()->model_object();
+    FinishPaintingInteraction();
     DetachTriangleSelectorGlResources();
     m_triangle_selectors.clear();
 

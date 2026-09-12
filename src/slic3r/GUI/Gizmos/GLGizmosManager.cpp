@@ -772,6 +772,12 @@ bool GLGizmosManager::on_mouse(const wxMouseEvent &mouse_event)
     return false;
 }
 
+void GLGizmosManager::OnMouseCaptureLost()
+{
+    if (m_enabled && m_current != Undefined)
+        m_gizmos[m_current]->OnMouseCaptureLost();
+}
+
 bool GLGizmosManager::on_char(wxKeyEvent& evt)
 {
     // see include/wx/defs.h enum wxKeyCode

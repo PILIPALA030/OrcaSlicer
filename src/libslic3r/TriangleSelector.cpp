@@ -6,6 +6,7 @@
 #include <boost/log/trivial.hpp>
 #include <atomic>
 #include <cstddef>
+#include <limits>
 #include <tbb/parallel_for.h>
 
 #ifndef NDEBUG
@@ -267,6 +268,49 @@ bool TriangleSelector::SetLeafState(int triangleIndex, EnforcerBlockerType state
     return true;
 }
 
+bool TriangleSelector::SelectSeedFillLeaf(int triangleIndex)
+{
+    if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
+        return false;
+
+    Triangle& triangle = m_triangles[triangleIndex];
+    if (!triangle.valid() || triangle.is_split() || triangle.is_selected_by_seed_fill())
+        return false;
+
+    triangle.select_by_seed_fill();
+    m_seedFillSelectedLeaves.push_back(triangleIndex);
+    return true;
+}
+
+uint32_t TriangleSelector::BeginQueryGeneration(std::vector<uint32_t>& queryStamp, uint32_t& queryGeneration,
+                                                size_t requiredSize)
+{
+    if (queryStamp.size() < requiredSize)
+        queryStamp.resize(requiredSize, 0);
+
+    if (queryGeneration == std::numeric_limits<uint32_t>::max())
+    {
+        std::fill(queryStamp.begin(), queryStamp.end(), 0);
+        queryGeneration = 1;
+    }
+    else
+    {
+        ++queryGeneration;
+    }
+
+    return queryGeneration;
+}
+
+void TriangleSelector::PrepareForLeafIdentityChange()
+{
+    seed_fill_unselect_all_triangles();
+    BeginQueryGeneration(m_triangleQueryStamp, m_triangleQueryGeneration, m_triangleQueryStamp.size());
+    m_neighborCache.topologyRevision = 0;
+    m_neighborCache.indexRevision = 0;
+    OnLeafIdentityWillChange();
+    assert(m_seedFillSelectedLeaves.empty());
+}
+
 void TriangleSelector::RecordDeferredCleanupRoot(uint32_t sourceTriangle)
 {
     if (sourceTriangle < static_cast<uint32_t>(m_orig_size_indices))
@@ -387,12 +431,13 @@ void TriangleSelector::select_patch(int facet_start, std::unique_ptr<Cursor> &&c
         start_facets.push_back(facet_start);
     }
 
-    // Keep track of facets of the original mesh we already processed.
-    std::vector<bool> visited(m_orig_size_indices, false);
+    // Keep track of original facets visited by this query without clearing an O(N) array.
+    const uint32_t queryGeneration = BeginQueryGeneration(
+        m_rootQueryStamp, m_rootQueryGeneration, static_cast<size_t>(m_orig_size_indices));
 
     for (int i = 0; i < start_facets.size(); i++) {
         int start_facet_id = start_facets[i];
-        if (visited[start_facet_id])
+        if (m_rootQueryStamp[start_facet_id] == queryGeneration)
             continue;
 
         // Now start with the facet the pointer points to and check all adjacent facets.
@@ -408,7 +453,8 @@ void TriangleSelector::select_patch(int facet_start, std::unique_ptr<Cursor> &&c
             const Vec3f& facet_normal = m_face_normals[m_triangles[facet].source_triangle];
             Matrix3f     normal_matrix = static_cast<Matrix3f>(trafo_no_translate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
             float        world_normal_z = (normal_matrix* facet_normal).normalized().z();
-            if (!visited[facet] && (highlight_by_angle_deg == 0.f || world_normal_z < highlight_angle_limit)) {
+            if (m_rootQueryStamp[facet] != queryGeneration &&
+                (highlight_by_angle_deg == 0.f || world_normal_z < highlight_angle_limit)) {
                 if (select_triangle(facet, new_state, triangle_splitting)) {
                     // add neighboring facets to list to be processed later
                     for (int neighbor_idx : m_neighbors[facet])
@@ -416,7 +462,7 @@ void TriangleSelector::select_patch(int facet_start, std::unique_ptr<Cursor> &&c
                             facets_to_check.push_back(neighbor_idx);
                 }
             }
-            visited[facet] = true;
+            m_rootQueryStamp[facet] = queryGeneration;
             ++facet_idx;
         }
     }
@@ -443,7 +489,8 @@ void TriangleSelector::seed_fill_select_triangles(const Vec3f &hit, int facet_st
 
     this->seed_fill_unselect_all_triangles();
 
-    std::vector<bool> visited(m_triangles.size(), false);
+    const uint32_t queryGeneration = BeginQueryGeneration(
+        m_triangleQueryStamp, m_triangleQueryGeneration, m_triangles.size());
     std::queue<int>   facet_queue;
     facet_queue.push(facet_start);
 
@@ -458,23 +505,26 @@ void TriangleSelector::seed_fill_select_triangles(const Vec3f &hit, int facet_st
         const Vec3f &facet_normal = m_face_normals[m_triangles[current_facet].source_triangle];
         Matrix3f     normal_matrix  = static_cast<Matrix3f>(trafo_no_translate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
         float        world_normal_z = (normal_matrix * facet_normal).normalized().z();
-        if (!visited[current_facet] && (highlight_by_angle_deg == 0.f || world_normal_z < highlight_angle_limit)) {
+        if (m_triangleQueryStamp[current_facet] != queryGeneration &&
+            (highlight_by_angle_deg == 0.f || world_normal_z < highlight_angle_limit)) {
             if (m_triangles[current_facet].is_split()) {
                 for (int split_triangle_idx = 0; split_triangle_idx <= m_triangles[current_facet].number_of_split_sides(); ++split_triangle_idx) {
                     assert(split_triangle_idx < int(m_triangles[current_facet].children.size()));
                     assert(m_triangles[current_facet].children[split_triangle_idx] < int(m_triangles.size()));
-                    if (int child = m_triangles[current_facet].children[split_triangle_idx]; !visited[child])
+                    if (int child = m_triangles[current_facet].children[split_triangle_idx];
+                        m_triangleQueryStamp[child] != queryGeneration)
                         // Child triangle shares normal with its parent. Select it.
                         facet_queue.push(child);
                 }
             } else
-                m_triangles[current_facet].select_by_seed_fill();
+                SelectSeedFillLeaf(current_facet);
 
             if (current_facet < m_orig_size_indices)
                 // Propagate over the original triangles.
                 for (int neighbor_idx : m_neighbors[current_facet]) {
                     assert(neighbor_idx >= -1);
-                    if (neighbor_idx >= 0 && !visited[neighbor_idx] && !is_facet_clipped(neighbor_idx, clp)) {
+                    if (neighbor_idx >= 0 && m_triangleQueryStamp[neighbor_idx] != queryGeneration &&
+                        !is_facet_clipped(neighbor_idx, clp)) {
                         // Check if neighbour_facet_idx is satisfies angle in seed_fill_angle and append it to facet_queue if it do.
                         const Vec3f &n1 = m_face_normals[m_triangles[neighbor_idx].source_triangle];
                         const Vec3f &n2 = m_face_normals[m_triangles[current_facet].source_triangle];
@@ -483,7 +533,7 @@ void TriangleSelector::seed_fill_select_triangles(const Vec3f &hit, int facet_st
                     }
                 }
         }
-        visited[current_facet] = true;
+        m_triangleQueryStamp[current_facet] = queryGeneration;
     }
 }
 
@@ -516,18 +566,28 @@ void TriangleSelector::precompute_all_neighbors_recursive(const int facet_idx, c
     }
 }
 
-std::pair<std::vector<Vec3i32>, std::vector<Vec3i32>> TriangleSelector::precompute_all_neighbors() const
+const TriangleSelector::NeighborCache& TriangleSelector::EnsureNeighborCache() const
 {
-    std::vector<Vec3i32> neighbors(m_triangles.size(), Vec3i32(-1, -1, -1));
-    std::vector<Vec3i32> neighbors_propagated(m_triangles.size(), Vec3i32(-1, -1, -1));
-    for (int facet_idx = 0; facet_idx < this->m_orig_size_indices; ++facet_idx) {
-        neighbors[facet_idx]            = m_neighbors[facet_idx];
-        neighbors_propagated[facet_idx] = neighbors[facet_idx];
-        assert(this->verify_triangle_neighbors(m_triangles[facet_idx], neighbors[facet_idx]));
+    if (m_neighborCache.topologyRevision == m_topologyRevision &&
+        m_neighborCache.indexRevision == m_triangleIndexRevision &&
+        m_neighborCache.neighbors.size() == m_triangles.size() &&
+        m_neighborCache.propagated.size() == m_triangles.size())
+        return m_neighborCache;
+
+    m_neighborCache.neighbors.assign(m_triangles.size(), Vec3i32(-1, -1, -1));
+    m_neighborCache.propagated.assign(m_triangles.size(), Vec3i32(-1, -1, -1));
+    for (int facet_idx = 0; facet_idx < this->m_orig_size_indices; ++facet_idx)
+    {
+        m_neighborCache.neighbors[facet_idx] = m_neighbors[facet_idx];
+        m_neighborCache.propagated[facet_idx] = m_neighborCache.neighbors[facet_idx];
+        assert(this->verify_triangle_neighbors(m_triangles[facet_idx], m_neighborCache.neighbors[facet_idx]));
         if (m_triangles[facet_idx].is_split())
-            this->precompute_all_neighbors_recursive(facet_idx, neighbors[facet_idx], neighbors_propagated[facet_idx], neighbors, neighbors_propagated);
+            this->precompute_all_neighbors_recursive(facet_idx, m_neighborCache.neighbors[facet_idx],
+                m_neighborCache.propagated[facet_idx], m_neighborCache.neighbors, m_neighborCache.propagated);
     }
-    return std::make_pair(std::move(neighbors), std::move(neighbors_propagated));
+    m_neighborCache.topologyRevision = m_topologyRevision;
+    m_neighborCache.indexRevision = m_triangleIndexRevision;
+    return m_neighborCache;
 }
 
 // It appends all triangles that are touching the edge (vertexi, vertexj) of the triangle.
@@ -605,7 +665,7 @@ void TriangleSelector::bucket_fill_select_triangles(const Vec3f& hit, int facet_
     this->seed_fill_unselect_all_triangles();
 
     if (!propagate) {
-        m_triangles[start_facet_idx].select_by_seed_fill();
+        SelectSeedFillLeaf(start_facet_idx);
         return;
     }
 
@@ -628,8 +688,9 @@ void TriangleSelector::bucket_fill_select_triangles(const Vec3f& hit, int facet_
         return touching_triangles;
     };
 
-    auto [neighbors, neighbors_propagated] = this->precompute_all_neighbors();
-    std::vector<bool>  visited(m_triangles.size(), false);
+    const NeighborCache& neighborCache = EnsureNeighborCache();
+    const uint32_t queryGeneration = BeginQueryGeneration(
+        m_triangleQueryStamp, m_triangleQueryGeneration, m_triangles.size());
     std::queue<int>    facet_queue;
 
     facet_queue.push(start_facet_idx);
@@ -638,12 +699,14 @@ void TriangleSelector::bucket_fill_select_triangles(const Vec3f& hit, int facet_
         facet_queue.pop();
         assert(!m_triangles[current_facet].is_split());
 
-        if (!visited[current_facet]) {
-            m_triangles[current_facet].select_by_seed_fill();
+        if (m_triangleQueryStamp[current_facet] != queryGeneration) {
+            SelectSeedFillLeaf(current_facet);
 
-            std::vector<int> touching_triangles = get_all_touching_triangles(current_facet, neighbors[current_facet], neighbors_propagated[current_facet]);
+            std::vector<int> touching_triangles = get_all_touching_triangles(
+                current_facet, neighborCache.neighbors[current_facet], neighborCache.propagated[current_facet]);
             for(const int tr_idx : touching_triangles) {
-                if (tr_idx < 0 || visited[tr_idx] || m_triangles[tr_idx].get_state() != start_facet_state || is_facet_clipped(tr_idx, clp))
+                if (tr_idx < 0 || m_triangleQueryStamp[tr_idx] == queryGeneration ||
+                    m_triangles[tr_idx].get_state() != start_facet_state || is_facet_clipped(tr_idx, clp))
                     continue;
 
                 const Vec3f& n1 = m_face_normals[m_triangles[tr_idx].source_triangle];
@@ -656,7 +719,7 @@ void TriangleSelector::bucket_fill_select_triangles(const Vec3f& hit, int facet_
             }
         }
 
-        visited[current_facet] = true;
+        m_triangleQueryStamp[current_facet] = queryGeneration;
     }
 }
 
@@ -1085,6 +1148,8 @@ void TriangleSelector::split_triangle(int facet_idx, const Vec3i32 &neighbors)
         return;
     }
 
+    PrepareForLeafIdentityChange();
+
     Triangle* tr = &m_triangles[facet_idx];
     assert(this->verify_triangle_neighbors(*tr, neighbors));
 
@@ -1249,6 +1314,7 @@ void TriangleSelector::undivide_triangle(int facet_idx)
     Triangle& tr = m_triangles[facet_idx];
 
     if (tr.is_split()) {
+        PrepareForLeafIdentityChange();
         const int sourceTriangle = tr.source_triangle;
         for (int i = 0; i <= tr.number_of_split_sides(); ++i) {
             int       child    = tr.children[i];
@@ -1326,6 +1392,8 @@ bool TriangleSelector::remove_useless_children(int facet_idx)
 
 void TriangleSelector::garbage_collect()
 {
+    PrepareForLeafIdentityChange();
+
     // First make a map from old to new triangle indices.
     int new_idx = m_orig_size_indices;
     std::vector<int> new_triangle_indices(m_triangles.size(), -1);
@@ -1412,6 +1480,7 @@ TriangleSelector::TriangleSelector(const TriangleMesh& mesh, float edge_limit)
 
 void TriangleSelector::reset()
 {
+    PrepareForLeafIdentityChange();
     ClearDeferredCleanup();
     m_vertices.clear();
     m_triangles.clear();
@@ -1422,6 +1491,7 @@ void TriangleSelector::reset()
     for (const stl_vertex& vert : m_mesh.its.vertices)
         m_vertices.emplace_back(vert);
     m_triangles.reserve(m_mesh.its.indices.size());
+    m_triangleQueryStamp.reserve(m_mesh.its.indices.size());
     for (size_t i = 0; i < m_mesh.its.indices.size(); ++i) {
         const stl_triangle_vertex_indices &ind = m_mesh.its.indices[i];
         push_triangle(ind[0], ind[1], ind[2], int(i));
@@ -1448,6 +1518,8 @@ int TriangleSelector::push_triangle(int a, int b, int c, int source_triangle, co
         assert(m_invalid_triangles == 0);
         idx = int(m_triangles.size());
         m_triangles.emplace_back(a, b, c, source_triangle, state);
+        m_triangleQueryStamp.resize(m_triangles.size(), 0);
+        m_triangleQueryStamp[idx] = 0;
     } else {
         // Reuse triangle from the free list.
         assert(m_free_triangles_head >= -1 && m_free_triangles_head < int(m_triangles.size()));
@@ -1461,6 +1533,7 @@ int TriangleSelector::push_triangle(int a, int b, int c, int source_triangle, co
         assert(m_invalid_triangles >= 0);
         assert((m_invalid_triangles == 0) == (m_free_triangles_head == -1));
         m_triangles[idx] = {a, b, c, source_triangle, state};
+        m_triangleQueryStamp[idx] = 0;
     }
     assert(m_triangles[idx].valid());
     return idx;
@@ -1472,11 +1545,21 @@ int TriangleSelector::push_triangle(int a, int b, int c, int source_triangle, co
 // Midpoint vertices are possibly reused by traversing children of neighbor triangles.
 void TriangleSelector::perform_split(int facet_idx, const Vec3i32 &neighbors, EnforcerBlockerType old_state)
 {
+    assert(m_seedFillSelectedLeaves.empty());
+
     // Reserve space for the new triangles upfront, so that the reference to this triangle will not change.
     {
         size_t num_triangles_new = m_triangles.size() + m_triangles[facet_idx].number_of_split_sides() + 1;
         if (m_triangles.capacity() < num_triangles_new)
-            m_triangles.reserve(next_highest_power_of_2(num_triangles_new));
+        {
+            const size_t newCapacity = next_highest_power_of_2(num_triangles_new);
+            m_triangles.reserve(newCapacity);
+            m_triangleQueryStamp.reserve(newCapacity);
+        }
+        else if (m_triangleQueryStamp.capacity() < num_triangles_new)
+        {
+            m_triangleQueryStamp.reserve(m_triangles.capacity());
+        }
     }
 
     Triangle &tr = m_triangles[facet_idx];
@@ -1868,6 +1951,7 @@ void TriangleSelector::deserialize(const TriangleSplittingData& data,
                                    EnforcerBlockerType          replace_filament,
                                    const EnforcerBlockerStateMap* state_map)
 {
+    PrepareForLeafIdentityChange();
     ClearDeferredCleanup();
     if (needs_reset)
         reset(); // dump any current state
@@ -1880,6 +1964,7 @@ void TriangleSelector::deserialize(const TriangleSplittingData& data,
     // Reserve number of triangles as if each triangle was saved with 4 bits.
     // With MMU painting this estimate may be somehow low, but better than nothing.
     m_triangles.reserve(std::max(m_mesh.its.indices.size(), data.bitstream.size() / 4));
+    m_triangleQueryStamp.reserve(m_triangles.capacity());
     // Number of triangles is twice the number of vertices on a large manifold mesh of genus zero.
     // Here the triangles count account for both the nodes and leaves, thus the following line may overestimate.
     m_vertices.reserve(std::max(m_mesh.its.vertices.size(), m_triangles.size() / 2));
@@ -2115,24 +2200,54 @@ bool TriangleSelector::has_facets(const TriangleSplittingData &data, const Enfor
 
 void TriangleSelector::seed_fill_unselect_all_triangles()
 {
-    for (Triangle &triangle : m_triangles)
-        if (!triangle.is_split())
+    for (int triangleIndex : m_seedFillSelectedLeaves)
+    {
+        if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
+            continue;
+
+        Triangle& triangle = m_triangles[triangleIndex];
+        if (triangle.valid() && !triangle.is_split() && triangle.is_selected_by_seed_fill())
             triangle.unselect_by_seed_fill();
+    }
+    m_seedFillSelectedLeaves.clear();
 }
 
-void TriangleSelector::seed_fill_apply_on_triangles(EnforcerBlockerType new_state)
+void TriangleSelector::seed_fill_apply_on_triangles(EnforcerBlockerType new_state, CleanupMode cleanupMode)
 {
-    for (size_t triangleIndex = 0; triangleIndex < m_triangles.size(); ++triangleIndex) {
+    std::vector<uint32_t> touchedRoots;
+    touchedRoots.reserve(m_seedFillSelectedLeaves.size());
+    for (int triangleIndex : m_seedFillSelectedLeaves)
+    {
+        if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
+            continue;
+
         Triangle& triangle = m_triangles[triangleIndex];
-        if (!triangle.is_split() && triangle.is_selected_by_seed_fill())
-            SetLeafStateWithoutCleanup(static_cast<int>(triangleIndex), new_state);
+        if (!triangle.valid() || triangle.is_split() || !triangle.is_selected_by_seed_fill() ||
+            triangle.get_state() == new_state)
+            continue;
+        if (triangle.source_triangle < 0 || triangle.source_triangle >= m_orig_size_indices)
+            continue;
+
+        triangle.set_state(new_state);
+        touchedRoots.push_back(static_cast<uint32_t>(triangle.source_triangle));
     }
 
-    for (Triangle &triangle : m_triangles)
-        if (triangle.is_split() && triangle.valid()) {
-            size_t facet_idx = &triangle - &m_triangles.front();
-            remove_useless_children(int(facet_idx));
-        }
+    seed_fill_unselect_all_triangles();
+    if (touchedRoots.empty())
+        return;
+
+    std::sort(touchedRoots.begin(), touchedRoots.end());
+    touchedRoots.erase(std::unique(touchedRoots.begin(), touchedRoots.end()), touchedRoots.end());
+
+    ++m_stateRevision;
+    for (uint32_t sourceTriangle : touchedRoots)
+    {
+        OnSelectorMutation(MutationKind::State, static_cast<int>(sourceTriangle));
+        RecordDeferredCleanupRoot(sourceTriangle);
+    }
+
+    if (cleanupMode == CleanupMode::Immediate)
+        FlushDeferredCleanup();
 }
 
 TriangleSelector::Cursor::Cursor(const Vec3f &source_, float radius_world, const Transform3d &trafo_, const ClippingPlane &clipping_plane_)

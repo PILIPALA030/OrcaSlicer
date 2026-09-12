@@ -20,6 +20,7 @@
 #include <optional>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
+#include <wx/glcanvas.h>
 
 namespace Slic3r::GUI {
 
@@ -71,6 +72,79 @@ GLGizmoPainterBase::~GLGizmoPainterBase()
     DetachTriangleSelectorGlResources();
     if (s_sphere != nullptr)
         s_sphere.reset();
+}
+
+void GLGizmoPainterBase::DiscardPaintingPreviewsAndFlush()
+{
+    for (const std::unique_ptr<TriangleSelectorGUI>& triangleSelector : m_triangle_selectors)
+        triangleSelector->ClearPointerPreview();
+
+    for (const std::unique_ptr<TriangleSelectorGUI>& triangleSelector : m_triangle_selectors)
+        triangleSelector->seed_fill_unselect_all_triangles();
+
+    for (const std::unique_ptr<TriangleSelectorGUI>& triangleSelector : m_triangle_selectors)
+    {
+        triangleSelector->FlushDeferredCleanup();
+        triangleSelector->request_update_render_data();
+    }
+    m_seed_fill_last_mesh_id = -1;
+    if (!m_triangle_selectors.empty())
+        m_parent.set_as_dirty();
+}
+
+void GLGizmoPainterBase::FinishPaintingInteraction()
+{
+    if (m_finishingPaintingInteraction)
+        return;
+
+    if (m_button_down != Button::None)
+    {
+        const wxString actionName = handle_snapshot_action_name(false, m_button_down);
+        FinalizePaintingStroke(actionName);
+        ReleasePaintingMouse();
+        return;
+    }
+
+    DiscardPaintingPreviewsAndFlush();
+    m_strokeHasCommittedState = false;
+}
+
+void GLGizmoPainterBase::FinalizePaintingStroke(const wxString& actionName)
+{
+    if (m_button_down == Button::None || m_finishingPaintingInteraction)
+        return;
+
+    m_finishingPaintingInteraction = true;
+    DiscardPaintingPreviewsAndFlush();
+
+    if (m_strokeHasCommittedState)
+    {
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), std::string(actionName.ToUTF8().data()),
+                                      UndoRedo::SnapshotType::GizmoAction);
+        update_model_object();
+    }
+
+    m_button_down = Button::None;
+    m_strokeHasCommittedState = false;
+    m_last_mouse_click = Vec2d::Zero();
+    m_finishingPaintingInteraction = false;
+}
+
+void GLGizmoPainterBase::CapturePaintingMouse()
+{
+    if (m_button_down == Button::None)
+        return;
+
+    wxGLCanvas* canvas = m_parent.get_wxglcanvas();
+    if (canvas != nullptr && wxWindow::GetCapture() == nullptr)
+        canvas->CaptureMouse();
+}
+
+void GLGizmoPainterBase::ReleasePaintingMouse()
+{
+    wxGLCanvas* canvas = m_parent.get_wxglcanvas();
+    if (canvas != nullptr && canvas->HasCapture())
+        canvas->ReleaseMouse();
 }
 
 void GLGizmoPainterBase::DetachTriangleSelectorGlResources()
@@ -672,9 +746,13 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
             }
 
             if (m_tool_type == ToolType::BUCKET_FILL || m_tool_type == ToolType::SMART_FILL) {
+                if (m_tool_type == ToolType::BUCKET_FILL && m_smart_fill_angle < 0.f)
+                    return true;
+
                 m_smart_fill_angle = action == SLAGizmoEventType::MouseWheelDown ? std::max(m_smart_fill_angle - SmartFillAngleStep, SmartFillAngleMin)
-                                                                                : std::min(m_smart_fill_angle + SmartFillAngleStep, SmartFillAngleMax);
+                                                                                 : std::min(m_smart_fill_angle + SmartFillAngleStep, SmartFillAngleMax);
                 m_parent.set_as_dirty();
+                FinishPaintingInteraction();
                 if (m_rr.mesh_id != -1) {
                     const Selection     &selection                 = m_parent.get_selection();
                     const ModelObject   *mo                        = m_c->selection_info()->model_object();
@@ -685,8 +763,16 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
                     const Transform3d   trafo_matrix = m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView ?
                         mi->get_assemble_transformation().get_matrix() * mo->volumes[m_rr.mesh_id]->get_matrix() :
                         mi->get_transformation().get_matrix() * mo->volumes[m_rr.mesh_id]->get_matrix();
-                    m_triangle_selectors[m_rr.mesh_id]->seed_fill_select_triangles(m_rr.hit, int(m_rr.facet), trafo_matrix_not_translate, this->get_clipping_plane_in_volume_coordinates(trafo_matrix), m_smart_fill_angle,
-                                                                                   m_paint_on_overhangs_only ? m_highlight_by_angle_threshold_deg : 0.f, true);
+                    const TriangleSelector::ClippingPlane& clippingPlane =
+                        get_clipping_plane_in_volume_coordinates(trafo_matrix);
+                    if (m_tool_type == ToolType::BUCKET_FILL)
+                        m_triangle_selectors[m_rr.mesh_id]->bucket_fill_select_triangles(
+                            m_rr.hit, static_cast<int>(m_rr.facet), clippingPlane, m_smart_fill_angle, true, true);
+                    else
+                        m_triangle_selectors[m_rr.mesh_id]->seed_fill_select_triangles(
+                            m_rr.hit, static_cast<int>(m_rr.facet), trafo_matrix_not_translate, clippingPlane,
+                            m_smart_fill_angle,
+                            m_paint_on_overhangs_only ? m_highlight_by_angle_threshold_deg : 0.f, true);
                     m_triangle_selectors[m_rr.mesh_id]->request_update_render_data();
                     m_seed_fill_last_mesh_id = m_rr.mesh_id;
                 }
@@ -785,8 +871,10 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
                 // Missing the object entirely
                 // shall not capture the mouse.
                 const bool dragging_while_painting = (action == SLAGizmoEventType::Dragging && m_button_down != Button::None);
-                if (mesh_idx != -1 && m_button_down == Button::None)
+                if (mesh_idx != -1 && m_button_down == Button::None) {
                     m_button_down = ((action == SLAGizmoEventType::LeftDown) ? Button::Left : Button::Right);
+                    m_strokeHasCommittedState = false;
+                }
 
                 const Transform3d& trafo_matrix = trafo_matrices[mesh_idx];
                 const Transform3d& trafo_matrix_not_translate = trafo_matrices_not_translate[mesh_idx];
@@ -797,10 +885,15 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
 
                 std::unique_ptr<TriangleSelector::Cursor> cursor = TriangleSelector::SinglePointCursor::cursor_factory(phr.z_world,
                     camera_pos, m_cursor_height, trafo_matrix, clp);
-                m_triangle_selectors[mesh_idx]->select_patch(int(phr.first_facet_idx), std::move(cursor), new_state, trafo_matrix_not_translate,
-                    m_triangle_splitting_enabled, m_paint_on_overhangs_only ? m_highlight_by_angle_threshold_deg : 0.f);
+                TriangleSelectorGUI& triangleSelector = *m_triangle_selectors[mesh_idx];
+                const uint64_t stateRevisionBefore = triangleSelector.GetStateRevision();
+                triangleSelector.select_patch(int(phr.first_facet_idx), std::move(cursor), new_state, trafo_matrix_not_translate,
+                                              m_triangle_splitting_enabled,
+                                              m_paint_on_overhangs_only ? m_highlight_by_angle_threshold_deg : 0.f);
 
-                m_triangle_selectors[mesh_idx]->request_update_render_data(true);
+                const bool selectorChanged = triangleSelector.GetStateRevision() != stateRevisionBefore;
+                m_strokeHasCommittedState |= selectorChanged;
+                triangleSelector.request_update_render_data(true);
                 m_last_mouse_click = _mouse_position;
             }
 
@@ -817,7 +910,6 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
         std::vector<std::vector<ProjectedMousePosition>> projected_mouse_positions_by_mesh = get_projected_mouse_positions(_mouse_position, 1., trafo_matrices);
         m_last_mouse_click = Vec2d::Zero(); // only actual hits should be saved
         const bool pointerTool = m_tool_type == ToolType::BRUSH && m_cursor_type == TriangleSelector::CursorType::POINTER;
-        bool pointerPreviewUpdated = false;
         if (pointerTool)
             for (const std::unique_ptr<TriangleSelectorGUI>& triangleSelector : m_triangle_selectors)
                 triangleSelector->SetPointerPreviewEnabled(true);
@@ -834,13 +926,15 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
             // Missing the object entirely
             // shall not capture the mouse.
             if (mesh_idx != -1)
-                if (m_button_down == Button::None)
+                if (m_button_down == Button::None) {
                     m_button_down = ((action == SLAGizmoEventType::LeftDown) ? Button::Left : Button::Right);
+                    m_strokeHasCommittedState = false;
+                }
 
             // In case we have no valid hit, we can return. The event will be stopped when
             // dragging while painting (to prevent scene rotations and moving the object)
             if (mesh_idx == -1) {
-                if (pointerTool && !pointerPreviewUpdated)
+                if (pointerTool)
                     for (const std::unique_ptr<TriangleSelectorGUI>& triangleSelector : m_triangle_selectors)
                         triangleSelector->ClearPointerPreview();
                 return dragging_while_painting;
@@ -850,19 +944,19 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
             if (pointerTool) {
                 for (const ProjectedMousePosition& projectedMousePosition : projected_mouse_positions) {
                     assert(projectedMousePosition.mesh_idx == mesh_idx);
-                    const int leafIndex = m_triangle_selectors[mesh_idx]->select_unsplit_triangle(
-                        projectedMousePosition.mesh_hit, static_cast<int>(projectedMousePosition.facet_idx));
-                    if (leafIndex >= 0)
-                        m_triangle_selectors[mesh_idx]->SetLeafState(leafIndex, new_state, TriangleSelector::CleanupMode::Deferred);
-                }
-                if (!pointerPreviewUpdated) {
+
+                    for (const std::unique_ptr<TriangleSelectorGUI>& triangleSelector : m_triangle_selectors) {
+                        if (triangleSelector->CommitPointerPreview(new_state, TriangleSelector::CleanupMode::Deferred)) {
+                            triangleSelector->request_update_render_data(true);
+                            m_strokeHasCommittedState = true;
+                        }
+                    }
+
                     for (size_t selectorIndex = 0; selectorIndex < m_triangle_selectors.size(); ++selectorIndex)
                         if (selectorIndex != static_cast<size_t>(mesh_idx))
                             m_triangle_selectors[selectorIndex]->ClearPointerPreview();
-                    const ProjectedMousePosition& previewPosition = projected_mouse_positions.front();
                     m_triangle_selectors[mesh_idx]->UpdatePointerPreview(
-                        previewPosition.mesh_hit, static_cast<int>(previewPosition.facet_idx));
-                    pointerPreviewUpdated = true;
+                        projectedMousePosition.mesh_hit, static_cast<int>(projectedMousePosition.facet_idx));
                 }
                 m_seed_fill_last_mesh_id = -1;
             } else {
@@ -876,13 +970,18 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
                         assert(projectedMousePosition.mesh_idx == mesh_idx);
                         const Vec3f meshHit = projectedMousePosition.mesh_hit;
                         const int facetIndex = static_cast<int>(projectedMousePosition.facet_idx);
-                        m_triangle_selectors[mesh_idx]->seed_fill_apply_on_triangles(new_state);
+                        const TriangleSelector::CleanupMode cleanupMode = m_tool_type == ToolType::BUCKET_FILL ?
+                            TriangleSelector::CleanupMode::Deferred : TriangleSelector::CleanupMode::Immediate;
+                        TriangleSelectorGUI& triangleSelector = *m_triangle_selectors[mesh_idx];
+                        const uint64_t stateRevisionBefore = triangleSelector.GetStateRevision();
+                        triangleSelector.seed_fill_apply_on_triangles(new_state, cleanupMode);
+                        m_strokeHasCommittedState |= triangleSelector.GetStateRevision() != stateRevisionBefore;
                         if (m_tool_type == ToolType::SMART_FILL)
-                            m_triangle_selectors[mesh_idx]->seed_fill_select_triangles(
+                            triangleSelector.seed_fill_select_triangles(
                                 meshHit, facetIndex, trafoMatrixNotTranslate, clippingPlane, m_smart_fill_angle,
                                 m_paint_on_overhangs_only ? m_highlight_by_angle_threshold_deg : 0.f, true);
                         else
-                            m_triangle_selectors[mesh_idx]->bucket_fill_select_triangles(
+                            triangleSelector.bucket_fill_select_triangles(
                                 meshHit, facetIndex, clippingPlane, m_smart_fill_angle, true, true);
 
                         m_seed_fill_last_mesh_id = -1;
@@ -890,6 +989,7 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
                 } else if (m_tool_type == ToolType::BRUSH) {
                     assert(m_cursor_type == TriangleSelector::CursorType::CIRCLE ||
                            m_cursor_type == TriangleSelector::CursorType::SPHERE);
+                    const uint64_t stateRevisionBefore = m_triangle_selectors[mesh_idx]->GetStateRevision();
 
                     if (projected_mouse_positions.size() == 1) {
                         const ProjectedMousePosition& firstPosition = projected_mouse_positions.front();
@@ -912,10 +1012,11 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
                                 m_paint_on_overhangs_only ? m_highlight_by_angle_threshold_deg : 0.f);
                         }
                     }
+                    m_strokeHasCommittedState |= m_triangle_selectors[mesh_idx]->GetStateRevision() != stateRevisionBefore;
                 }
             }
 
-            m_triangle_selectors[mesh_idx]->request_update_render_data(true);
+            m_triangle_selectors[mesh_idx]->request_update_render_data(!pointerTool);
 
             m_last_mouse_click = _mouse_position;
         }
@@ -1015,20 +1116,8 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
 
     if ((action == SLAGizmoEventType::LeftUp || action == SLAGizmoEventType::RightUp)
       && m_button_down != Button::None) {
-        // Take snapshot and update ModelVolume data.
-        wxString action_name = this->handle_snapshot_action_name(shift_down, m_button_down);
-        Plater::TakeSnapshot snapshot(wxGetApp().plater(), std::string(action_name.ToUTF8().data()), UndoRedo::SnapshotType::GizmoAction);
-        if (m_tool_type == ToolType::BRUSH && m_cursor_type == TriangleSelector::CursorType::POINTER) {
-            for (const std::unique_ptr<TriangleSelectorGUI>& triangleSelector : m_triangle_selectors)
-                triangleSelector->ClearPointerPreview();
-            for (const std::unique_ptr<TriangleSelectorGUI>& triangleSelector : m_triangle_selectors)
-                triangleSelector->FlushDeferredCleanup();
-            m_parent.set_as_dirty();
-        }
-        update_model_object();
-
-        m_button_down = Button::None;
-        m_last_mouse_click = Vec2d::Zero();
+        const wxString actionName = handle_snapshot_action_name(shift_down, m_button_down);
+        FinalizePaintingStroke(actionName);
         return true;
     }
 
@@ -1060,6 +1149,7 @@ bool GLGizmoPainterBase::on_mouse(const wxMouseEvent &mouse_event)
         {
             // the gizmo got the event and took some action, there is no need
             // to do anything more
+            CapturePaintingMouse();
             m_parent.set_as_dirty();
             return true;
         }
@@ -1070,6 +1160,7 @@ bool GLGizmoPainterBase::on_mouse(const wxMouseEvent &mouse_event)
             gizmo_event(SLAGizmoEventType::RightDown, mouse_pos, false, false, false))
         {
             // event was taken care of
+            CapturePaintingMouse();
             m_parent.set_as_dirty();
             return true;
         }
@@ -1092,6 +1183,7 @@ bool GLGizmoPainterBase::on_mouse(const wxMouseEvent &mouse_event)
                 gizmo_event(SLAGizmoEventType::LeftUp, mouse_pos, mouse_event.ShiftDown(), mouse_event.AltDown(), true);
             else if (mouse_event.RightIsDown())
                 gizmo_event(SLAGizmoEventType::RightUp, mouse_pos, mouse_event.ShiftDown(), mouse_event.AltDown(), true);
+            ReleasePaintingMouse();
             return false;
         }
     } else if (mouse_event.LeftUp()) {
@@ -1109,6 +1201,15 @@ bool GLGizmoPainterBase::on_mouse(const wxMouseEvent &mouse_event)
         }
     }
     return false;
+}
+
+void GLGizmoPainterBase::OnMouseCaptureLost()
+{
+    if (m_button_down == Button::None)
+        return;
+
+    const wxString actionName = handle_snapshot_action_name(false, m_button_down);
+    FinalizePaintingStroke(actionName);
 }
 
 void GLGizmoPainterBase::update_raycast_cache(const Vec2d& mouse_position,
@@ -1215,6 +1316,7 @@ void GLGizmoPainterBase::on_set_state()
     }
     if (m_state == Off && m_old_state != Off) { // the gizmo was just turned Off
         m_parent.enable_picking(true);
+        FinishPaintingInteraction();
         // we are actually shutting down
         on_shutdown();
         m_old_mo_id = -1;
@@ -1301,6 +1403,14 @@ bool TriangleSelectorGUI::UpdatePointerPreview(const Vec3f& hit, int facetIndex)
     return true;
 }
 
+bool TriangleSelectorGUI::CommitPointerPreview(EnforcerBlockerType state, CleanupMode cleanupMode)
+{
+    if (!m_pointerPreviewEnabled || m_pointerPreviewLeaf < 0)
+        return false;
+
+    return SetLeafState(m_pointerPreviewLeaf, state, cleanupMode);
+}
+
 bool TriangleSelectorGUI::ClearPointerPreview()
 {
     if (m_pointerPreviewLeaf == -1 && !m_pointerPreviewVertices.has_value())
@@ -1317,12 +1427,20 @@ bool TriangleSelectorGUI::ClearPointerPreview()
 
 void TriangleSelectorGUI::InvalidatePointerPreview()
 {
+    if (m_pointerPreviewLeaf == -1 && !m_pointerPreviewVertices.has_value())
+        return;
+
     m_pointerPreviewLeaf = -1;
     m_pointerPreviewVertices.reset();
     if (m_pointerPreviewEnabled) {
         m_pointerPreviewDirty = true;
         m_update_render_data = true;
     }
+}
+
+void TriangleSelectorGUI::OnLeafIdentityWillChange()
+{
+    InvalidatePointerPreview();
 }
 
 void TriangleSelectorGUI::OnSelectorMutation(MutationKind kind, int sourceTriangle)
@@ -1814,7 +1932,7 @@ void TriangleSelectorPatch::update_selector_triangles()
 
 void TriangleSelectorPatch::update_triangles_per_patch()
 {
-    auto [neighbors, neighbors_propagated] = this->precompute_all_neighbors();
+    const NeighborCache& neighborCache = EnsureNeighborCache();
     std::vector<bool>  visited(m_triangles.size(), false);
 
     bool using_wireframe = (m_need_wireframe && wxGetApp().plater()->is_wireframe_enabled() && wxGetApp().plater()->is_show_wireframe()) ? true : false; 
@@ -1906,7 +2024,8 @@ void TriangleSelectorPatch::update_triangles_per_patch()
                 //patch.triangle_indices.insert(patch.triangle_indices.end(), triangle.verts_idxs.begin(), triangle.verts_idxs.end());
                 patch.facet_indices.push_back(current_facet);
 
-                std::vector<int> touching_triangles = get_all_touching_triangles(current_facet, neighbors[current_facet], neighbors_propagated[current_facet]);
+                std::vector<int> touching_triangles = get_all_touching_triangles(
+                    current_facet, neighborCache.neighbors[current_facet], neighborCache.propagated[current_facet]);
                 for (const int tr_idx : touching_triangles) {
                     if (tr_idx < 0)
                         continue;

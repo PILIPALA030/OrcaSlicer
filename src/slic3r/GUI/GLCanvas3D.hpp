@@ -31,6 +31,7 @@ class wxSizeEvent;
 class wxIdleEvent;
 class wxKeyEvent;
 class wxMouseEvent;
+class wxMouseCaptureLostEvent;
 class wxTimerEvent;
 class wxPaintEvent;
 class wxGLCanvas;
@@ -1034,6 +1035,7 @@ public:
     void on_render_timer(wxTimerEvent& evt);
     void on_set_color_timer(wxTimerEvent& evt);
     void on_mouse(wxMouseEvent& evt);
+    void OnMouseCaptureLost(wxMouseCaptureLostEvent& event);
     void on_gesture(wxGestureEvent& evt);
     void on_paint(wxPaintEvent& evt);
     void on_set_focus(wxFocusEvent& evt);

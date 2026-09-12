@@ -291,7 +291,16 @@ public:
         template<class Archive> void serialize(Archive &ar) { ar(triangles_to_split, bitstream, used_states); }
     };
 
-    std::pair<std::vector<Vec3i32>, std::vector<Vec3i32>> precompute_all_neighbors() const;
+    struct NeighborCache
+    {
+        uint64_t topologyRevision = 0;
+        uint64_t indexRevision = 0;
+        std::vector<Vec3i32> neighbors;
+        std::vector<Vec3i32> propagated;
+    };
+
+    /** Returns leaf-neighbor data and rebuilds it only after topology or triangle-index changes. */
+    const NeighborCache& EnsureNeighborCache() const;
     void precompute_all_neighbors_recursive(int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<Vec3i32> &neighbors_out, std::vector<Vec3i32> &neighbors_normal_out) const;
 
     // Set a limit to the edge length, below which the edge will not be split by select_patch().
@@ -392,7 +401,7 @@ public:
 
     // For all triangles selected by seed fill, set new EnforcerBlockerType and remove flag indicating that triangle was selected by seed fill.
     // The operation may merge split triangles if they are being assigned the same color.
-    void seed_fill_apply_on_triangles(EnforcerBlockerType new_state);
+    void seed_fill_apply_on_triangles(EnforcerBlockerType new_state, CleanupMode cleanupMode = CleanupMode::Immediate);
 
 protected:
     enum class MutationKind : uint8_t
@@ -405,6 +414,8 @@ protected:
     };
 
     virtual void OnSelectorMutation(MutationKind kind, int sourceTriangle) {}
+    /** Invalidates derived-class caches that retain current leaf indices before those indices may change. */
+    virtual void OnLeafIdentityWillChange() {}
 
     // Triangle and info about how it's split.
     class Triangle {
@@ -507,6 +518,7 @@ protected:
     uint64_t m_topologyRevision = 1;
     uint64_t m_triangleIndexRevision = 1;
     uint64_t m_stateRevision = 1;
+    mutable NeighborCache m_neighborCache;
 
     std::unique_ptr<Cursor> m_cursor;
     // Zero indicates an uninitialized state.
@@ -515,6 +527,10 @@ protected:
     // Private functions:
 private:
     bool SetLeafStateWithoutCleanup(int triangleIndex, EnforcerBlockerType state, int* sourceTriangle = nullptr);
+    bool SelectSeedFillLeaf(int triangleIndex);
+    /** Advances one reusable query generation and grows its stamp storage when needed. */
+    uint32_t BeginQueryGeneration(std::vector<uint32_t>& queryStamp, uint32_t& queryGeneration, size_t requiredSize);
+    void PrepareForLeafIdentityChange();
     void RecordDeferredCleanupRoot(uint32_t sourceTriangle);
     void ClearDeferredCleanup();
     bool select_triangle(int facet_idx, EnforcerBlockerType type, bool triangle_splitting);
@@ -564,6 +580,11 @@ private:
     void get_seed_fill_contour_recursive(int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<Vec2i32> &edges_out) const;
 
     std::vector<uint32_t> m_deferredCleanupRoots;
+    std::vector<int> m_seedFillSelectedLeaves;
+    uint32_t m_rootQueryGeneration { 0 };
+    std::vector<uint32_t> m_rootQueryStamp;
+    uint32_t m_triangleQueryGeneration { 0 };
+    std::vector<uint32_t> m_triangleQueryStamp;
     int m_free_triangles_head { -1 };
     int m_free_vertices_head { -1 };
 };

@@ -294,6 +294,7 @@ public:
     std::string get_tooltip() const;
 
     bool on_mouse(const wxMouseEvent &mouse_event);
+    void OnMouseCaptureLost();
     bool on_mouse_wheel(const wxMouseEvent &evt);
     bool on_char(wxKeyEvent& evt);
     bool on_key(wxKeyEvent& evt);

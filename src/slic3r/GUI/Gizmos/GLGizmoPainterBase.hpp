@@ -47,6 +47,8 @@ public:
     void SetPointerPreviewEnabled(bool enabled);
     /** Updates the Pointer preview from a raycast hit and reports whether its cached leaf changed. */
     bool UpdatePointerPreview(const Vec3f& hit, int facetIndex);
+    /** Applies the previously cached Pointer preview leaf without changing the current preview. */
+    bool CommitPointerPreview(EnforcerBlockerType state, CleanupMode cleanupMode);
     /** Clears the cached Pointer leaf and reports whether visible preview data changed. */
     bool ClearPointerPreview();
 
@@ -74,6 +76,7 @@ protected:
 
     static ColorRGBA get_seed_fill_color(const ColorRGBA &base_color);
     void OnSelectorMutation(MutationKind kind, int sourceTriangle) override;
+    void OnLeafIdentityWillChange() override;
 
 private:
     void update_render_data();
@@ -325,6 +328,7 @@ public:
     /// <returns>Return True when use the information and don't want to
     /// propagate it otherwise False.</returns>
     bool on_mouse(const wxMouseEvent &mouse_event) override;
+    void OnMouseCaptureLost() override;
 
 protected:
     virtual void render_triangles(const Selection& selection) const;
@@ -344,6 +348,17 @@ protected:
 
     virtual EnforcerBlockerType get_left_button_state_type() const { return EnforcerBlockerType::ENFORCER; }
     virtual EnforcerBlockerType get_right_button_state_type() const { return EnforcerBlockerType::BLOCKER; }
+
+    /** Ends an active painter stroke or clears all leaf-index previews before a tool/lifecycle change. */
+    void FinishPaintingInteraction();
+    /** Discards uncommitted previews and flushes deferred root cleanup for every selector. */
+    void DiscardPaintingPreviewsAndFlush();
+    /** Ends one active stroke and persists it only when selector state actually changed. */
+    void FinalizePaintingStroke(const wxString& actionName);
+    /** Captures mouse input so an active stroke receives release events outside the canvas. */
+    void CapturePaintingMouse();
+    /** Releases mouse input when a stroke ends without a physical mouse-up event. */
+    void ReleasePaintingMouse();
 
     float m_cursor_radius = 1.f;
     // BBS
@@ -438,6 +453,8 @@ private:
     Vec2d m_last_mouse_click = Vec2d::Zero();
 
     Button m_button_down = Button::None;
+    bool m_strokeHasCommittedState = false;
+    bool m_finishingPaintingInteraction = false;
     EState m_old_state = Off; // to be able to see that the gizmo has just been closed (see on_set_state)
 
     // Following cache holds result of a raycast query. The queries are asked
