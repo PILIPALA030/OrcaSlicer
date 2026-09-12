@@ -1816,15 +1816,56 @@ void TriangleSelector::get_facets_split_by_tjoints(const Vec3i32 &vertices, cons
     }
 }
 
-std::vector<Vec2i32> TriangleSelector::get_seed_fill_contour() const {
-    std::vector<Vec2i32> edges_out;
-    for (int facet_idx = 0; facet_idx < this->m_orig_size_indices; ++facet_idx) {
-        const Vec3i32 neighbors = m_neighbors[facet_idx];
-        assert(this->verify_triangle_neighbors(m_triangles[facet_idx], neighbors));
-        this->get_seed_fill_contour_recursive(facet_idx, neighbors, neighbors, edges_out);
+std::vector<Vec2i32> TriangleSelector::get_seed_fill_contour() const
+{
+    if (m_seedFillSelectedLeaves.empty())
+        return {};
+
+    std::vector<uint32_t> sourceRoots;
+    sourceRoots.reserve(m_seedFillSelectedLeaves.size());
+    for (int triangleIndex : m_seedFillSelectedLeaves)
+    {
+        if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
+            continue;
+
+        const Triangle& triangle = m_triangles[triangleIndex];
+        if (!triangle.valid() || triangle.is_split() || !triangle.is_selected_by_seed_fill() ||
+            triangle.source_triangle < 0 || triangle.source_triangle >= m_orig_size_indices)
+            continue;
+
+        sourceRoots.push_back(static_cast<uint32_t>(triangle.source_triangle));
     }
 
-    return edges_out;
+    return get_seed_fill_contour(sourceRoots);
+}
+
+std::vector<Vec2i32> TriangleSelector::get_seed_fill_contour(const std::vector<uint32_t>& sourceRoots) const
+{
+    if (sourceRoots.empty())
+        return {};
+
+    std::vector<uint32_t> uniqueSourceRoots;
+    uniqueSourceRoots.reserve(sourceRoots.size());
+    for (uint32_t sourceRoot : sourceRoots)
+        if (sourceRoot < static_cast<uint32_t>(m_orig_size_indices))
+            uniqueSourceRoots.push_back(sourceRoot);
+
+    if (uniqueSourceRoots.empty())
+        return {};
+
+    std::sort(uniqueSourceRoots.begin(), uniqueSourceRoots.end());
+    uniqueSourceRoots.erase(std::unique(uniqueSourceRoots.begin(), uniqueSourceRoots.end()), uniqueSourceRoots.end());
+
+    std::vector<Vec2i32> edgesOut;
+    for (uint32_t sourceRoot : uniqueSourceRoots)
+    {
+        const int rootIndex = static_cast<int>(sourceRoot);
+        const Vec3i32 neighbors = m_neighbors[rootIndex];
+        assert(verify_triangle_neighbors(m_triangles[rootIndex], neighbors));
+        get_seed_fill_contour_recursive(rootIndex, neighbors, neighbors, edgesOut);
+    }
+
+    return edgesOut;
 }
 
 void TriangleSelector::get_seed_fill_contour_recursive(const int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<Vec2i32> &edges_out) const {

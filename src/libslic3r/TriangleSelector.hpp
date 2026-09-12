@@ -364,6 +364,8 @@ public:
     indexed_triangle_set get_facets_strict(EnforcerBlockerType state) const;
     // Get edges around the selected area by seed fill.
     std::vector<Vec2i32> get_seed_fill_contour() const;
+    // Get seed-fill contour edges by traversing only the supplied original source roots.
+    std::vector<Vec2i32> get_seed_fill_contour(const std::vector<uint32_t>& sourceRoots) const;
 
     // BBS
     void get_facets(std::vector<indexed_triangle_set>& facets_per_type) const;
