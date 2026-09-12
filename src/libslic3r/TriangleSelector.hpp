@@ -7,7 +7,10 @@
 #include <array>
 #include <cfloat>
 #include <cstdint>
+#include <memory>
 #include <optional>
+#include <utility>
+#include <vector>
 #include "Point.hpp"
 #include "TriangleMesh.hpp"
 
@@ -303,6 +306,35 @@ public:
     const NeighborCache& EnsureNeighborCache() const;
     void precompute_all_neighbors_recursive(int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<Vec3i32> &neighbors_out, std::vector<Vec3i32> &neighbors_normal_out) const;
 
+    /** Conservatively indexes original source roots by their world-space Z spans. */
+    class HeightRangeIndex
+    {
+    public:
+        void Build(const TriangleMesh& mesh, const Transform3d& effectiveTransform);
+        bool Matches(const TriangleMesh& mesh, const Transform3d& effectiveTransform) const;
+        const std::vector<uint32_t>& Query(float zBottomWorld, float zTopWorld);
+        size_t GetBucketCount() const { return m_buckets.size(); }
+        size_t GetTotalBucketReferences() const { return m_totalBucketReferences; }
+        size_t GetLongSpanRootCount() const { return m_longSpanRoots.size(); }
+
+    private:
+        size_t BucketIndex(float zWorld) const;
+
+        const TriangleMesh* m_mesh = nullptr;
+        Transform3d m_effectiveTransform = Transform3d::Identity();
+        float m_minZ = 0.f;
+        float m_maxZ = 0.f;
+        float m_bucketSize = 1.f;
+        std::vector<std::vector<uint32_t>> m_buckets;
+        std::vector<uint32_t> m_longSpanRoots;
+        std::vector<std::pair<float, float>> m_rootZSpans;
+        uint32_t m_queryGeneration = 0;
+        std::vector<uint32_t> m_sourceQueryGeneration;
+        std::vector<uint32_t> m_queryCandidates;
+        size_t m_totalBucketReferences = 0;
+        bool m_initialized = false;
+    };
+
     // Set a limit to the edge length, below which the edge will not be split by select_patch().
     // Called by select_patch() internally. Made public for debugging purposes, see TriangleSelectorGUI::render_debug().
     void set_edge_limit(float edge_limit);
@@ -315,6 +347,14 @@ public:
     {
         Immediate,
         Deferred
+    };
+
+    struct HeightRangeSelectionOptions
+    {
+        EnforcerBlockerType state = EnforcerBlockerType::NONE;
+        Transform3d transformNoTranslate = Transform3d::Identity();
+        bool triangleSplitting = true;
+        float highlightByAngleDeg = 0.f;
     };
 
     uint64_t GetTopologyRevision() const noexcept { return m_topologyRevision; }
@@ -339,6 +379,10 @@ public:
                       const Transform3d        &trafo_no_translate,            // matrix to get from mesh to world without translation
                       bool                      triangle_splitting,            // If triangles will be split base on the cursor or not
                       float                     highlight_by_angle_deg = 0.f); // The maximal angle of overhang. If it is set to a non-zero value, it is possible to paint only the triangles of overhang defined by this angle in degrees.
+
+    /** Applies a height-range cursor directly to indexed source-root candidates without root-neighbor traversal. */
+    void SelectHeightRange(const std::vector<uint32_t>& sourceRoots, std::unique_ptr<HeightRange>&& cursor,
+                           const HeightRangeSelectionOptions& options);
 
     void seed_fill_select_triangles(const Vec3f        &hit,                          // point where to start
                                     int                 facet_start,                  // facet of the original mesh (unsplit) that the hit point belongs to
@@ -528,6 +572,7 @@ protected:
 
     // Private functions:
 private:
+    bool PrepareSelectionCursor(std::unique_ptr<Cursor> cursor);
     bool SetLeafStateWithoutCleanup(int triangleIndex, EnforcerBlockerType state, int* sourceTriangle = nullptr);
     bool SelectSeedFillLeaf(int triangleIndex);
     /** Advances one reusable query generation and grows its stamp storage when needed. */

@@ -5,6 +5,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/log/trivial.hpp>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <limits>
 #include <tbb/parallel_for.h>
@@ -14,6 +15,195 @@
 #endif // NDEBUG
 
 namespace Slic3r {
+
+void TriangleSelector::HeightRangeIndex::Build(const TriangleMesh& mesh, const Transform3d& effectiveTransform)
+{
+    constexpr size_t MAX_BUCKET_COUNT = 65536;
+    constexpr size_t MAX_BUCKETS_PER_ROOT = 32;
+    constexpr size_t MAX_REFERENCES_PER_ROOT_BUDGET = 4;
+
+    *this = HeightRangeIndex();
+    m_mesh = &mesh;
+    m_effectiveTransform = effectiveTransform;
+    m_initialized = true;
+
+    const indexed_triangle_set& indexedTriangles = mesh.its;
+    const size_t rootCount = indexedTriangles.indices.size();
+    if (rootCount == 0)
+        return;
+
+    const float infinity = std::numeric_limits<float>::infinity();
+    m_rootZSpans.assign(rootCount, std::make_pair(infinity, -infinity));
+    bool hasFiniteSpan = false;
+    float minimumZ = std::numeric_limits<float>::max();
+    float maximumZ = std::numeric_limits<float>::lowest();
+
+    for (size_t rootIndex = 0; rootIndex < rootCount; ++rootIndex)
+    {
+        const stl_triangle_vertex_indices& triangle = indexedTriangles.indices[rootIndex];
+        float rootMinimumZ = std::numeric_limits<float>::max();
+        float rootMaximumZ = std::numeric_limits<float>::lowest();
+        bool validSpan = true;
+
+        for (int vertexOffset = 0; vertexOffset < 3; ++vertexOffset)
+        {
+            const int vertexIndex = triangle(vertexOffset);
+            if (vertexIndex < 0 || vertexIndex >= static_cast<int>(indexedTriangles.vertices.size()))
+            {
+                validSpan = false;
+                break;
+            }
+
+            const stl_vertex& vertex = indexedTriangles.vertices[vertexIndex];
+            const Vec3d worldVertex = effectiveTransform * Vec3d(vertex.x(), vertex.y(), vertex.z());
+            if (!worldVertex.allFinite())
+            {
+                validSpan = false;
+                break;
+            }
+
+            const float worldZ = static_cast<float>(worldVertex.z());
+            if (!std::isfinite(worldZ))
+            {
+                validSpan = false;
+                break;
+            }
+
+            rootMinimumZ = std::min(rootMinimumZ, worldZ);
+            rootMaximumZ = std::max(rootMaximumZ, worldZ);
+        }
+
+        if (!validSpan)
+        {
+            m_rootZSpans[rootIndex] = std::make_pair(-infinity, infinity);
+            continue;
+        }
+
+        m_rootZSpans[rootIndex] = std::make_pair(rootMinimumZ, rootMaximumZ);
+        minimumZ = std::min(minimumZ, rootMinimumZ);
+        maximumZ = std::max(maximumZ, rootMaximumZ);
+        hasFiniteSpan = true;
+    }
+
+    if (hasFiniteSpan)
+    {
+        m_minZ = minimumZ;
+        m_maxZ = maximumZ;
+    }
+
+    const size_t targetBucketCount = std::max<size_t>(1, std::min(rootCount, MAX_BUCKET_COUNT));
+    const double zExtent = static_cast<double>(m_maxZ) - static_cast<double>(m_minZ);
+    if (targetBucketCount > 1 && std::floor(zExtent / static_cast<double>(m_bucketSize)) + 1.0 > targetBucketCount)
+    {
+        const double requiredBucketSize = zExtent / static_cast<double>(targetBucketCount - 1);
+        m_bucketSize = requiredBucketSize > static_cast<double>(std::numeric_limits<float>::max()) ?
+            std::numeric_limits<float>::max() : std::max(static_cast<float>(requiredBucketSize), std::numeric_limits<float>::epsilon());
+    }
+
+    size_t bucketCount = 1;
+    if (targetBucketCount > 1 && zExtent > 0.0)
+    {
+        const double calculatedBucketCount = std::floor(zExtent / static_cast<double>(m_bucketSize)) + 1.0;
+        bucketCount = static_cast<size_t>(std::min(static_cast<double>(targetBucketCount), calculatedBucketCount));
+    }
+    m_buckets.resize(bucketCount);
+    m_sourceQueryGeneration.assign(rootCount, 0);
+    m_queryCandidates.reserve(std::min<size_t>(rootCount, 4096));
+
+    const size_t maxTotalReferences = rootCount > std::numeric_limits<size_t>::max() / MAX_REFERENCES_PER_ROOT_BUDGET ?
+        std::numeric_limits<size_t>::max() : rootCount * MAX_REFERENCES_PER_ROOT_BUDGET;
+    for (size_t rootIndex = 0; rootIndex < rootCount; ++rootIndex)
+    {
+        const std::pair<float, float>& zSpan = m_rootZSpans[rootIndex];
+        if (!std::isfinite(zSpan.first) || !std::isfinite(zSpan.second))
+        {
+            m_longSpanRoots.push_back(static_cast<uint32_t>(rootIndex));
+            continue;
+        }
+
+        const size_t firstBucket = BucketIndex(zSpan.first);
+        const size_t lastBucket = BucketIndex(zSpan.second);
+        const size_t spanBucketCount = lastBucket - firstBucket + 1;
+        if (spanBucketCount > MAX_BUCKETS_PER_ROOT || spanBucketCount > maxTotalReferences - m_totalBucketReferences)
+        {
+            m_longSpanRoots.push_back(static_cast<uint32_t>(rootIndex));
+            continue;
+        }
+
+        for (size_t bucketIndex = firstBucket; bucketIndex <= lastBucket; ++bucketIndex)
+            m_buckets[bucketIndex].push_back(static_cast<uint32_t>(rootIndex));
+        m_totalBucketReferences += spanBucketCount;
+    }
+}
+
+bool TriangleSelector::HeightRangeIndex::Matches(const TriangleMesh& mesh, const Transform3d& effectiveTransform) const
+{
+    return m_initialized && m_mesh == &mesh &&
+           (m_effectiveTransform.matrix().array() == effectiveTransform.matrix().array()).all();
+}
+
+size_t TriangleSelector::HeightRangeIndex::BucketIndex(float zWorld) const
+{
+    if (m_buckets.size() <= 1 || zWorld <= m_minZ)
+        return 0;
+    if (zWorld >= m_maxZ)
+        return m_buckets.size() - 1;
+
+    const double bucketIndex = std::floor(
+        (static_cast<double>(zWorld) - static_cast<double>(m_minZ)) / static_cast<double>(m_bucketSize));
+    return std::min(static_cast<size_t>(std::max(0.0, bucketIndex)), m_buckets.size() - 1);
+}
+
+const std::vector<uint32_t>& TriangleSelector::HeightRangeIndex::Query(float zBottomWorld, float zTopWorld)
+{
+    constexpr float QUERY_TOLERANCE = 0.02f;
+
+    m_queryCandidates.clear();
+    if (!m_initialized || m_rootZSpans.empty() || !std::isfinite(zBottomWorld) || !std::isfinite(zTopWorld))
+        return m_queryCandidates;
+
+    if (zBottomWorld > zTopWorld)
+        std::swap(zBottomWorld, zTopWorld);
+
+    if (m_queryGeneration == std::numeric_limits<uint32_t>::max())
+    {
+        std::fill(m_sourceQueryGeneration.begin(), m_sourceQueryGeneration.end(), 0);
+        m_queryGeneration = 1;
+    }
+    else
+    {
+        ++m_queryGeneration;
+    }
+
+    const float queryMinimumZ = zBottomWorld - QUERY_TOLERANCE;
+    const float queryMaximumZ = zTopWorld + QUERY_TOLERANCE;
+    const auto appendCandidate = [this, queryMinimumZ, queryMaximumZ](uint32_t sourceRoot)
+    {
+        if (sourceRoot >= m_rootZSpans.size() || m_sourceQueryGeneration[sourceRoot] == m_queryGeneration)
+            return;
+
+        m_sourceQueryGeneration[sourceRoot] = m_queryGeneration;
+        const std::pair<float, float>& zSpan = m_rootZSpans[sourceRoot];
+        if (zSpan.second < queryMinimumZ || zSpan.first > queryMaximumZ)
+            return;
+
+        m_queryCandidates.push_back(sourceRoot);
+    };
+
+    if (!m_buckets.empty() && queryMaximumZ >= m_minZ && queryMinimumZ <= m_maxZ)
+    {
+        const size_t firstBucket = BucketIndex(queryMinimumZ);
+        const size_t lastBucket = BucketIndex(queryMaximumZ);
+        for (size_t bucketIndex = firstBucket; bucketIndex <= lastBucket; ++bucketIndex)
+            for (uint32_t sourceRoot : m_buckets[bucketIndex])
+                appendCandidate(sourceRoot);
+    }
+
+    for (uint32_t sourceRoot : m_longSpanRoots)
+        appendCandidate(sourceRoot);
+
+    return m_queryCandidates;
+}
 
 // Check if the line is whole inside the sphere, or it is partially inside (intersecting) the sphere.
 // Inspired by Christer Ericson's Real-Time Collision Detection, pp. 177-179.
@@ -390,81 +580,99 @@ void TriangleSelector::NotifyFullReset()
     OnSelectorMutation(MutationKind::FullReset, -1);
 }
 
+bool TriangleSelector::PrepareSelectionCursor(std::unique_ptr<Cursor> cursor)
+{
+    if (cursor == nullptr)
+        return false;
+
+    m_cursor = std::move(cursor);
+    const bool isHeightRange = dynamic_cast<HeightRange*>(m_cursor.get()) != nullptr;
+    const float edgeLimit = isHeightRange ? 0.1f : std::min(std::sqrt(m_cursor->radius_sqr) / 5.f, 0.05f);
+    if (m_old_cursor_radius_sqr != m_cursor->radius_sqr || m_edge_limit != edgeLimit)
+        set_edge_limit(edgeLimit);
+    m_old_cursor_radius_sqr = m_cursor->radius_sqr;
+    return true;
+}
+
 void TriangleSelector::select_patch(int facet_start, std::unique_ptr<Cursor> &&cursor, EnforcerBlockerType new_state, const Transform3d& trafo_no_translate, bool triangle_splitting, float highlight_by_angle_deg)
 {
     assert(facet_start < m_orig_size_indices);
-
-    // Save current cursor center, squared radius and camera direction, so we don't
-    // have to pass it around.
-    m_cursor = std::move(cursor);
-
-    // In case user changed cursor size since last time, update triangle edge limit.
-    // It is necessary to compare the internal radius in m_cursor! radius is in
-    // world coords and does not change after scaling.
-    if (m_old_cursor_radius_sqr != m_cursor->radius_sqr) {
-        // BBS: improve details for large cursor radius
-        TriangleSelector::HeightRange* hr_cursor = dynamic_cast<TriangleSelector::HeightRange*>(m_cursor.get());
-        if (hr_cursor == nullptr) {
-            set_edge_limit(std::min(std::sqrt(m_cursor->radius_sqr) / 5.f, 0.05f));
-            m_old_cursor_radius_sqr = m_cursor->radius_sqr;
-        }
-        else {
-            set_edge_limit(0.1);
-            m_old_cursor_radius_sqr = 0.1;
-        }
-    }
+    const bool isHeightRange = dynamic_cast<HeightRange*>(cursor.get()) != nullptr;
+    assert(!isHeightRange);
+    if (facet_start < 0 || facet_start >= m_orig_size_indices || cursor == nullptr || isHeightRange ||
+        !PrepareSelectionCursor(std::move(cursor)))
+        return;
 
     const float highlight_angle_limit = -cos(Geometry::deg2rad(highlight_by_angle_deg));
-
-    // BBS
-    std::vector<int> start_facets;
-    HeightRange* hr_cursor = dynamic_cast<HeightRange*>(m_cursor.get());
-    if (hr_cursor) {
-        for (int facet_id = 0; facet_id < m_orig_size_indices; facet_id++) {
-            const Triangle& tr = m_triangles[facet_id];
-            if (m_cursor->is_edge_inside_cursor(tr, m_vertices)) {
-                start_facets.push_back(facet_id);
-            }
-        }
-    }
-    else {
-        start_facets.push_back(facet_start);
-    }
 
     // Keep track of original facets visited by this query without clearing an O(N) array.
     const uint32_t queryGeneration = BeginQueryGeneration(
         m_rootQueryStamp, m_rootQueryGeneration, static_cast<size_t>(m_orig_size_indices));
 
-    for (int i = 0; i < start_facets.size(); i++) {
-        int start_facet_id = start_facets[i];
-        if (m_rootQueryStamp[start_facet_id] == queryGeneration)
+    // Now start with the facet the pointer points to and check all adjacent facets.
+    std::vector<int> facetsToCheck;
+    facetsToCheck.reserve(16);
+    facetsToCheck.emplace_back(facet_start);
+
+    const Matrix3f normalMatrix = static_cast<Matrix3f>(
+        trafo_no_translate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
+
+    // Breadth-first search around the hit point. facetsToCheck may grow significantly large.
+    size_t facetIndex = 0;
+    while (facetIndex < facetsToCheck.size())
+    {
+        const int facet = facetsToCheck[facetIndex];
+        const Vec3f& facetNormal = m_face_normals[m_triangles[facet].source_triangle];
+        const float worldNormalZ = (normalMatrix * facetNormal).normalized().z();
+        if (m_rootQueryStamp[facet] != queryGeneration &&
+            (highlight_by_angle_deg == 0.f || worldNormalZ < highlight_angle_limit))
+        {
+            if (select_triangle(facet, new_state, triangle_splitting))
+            {
+                // Add neighboring facets to the list to be processed later.
+                for (int neighborIndex : m_neighbors[facet])
+                    if (neighborIndex >= 0 && m_cursor->is_facet_visible(neighborIndex, m_face_normals))
+                        facetsToCheck.push_back(neighborIndex);
+            }
+        }
+        m_rootQueryStamp[facet] = queryGeneration;
+        ++facetIndex;
+    }
+}
+
+void TriangleSelector::SelectHeightRange(const std::vector<uint32_t>& sourceRoots, std::unique_ptr<HeightRange>&& cursor,
+                                         const HeightRangeSelectionOptions& options)
+{
+    if (sourceRoots.empty() || !PrepareSelectionCursor(std::move(cursor)))
+        return;
+
+    const float highlightAngleLimit = -cos(Geometry::deg2rad(options.highlightByAngleDeg));
+    Matrix3f normalMatrix = Matrix3f::Identity();
+    if (options.highlightByAngleDeg != 0.f)
+    {
+        normalMatrix = static_cast<Matrix3f>(
+            options.transformNoTranslate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
+    }
+
+    for (uint32_t sourceRoot : sourceRoots)
+    {
+        if (sourceRoot >= static_cast<uint32_t>(m_orig_size_indices))
             continue;
 
-        // Now start with the facet the pointer points to and check all adjacent facets.
-        std::vector<int> facets_to_check;
-        facets_to_check.reserve(16);
-        facets_to_check.emplace_back(start_facet_id);
+        const int rootIndex = static_cast<int>(sourceRoot);
+        const Triangle& rootTriangle = m_triangles[rootIndex];
+        if (!rootTriangle.valid() || !m_cursor->is_edge_inside_cursor(rootTriangle, m_vertices))
+            continue;
 
-        // Breadth-first search around the hit point. facets_to_check may grow significantly large.
-        // Head of the bread-first facets_to_check FIFO.
-        int facet_idx = 0;
-        while (facet_idx < int(facets_to_check.size())) {
-            int          facet = facets_to_check[facet_idx];
-            const Vec3f& facet_normal = m_face_normals[m_triangles[facet].source_triangle];
-            Matrix3f     normal_matrix = static_cast<Matrix3f>(trafo_no_translate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
-            float        world_normal_z = (normal_matrix* facet_normal).normalized().z();
-            if (m_rootQueryStamp[facet] != queryGeneration &&
-                (highlight_by_angle_deg == 0.f || world_normal_z < highlight_angle_limit)) {
-                if (select_triangle(facet, new_state, triangle_splitting)) {
-                    // add neighboring facets to list to be processed later
-                    for (int neighbor_idx : m_neighbors[facet])
-                        if (neighbor_idx >= 0 && m_cursor->is_facet_visible(neighbor_idx, m_face_normals))
-                            facets_to_check.push_back(neighbor_idx);
-                }
-            }
-            m_rootQueryStamp[facet] = queryGeneration;
-            ++facet_idx;
+        if (options.highlightByAngleDeg != 0.f)
+        {
+            const Vec3f& facetNormal = m_face_normals[rootTriangle.source_triangle];
+            const float worldNormalZ = (normalMatrix * facetNormal).normalized().z();
+            if (!(worldNormalZ < highlightAngleLimit))
+                continue;
         }
+
+        select_triangle(rootIndex, options.state, options.triangleSplitting);
     }
 }
 
@@ -1285,23 +1493,33 @@ bool TriangleSelector::HeightRange::is_pointer_in_triangle(const Vec3f& p1_, con
 bool TriangleSelector::HeightRange::is_mesh_point_inside(const Vec3f& point) const
 {
     // just use 40% edge limit as tolerance
-    const float tolerance = 0.02;
+    const float tolerance = 0.02f;
+    if (clipping_plane.is_active() && clipping_plane.is_mesh_point_clipped(point))
+        return false;
+
     const Vec3f transformed_point = trafo * point;
-    float top_z = m_z_world + m_height + tolerance;
-    float bot_z = m_z_world - tolerance;
+    const float top_z = m_z_world + m_height + tolerance;
+    const float bot_z = m_z_world - tolerance;
 
     return transformed_point.z() > bot_z && transformed_point.z() < top_z;
 }
 
 bool TriangleSelector::HeightRange::is_edge_inside_cursor(const Triangle& tr, const std::vector<Vertex>& vertices) const
 {
-    float top_z = m_z_world + m_height + EPSILON;
-    float bot_z = m_z_world - EPSILON;
+    const float top_z = m_z_world + m_height + EPSILON;
+    const float bot_z = m_z_world - EPSILON;
     std::array<Vec3f, 3> pts;
-    for (int i = 0; i < 3; ++i) {
+    bool allVerticesClipped = clipping_plane.is_active();
+    for (int i = 0; i < 3; ++i)
+    {
         pts[i] = vertices[tr.verts_idxs[i]].v;
+        if (!clipping_plane.is_active() || !clipping_plane.is_mesh_point_clipped(pts[i]))
+            allVerticesClipped = false;
         pts[i] = this->trafo * pts[i];
     }
+
+    if (allVerticesClipped)
+        return false;
 
     return !((pts[0].z() < bot_z && pts[1].z() < bot_z && pts[2].z() < bot_z) ||
              (pts[0].z() > top_z && pts[1].z() > top_z && pts[2].z() > top_z));

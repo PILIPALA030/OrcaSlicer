@@ -657,67 +657,16 @@ std::vector<std::vector<GLGizmoPainterBase::ProjectedMousePosition>> GLGizmoPain
     return mesh_hit_points_by_mesh;
 }
 
-// BBS
-std::vector<GLGizmoPainterBase::ProjectedHeightRange> GLGizmoPainterBase::get_projected_height_range(
-    const Vec2d& mouse_position,
-    double resolution,
-    const std::vector<const ModelVolume*>& part_volumes,
-    const std::vector<Transform3d>& trafo_matrices) const
+TriangleSelector::HeightRangeIndex& GLGizmoPainterBase::EnsureHeightRangeIndex(
+    size_t meshIndex, const TriangleMesh& mesh, const Transform3d& effectiveTransform)
 {
-    std::vector<GLGizmoPainterBase::ProjectedHeightRange> hit_triangles_by_mesh;
+    if (m_heightRangeIndices.size() <= meshIndex)
+        m_heightRangeIndices.resize(meshIndex + 1);
 
-    const Camera& camera = wxGetApp().plater()->get_camera();
-
-    // In mesh_hit_points only the last item could have mesh_id == -1, any other items mustn't.
-    update_raycast_cache(mouse_position, camera, trafo_matrices);
-    if (m_rr.mesh_id == -1)
-        return hit_triangles_by_mesh;
-
-    ProjectedMousePosition mesh_hit_point = { m_rr.hit, m_rr.mesh_id, m_rr.facet };
-    float z_bot_world= (trafo_matrices[m_rr.mesh_id] * Vec3d(m_rr.hit(0), m_rr.hit(1), m_rr.hit(2))).z();
-    float z_top_world = z_bot_world+ m_cursor_height;
-    hit_triangles_by_mesh.push_back({ z_bot_world, m_rr.mesh_id, size_t(m_rr.facet) });
-
-    const Selection& selection = m_parent.get_selection();
-    const ModelObject* mo = m_c->selection_info()->model_object();
-    const ModelInstance* mi = mo->instances[selection.get_instance_idx()];
-    const Transform3d   instance_trafo = m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView ?
-        mi->get_assemble_transformation().get_matrix() :
-        mi->get_transformation().get_matrix();
-    const Transform3d   instance_trafo_not_translate = m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView ?
-        mi->get_assemble_transformation().get_matrix_no_offset() :
-        mi->get_transformation().get_matrix_no_offset();
-
-    for (int mesh_idx = 0; mesh_idx < part_volumes.size(); mesh_idx++) {
-        if (mesh_idx == m_rr.mesh_id)
-            continue;
-
-        const Transform3d& trafo = trafo_matrices[mesh_idx];
-        const indexed_triangle_set& its = part_volumes[mesh_idx]->mesh().its;
-
-        int first_hit_facet_idx = -1;
-        for (int facet_idx = 0; facet_idx < its.indices.size(); facet_idx++) {
-            stl_vertex v0 = its.vertices[its.indices[facet_idx].x()];
-            stl_vertex v1 = its.vertices[its.indices[facet_idx].y()];
-            stl_vertex v2 = its.vertices[its.indices[facet_idx].z()];
-
-            float v0_z = (trafo * Vec3d(v0(0), v0(1), v0(2))).z();
-            float v1_z = (trafo * Vec3d(v1(0), v1(1), v1(2))).z();
-            float v2_z = (trafo * Vec3d(v2(0), v2(1), v2(2))).z();
-            bool outside_range = (v0_z < z_bot_world&& v1_z < z_bot_world&& v2_z < z_bot_world) ||
-                                 (v0_z > z_top_world && v1_z > z_top_world && v2_z > z_top_world);
-            if (!outside_range) {
-                first_hit_facet_idx = facet_idx;
-                break;
-            }
-        }
-
-        if (first_hit_facet_idx != -1) {
-            hit_triangles_by_mesh.push_back({ z_bot_world, mesh_idx, (size_t)first_hit_facet_idx });
-        }
-    }
-
-    return hit_triangles_by_mesh;
+    TriangleSelector::HeightRangeIndex& heightRangeIndex = m_heightRangeIndices[meshIndex];
+    if (!heightRangeIndex.Matches(mesh, effectiveTransform))
+        heightRangeIndex.Build(mesh, effectiveTransform);
+    return heightRangeIndex;
 }
 
 // Following function is called from GLCanvas3D to inform the gizmo about a mouse/keyboard event.
@@ -860,42 +809,58 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
         // BBS
         if (m_tool_type == ToolType::BRUSH && m_cursor_type == TriangleSelector::CursorType::HEIGHT_RANGE)
         {
-            std::vector<ProjectedHeightRange> projected_height_range_by_mesh = get_projected_height_range(_mouse_position, 1., part_volumes, trafo_matrices);
             m_last_mouse_click = Vec2d::Zero();
 
-            for (int i = 0; i < projected_height_range_by_mesh.size(); i++) {
-                const ProjectedHeightRange& phr = projected_height_range_by_mesh[i];
-                int mesh_idx = phr.mesh_idx;
+            update_raycast_cache(_mouse_position, camera, trafo_matrices);
+            assert(part_volumes.size() == trafo_matrices.size());
+            assert(part_volumes.size() == trafo_matrices_not_translate.size());
+            assert(part_volumes.size() == m_triangle_selectors.size());
+            size_t volumeCount = std::min(part_volumes.size(), trafo_matrices.size());
+            volumeCount = std::min(volumeCount, trafo_matrices_not_translate.size());
+            volumeCount = std::min(volumeCount, m_triangle_selectors.size());
+            if (m_rr.mesh_id < 0 || static_cast<size_t>(m_rr.mesh_id) >= volumeCount)
+                return true;
 
-                // The mouse button click detection is enabled when there is a valid hit.
-                // Missing the object entirely
-                // shall not capture the mouse.
-                const bool dragging_while_painting = (action == SLAGizmoEventType::Dragging && m_button_down != Button::None);
-                if (mesh_idx != -1 && m_button_down == Button::None) {
-                    m_button_down = ((action == SLAGizmoEventType::LeftDown) ? Button::Left : Button::Right);
-                    m_strokeHasCommittedState = false;
-                }
-
-                const Transform3d& trafo_matrix = trafo_matrices[mesh_idx];
-                const Transform3d& trafo_matrix_not_translate = trafo_matrices_not_translate[mesh_idx];
-
-                // Calculate direction from camera to the hit (in mesh coords):
-                Vec3f camera_pos = (trafo_matrix.inverse() * camera.get_position()).cast<float>();
-                const TriangleSelector::ClippingPlane& clp = this->get_clipping_plane_in_volume_coordinates(trafo_matrix);
-
-                std::unique_ptr<TriangleSelector::Cursor> cursor = TriangleSelector::SinglePointCursor::cursor_factory(phr.z_world,
-                    camera_pos, m_cursor_height, trafo_matrix, clp);
-                TriangleSelectorGUI& triangleSelector = *m_triangle_selectors[mesh_idx];
-                const uint64_t stateRevisionBefore = triangleSelector.GetStateRevision();
-                triangleSelector.select_patch(int(phr.first_facet_idx), std::move(cursor), new_state, trafo_matrix_not_translate,
-                                              m_triangle_splitting_enabled,
-                                              m_paint_on_overhangs_only ? m_highlight_by_angle_threshold_deg : 0.f);
-
-                const bool selectorChanged = triangleSelector.GetStateRevision() != stateRevisionBefore;
-                m_strokeHasCommittedState |= selectorChanged;
-                triangleSelector.request_update_render_data(true);
-                m_last_mouse_click = _mouse_position;
+            if (m_button_down == Button::None)
+            {
+                m_button_down = action == SLAGizmoEventType::LeftDown ? Button::Left : Button::Right;
+                m_strokeHasCommittedState = false;
             }
+
+            const size_t hitMeshIndex = static_cast<size_t>(m_rr.mesh_id);
+            const Vec3d worldHit = trafo_matrices[hitMeshIndex] * m_rr.hit.cast<double>();
+            const float zBottomWorld = static_cast<float>(worldHit.z());
+            const float zTopWorld = zBottomWorld + m_cursor_height;
+
+            for (size_t meshIndex = 0; meshIndex < volumeCount; ++meshIndex)
+            {
+                const TriangleMesh& mesh = part_volumes[meshIndex]->mesh();
+                TriangleSelector::HeightRangeIndex& heightRangeIndex =
+                    EnsureHeightRangeIndex(meshIndex, mesh, trafo_matrices[meshIndex]);
+                const std::vector<uint32_t>& sourceRoots = heightRangeIndex.Query(zBottomWorld, zTopWorld);
+                if (sourceRoots.empty())
+                    continue;
+
+                const Transform3d& transform = trafo_matrices[meshIndex];
+                const Vec3f cameraPosition = (transform.inverse() * camera.get_position()).cast<float>();
+                const TriangleSelector::ClippingPlane clippingPlane = get_clipping_plane_in_volume_coordinates(transform);
+                std::unique_ptr<TriangleSelector::HeightRange> cursor = std::make_unique<TriangleSelector::HeightRange>(
+                    zBottomWorld, cameraPosition, m_cursor_height, transform, clippingPlane);
+
+                TriangleSelector::HeightRangeSelectionOptions options;
+                options.state = new_state;
+                options.transformNoTranslate = trafo_matrices_not_translate[meshIndex];
+                options.triangleSplitting = m_triangle_splitting_enabled;
+                options.highlightByAngleDeg = m_paint_on_overhangs_only ? m_highlight_by_angle_threshold_deg : 0.f;
+
+                TriangleSelectorGUI& triangleSelector = *m_triangle_selectors[meshIndex];
+                const uint64_t stateRevisionBefore = triangleSelector.GetStateRevision();
+                triangleSelector.SelectHeightRange(sourceRoots, std::move(cursor), options);
+                m_strokeHasCommittedState |= triangleSelector.GetStateRevision() != stateRevisionBefore;
+                triangleSelector.request_update_render_data(true);
+            }
+
+            m_last_mouse_click = _mouse_position;
 
             return true;
         }
@@ -1323,6 +1288,7 @@ void GLGizmoPainterBase::on_set_state()
         //m_iva.release_geometry();
         DetachTriangleSelectorGlResources();
         m_triangle_selectors.clear();
+        m_heightRangeIndices.clear();
 
         //Camera& camera = wxGetApp().plater()->get_camera();
         //camera.look_at(camera.get_position(), m_previous_target, Vec3d::UnitZ());

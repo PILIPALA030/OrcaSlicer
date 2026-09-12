@@ -15,6 +15,7 @@
 #include <memory>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 
 namespace Slic3r::GUI {
@@ -372,6 +373,7 @@ protected:
 
     // For each model-part volume, store status and division of the triangles.
     std::vector<std::unique_ptr<TriangleSelectorGUI>> m_triangle_selectors;
+    std::vector<TriangleSelector::HeightRangeIndex> m_heightRangeIndices;
 
     TriangleSelector::CursorType m_cursor_type = TriangleSelector::SPHERE;
 
@@ -388,14 +390,6 @@ protected:
         Vec3f  mesh_hit;
         int    mesh_idx;
         size_t facet_idx;
-    };
-
-    // BBS: projected result of mouse height range for a mesh
-    struct ProjectedHeightRange
-    {
-        float   z_world;
-        int     mesh_idx;
-        size_t  first_facet_idx;
     };
 
     bool     m_triangle_splitting_enabled = true;
@@ -439,7 +433,9 @@ protected:
 private:
     std::vector<std::vector<ProjectedMousePosition>> get_projected_mouse_positions(const Vec2d &mouse_position, double resolution, const std::vector<Transform3d> &trafo_matrices) const;
 
-    std::vector<ProjectedHeightRange> get_projected_height_range(const Vec2d& mouse_position, double resolution, const std::vector<const ModelVolume*>& part_volumes, const std::vector<Transform3d>& trafo_matrices) const;
+    /** Returns the reusable world-Z index for one model-part volume, rebuilding it when its mesh or transform changed. */
+    TriangleSelector::HeightRangeIndex& EnsureHeightRangeIndex(size_t meshIndex, const TriangleMesh& mesh,
+                                                               const Transform3d& effectiveTransform);
 
     bool is_mesh_point_clipped(const Vec3d& point, const Transform3d& trafo) const;
     void update_raycast_cache(const Vec2d& mouse_position,
