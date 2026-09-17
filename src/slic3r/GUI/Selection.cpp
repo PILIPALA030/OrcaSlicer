@@ -208,18 +208,19 @@ void Selection::add(unsigned int volume_idx, bool as_single_selection, bool chec
         if (volume->volume_idx() >= 0 && (is_empty() || volume->instance_idx() == get_instance_idx()))
             do_add_volume(volume_idx);
 
+        update_type();
+        this->set_bounding_boxes_dirty();
         break;
     }
     case Instance:
     {
         Plater::SuppressSnapshots suppress(wxGetApp().plater());
+        // add_instance() already runs update_type() and set_bounding_boxes_dirty(),
+        // return without repeating them to avoid the duplicated O(N) rescans per add
         add_instance(volume->object_idx(), volume->instance_idx(), as_single_selection);
-        break;
+        return;
     }
     }
-
-    update_type();
-    this->set_bounding_boxes_dirty();
 }
 
 void Selection::remove(unsigned int volume_idx)
