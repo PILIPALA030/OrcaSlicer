@@ -11181,39 +11181,17 @@ void GLCanvas3D::_update_selection_from_hover()
             std::vector<unsigned int> volume_idxs = ExpandHoveredVolumes(m_volumes.volumes, m_hover_volume_idxs, EHoveredExpansion::SameVolume, false);
             m_selection.add_volumes(Selection::EMode::Volume, volume_idxs, false);
         }
+        else if (ctrl_pressed && !m_selection.is_empty() &&
+                 (m_selection.is_wipe_tower() || m_selection.is_any_modifier() || m_selection.is_any_volume())) {
+            for (int i : m_hover_volume_idxs) {
+                m_selection.add(static_cast<unsigned int>(i), false);
+            }
+        }
         else {
             // same mode decision as the former per-item Selection::add():
             // keep Instance mode, otherwise fall back to the volume selection mode
             const Selection::EMode target_mode = (m_selection.get_mode() == Selection::EMode::Volume) ?
                 m_selection.get_volume_selection_mode() : Selection::EMode::Instance;
-
-            // when appending with Ctrl, the former per-item add() used to reset an existing
-            // selection that cannot merge with the volumes being added:
-            // - a wipe tower selection, as soon as a regular volume is added
-            // - a volume-level selection, whose first item belongs to none of the hovered instances
-            if (ctrl_pressed && target_mode == Selection::EMode::Instance && !m_selection.is_empty() &&
-                (m_selection.is_wipe_tower() || m_selection.is_any_modifier() || m_selection.is_any_volume())) {
-                bool drop_current_selection = false;
-
-                if (m_selection.is_wipe_tower())
-                    drop_current_selection = hover_has_regular_volume;
-                else {
-                    const GLVolume* first_volume = m_selection.get_first_volume();
-                    bool first_in_hovered_instances = false;
-                    for (int i : m_hover_volume_idxs) {
-                        const GLVolume* v = m_volumes.volumes[i];
-                        if (v->object_idx() == first_volume->object_idx() && v->instance_idx() == first_volume->instance_idx()) {
-                            first_in_hovered_instances = true;
-                            break;
-                        }
-                    }
-                    drop_current_selection = !first_in_hovered_instances;
-                }
-
-                if (drop_current_selection)
-                    m_selection.clear();
-            }
-
             const EHoveredExpansion expansion = (target_mode == Selection::EMode::Instance) ? EHoveredExpansion::Instance : EHoveredExpansion::AsIs;
             std::vector<unsigned int> volume_idxs = ExpandHoveredVolumes(m_volumes.volumes, m_hover_volume_idxs, expansion, skip_wipe_tower);
             m_selection.add_volumes(target_mode, volume_idxs, false);
