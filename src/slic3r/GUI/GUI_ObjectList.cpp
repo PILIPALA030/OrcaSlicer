@@ -4694,39 +4694,28 @@ void ObjectList::update_selections()
     }
     else if (selection.is_mixed())
     {
-        const Selection::ObjectIdxsToInstanceIdxsMap& objects_content_list = selection.get_content();
+        // m_cache.content is built from m_list in update_type(), so the membership
+        // test is always true; only the single-instance split decides the item type
+        const bool from_single_instance = selection.is_from_single_instance();
 
         for (auto idx : selection.get_volume_idxs()) {
             const auto gl_vol = selection.get_volume(idx);
             const auto& glv_obj_idx = gl_vol->object_idx();
             const auto& glv_ins_idx = gl_vol->instance_idx();
 
-            bool is_selected = false;
-
-            for (auto obj_ins : objects_content_list) {
-                if (obj_ins.first == glv_obj_idx) {
-                    if (obj_ins.second.find(glv_ins_idx) != obj_ins.second.end() &&
-                        !selection.is_from_single_instance() ) // a case when volumes of different types are selected
-                    {
-                        if (glv_ins_idx == 0 && (*m_objects)[glv_obj_idx]->instances.size() == 1)
-                            sels.Add(m_objects_model->GetItemById(glv_obj_idx));
-                        else
-                            sels.Add(m_objects_model->GetItemByInstanceId(glv_obj_idx, glv_ins_idx));
-
-                        is_selected = true;
-                        break;
-                    }
-                }
+            if (!from_single_instance) {
+                if (glv_ins_idx == 0 && (*m_objects)[glv_obj_idx]->instances.size() == 1)
+                    sels.Add(m_objects_model->GetItemById(glv_obj_idx));
+                else
+                    sels.Add(m_objects_model->GetItemByInstanceId(glv_obj_idx, glv_ins_idx));
             }
-
-            if (is_selected)
-                continue;
-
-            const auto& glv_vol_idx = gl_vol->volume_idx();
-            if (glv_vol_idx == 0 && (*m_objects)[glv_obj_idx]->volumes.size() == 1)
-                sels.Add(m_objects_model->GetItemById(glv_obj_idx));
-            else
-                sels.Add(m_objects_model->GetItemByVolumeId(glv_obj_idx, glv_vol_idx));
+            else {
+                const auto& glv_vol_idx = gl_vol->volume_idx();
+                if (glv_vol_idx == 0 && (*m_objects)[glv_obj_idx]->volumes.size() == 1)
+                    sels.Add(m_objects_model->GetItemById(glv_obj_idx));
+                else
+                    sels.Add(m_objects_model->GetItemByVolumeId(glv_obj_idx, glv_vol_idx));
+            }
         }
     }
 
