@@ -11177,7 +11177,12 @@ void GLCanvas3D::_update_selection_from_hover()
         }
         const bool skip_wipe_tower = hover_has_regular_volume || (!m_selection.is_empty() && !m_selection.is_wipe_tower());
 
-        if (hover_modifiers_only) {
+        if (!hover_has_regular_volume) {
+            for (int i : m_hover_volume_idxs) {
+                m_selection.add(static_cast<unsigned int>(i), false);
+            }
+        }
+        else if (hover_modifiers_only) {
             std::vector<unsigned int> volume_idxs = ExpandHoveredVolumes(m_volumes.volumes, m_hover_volume_idxs, EHoveredExpansion::SameVolume, false);
             m_selection.add_volumes(Selection::EMode::Volume, volume_idxs, false);
         }
