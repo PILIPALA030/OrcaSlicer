@@ -458,6 +458,56 @@ bool TriangleSelector::SetLeafState(int triangleIndex, EnforcerBlockerType state
     return true;
 }
 
+bool TriangleSelector::SubtreeAllLeavesHaveState(int triangleIndex, EnforcerBlockerType state) const
+{
+    if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
+        return false;
+
+    const Triangle& triangle = m_triangles[triangleIndex];
+    if (!triangle.valid())
+        return false;
+
+    if (!triangle.is_split())
+        return triangle.get_state() == state;
+
+    const int childCount = triangle.number_of_split_sides() + 1;
+    for (int childOffset = 0; childOffset < childCount; ++childOffset)
+        if (!SubtreeAllLeavesHaveState(triangle.children[childOffset], state))
+            return false;
+
+    return true;
+}
+
+bool TriangleSelector::CollapseSubtreeToState(int triangleIndex, EnforcerBlockerType state)
+{
+    if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
+        return false;
+
+    const Triangle& triangleBefore = m_triangles[triangleIndex];
+    if (!triangleBefore.valid())
+        return false;
+
+    const bool semanticStateChanged = !SubtreeAllLeavesHaveState(triangleIndex, state);
+    const int  sourceTriangle       = triangleBefore.source_triangle;
+
+    // May destroy children and emit Topology mutation notifications.
+    undivide_triangle(triangleIndex);
+
+    Triangle& collapsedLeaf = m_triangles[triangleIndex];
+    assert(collapsedLeaf.valid());
+    assert(!collapsedLeaf.is_split());
+
+    if (collapsedLeaf.get_state() != state)
+        collapsedLeaf.set_state(state);
+
+    if (semanticStateChanged) {
+        ++m_stateRevision;
+        OnSelectorMutation(MutationKind::State, sourceTriangle);
+    }
+
+    return semanticStateChanged;
+}
+
 bool TriangleSelector::SelectSeedFillLeaf(int triangleIndex)
 {
     if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
@@ -1305,8 +1355,7 @@ bool TriangleSelector::select_triangle_recursive(int facet_idx, const Vec3i32 &n
 
     if (num_of_inside_vertices == 3) {
         // dump any subdivision and select whole triangle
-        undivide_triangle(facet_idx);
-        SetLeafStateWithoutCleanup(facet_idx, type);
+        CollapseSubtreeToState(facet_idx, type);
     } else {
         // the triangle is partially inside, let's recursively divide it
         // (if not already) and try selecting its children.
@@ -1342,9 +1391,7 @@ bool TriangleSelector::select_triangle_recursive(int facet_idx, const Vec3i32 &n
 void TriangleSelector::set_facet(int facet_idx, EnforcerBlockerType state)
 {
     assert(facet_idx < m_orig_size_indices);
-    undivide_triangle(facet_idx);
-    assert(! m_triangles[facet_idx].is_split());
-    SetLeafState(facet_idx, state);
+    CollapseSubtreeToState(facet_idx, state);
 }
 
 // called by select_patch()->select_triangle()...select_triangle()
@@ -1603,8 +1650,8 @@ bool TriangleSelector::remove_useless_children(int facet_idx)
     }
 
     // If we got here, the children can be removed.
-    undivide_triangle(facet_idx);
-    SetLeafStateWithoutCleanup(facet_idx, first_child_type);
+    const bool semanticStateChanged = CollapseSubtreeToState(facet_idx, first_child_type);
+    assert(! semanticStateChanged);
     return true;
 }
 

@@ -574,6 +574,11 @@ protected:
 private:
     bool PrepareSelectionCursor(std::unique_ptr<Cursor> cursor);
     bool SetLeafStateWithoutCleanup(int triangleIndex, EnforcerBlockerType state, int* sourceTriangle = nullptr);
+    //Returns true when every valid leaf in the subtree already carries the given state.
+    bool SubtreeAllLeavesHaveState(int triangleIndex, EnforcerBlockerType state) const;
+    /** Collapses a subtree into a single leaf and bumps the State revision iff the paint state
+     *  represented by the subtree before the collapse differs from the target state. */
+    bool CollapseSubtreeToState(int triangleIndex, EnforcerBlockerType state);
     bool SelectSeedFillLeaf(int triangleIndex);
     /** Advances one reusable query generation and grows its stamp storage when needed. */
     uint32_t BeginQueryGeneration(std::vector<uint32_t>& queryStamp, uint32_t& queryGeneration, size_t requiredSize);
