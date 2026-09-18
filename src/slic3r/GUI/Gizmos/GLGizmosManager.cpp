@@ -1373,6 +1373,7 @@ bool GLGizmosManager::activate_gizmo(EType type)
     if (type == Undefined) { 
         // it is deactivation of gizmo
         m_current = Undefined;
+        m_parent.set_as_dirty();
         return true;
     }
 
@@ -1395,6 +1396,7 @@ bool GLGizmosManager::activate_gizmo(EType type)
     new_gizmo.register_raycasters_for_picking();
 
     // sucessful activation of gizmo
+    m_parent.set_as_dirty();
     return true;
 }
 
