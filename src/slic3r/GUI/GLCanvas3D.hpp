@@ -1422,7 +1422,7 @@ private:
     bool ShouldRenderVolumeForPicking(const GLVolume& volume) const;
 
     std::optional<PickingPassResult> _picking_pass(bool& sinkingContourSceneChanged);
-    bool _rectangular_selection_picking_pass();
+    bool _rectangular_selection_picking_pass(bool querySelection);
     void _render_background();
     void _render_bed(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool show_axes);
     //BBS: add part plate related logic

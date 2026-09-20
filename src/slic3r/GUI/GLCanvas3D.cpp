@@ -3116,7 +3116,9 @@ void GLCanvas3D::render(bool only_init, bool overlayOnly)
     if (m_picking_enabled) {
         if (isRectanglePicking)
             // picking pass using rectangle selection
-            sinkingContourSceneChanged = _rectangular_selection_picking_pass();
+            // The GPU picking buffer is already rendered above.  Keep rectangle dragging
+            // as an overlay-only operation and query the buffer on mouse release.
+            sinkingContourSceneChanged = _rectangular_selection_picking_pass(false);
         //BBS: enable picking when no volumes for partplate logic
         //else if (!m_volumes.empty())
         else {
@@ -4933,6 +4935,8 @@ void GLCanvas3D::on_key(wxKeyEvent& evt)
                     translationProcessor.process(evt);
 
                     if (m_picking_enabled && m_rectangle_selection.is_dragging()) {
+                        if (_set_current())
+                            _rectangular_selection_picking_pass(true);
                         _update_selection_from_hover();
                         m_rectangle_selection.stop_dragging();
                         m_mouse.ignore_left_up = true;
@@ -4942,6 +4946,8 @@ void GLCanvas3D::on_key(wxKeyEvent& evt)
                 }
                 else if (keyCode == WXK_ALT) {
                     if (m_picking_enabled && m_rectangle_selection.is_dragging()) {
+                        if (_set_current())
+                            _rectangular_selection_picking_pass(true);
                         _update_selection_from_hover();
                         m_rectangle_selection.stop_dragging();
                         m_mouse.ignore_left_up = true;
@@ -5872,6 +5878,8 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
         else if (evt.LeftUp() && m_picking_enabled && m_rectangle_selection.is_dragging() && m_layers_editing.state != LayersEditing::Editing) {
             //BBS: don't use alt as de-select
             //if (evt.ShiftDown() || evt.AltDown())
+            if (_set_current())
+                _rectangular_selection_picking_pass(true);
             if (evt.ShiftDown())
                 _update_selection_from_hover();
 
@@ -9233,8 +9241,11 @@ std::optional<GLCanvas3D::PickingPassResult> GLCanvas3D::_picking_pass(bool& sin
     return result;
 }
 
-bool GLCanvas3D::_rectangular_selection_picking_pass()
+bool GLCanvas3D::_rectangular_selection_picking_pass(bool querySelection)
 {
+    if (!querySelection)
+        return false;
+
     m_gizmos.set_hover_id(-1);
 
     std::set<int> idxs;
