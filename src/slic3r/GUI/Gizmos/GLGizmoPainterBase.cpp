@@ -162,6 +162,7 @@ void GLGizmoPainterBase::DetachTriangleSelectorGlResources()
         std::vector<unsigned int> selectorIds = patchSelector->DetachGlResources();
         bufferIds.insert(bufferIds.end(), selectorIds.begin(), selectorIds.end());
     }
+    DetachHeightPreviewGlResources(bufferIds);
 
     if (!bufferIds.empty())
         wxGetApp().get_opengl_manager().EnqueueBufferDeletes(std::move(bufferIds));
@@ -174,6 +175,7 @@ void GLGizmoPainterBase::ReleaseTriangleSelectorGlResources()
         if (patchSelector != nullptr)
             patchSelector->ReleaseGlResources();
     }
+    ReleaseHeightPreviewGlResources();
 }
 
 void GLGizmoPainterBase::data_changed(bool is_serializing)
@@ -186,6 +188,7 @@ void GLGizmoPainterBase::data_changed(bool is_serializing)
     if (mo && selection.is_from_single_instance()
      && (m_schedule_update || mo->id() != m_old_mo_id || mo->volumes.size() != m_old_volumes_size))
     {
+        InvalidateHeightPreviewCaches("model_rebuild");
         //BBS: add logic to distinguish the first_time_update and later_update
         update_from_model_object(!m_schedule_update);
 
@@ -444,39 +447,168 @@ void GLGizmoPainterBase::render_cursor_height_range(const Transform3d& trafo) co
     const Selection& selection = m_parent.get_selection();
     const ModelObject* model_object = wxGetApp().model().objects[selection.get_object_idx()];
     const ModelInstance* mi = model_object->instances[selection.get_instance_idx()];
+    const Camera& camera = wxGetApp().plater()->get_camera();
 
-    int volumes_count = model_object->volumes.size();
-    if (m_cut_contours.size() != volumes_count * 2) {
-        m_cut_contours.resize(volumes_count * 2);
-    }
-    m_volumes_index = 0;
-    for (const ModelVolume* mv : model_object->volumes) {
-        TriangleMesh vol_mesh = mv->mesh();
+    for (size_t volumeIndex = 0; volumeIndex < model_object->volumes.size(); ++volumeIndex)
+    {
+        const ModelVolume& volume = *model_object->volumes[volumeIndex];
+
+        // Keep the exact baseline transform expression, including assemble view and explosion.
+        Transform3d effectiveTransform = Transform3d::Identity();
         if (m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView) {
-            Transform3d temp = mi->get_assemble_transformation().get_matrix() * mv->get_matrix();
-            temp.translate(mv->get_transformation().get_offset() * (GLVolume::explosion_ratio - 1.0) + mi->get_offset_to_assembly() * (GLVolume::explosion_ratio - 1.0));
-            vol_mesh.transform(temp);
+            effectiveTransform = mi->get_assemble_transformation().get_matrix() * volume.get_matrix();
+            effectiveTransform.translate(volume.get_transformation().get_offset() * (GLVolume::explosion_ratio - 1.0) +
+                                         mi->get_offset_to_assembly() * (GLVolume::explosion_ratio - 1.0));
         }
         else {
-            vol_mesh.transform(mi->get_transformation().get_matrix() * mv->get_matrix());
+            effectiveTransform = mi->get_transformation().get_matrix() * volume.get_matrix();
         }
 
-        for (int i = 0; i < zs.size(); i++) {
-            update_contours(m_volumes_index, vol_mesh, zs[i], max_z, min_z);
+        HeightPreviewVolumeCache& cache = GetHeightPreviewVolumeCache(volumeIndex);
+        if (!EnsureHeightPreviewMesh(cache, *model_object, *mi, volume, effectiveTransform)) {
+            for (HeightPreviewCut& cut : cache.cuts) {
+                cut.key.reset();
+                cut.contours.reset();
+            }
+            continue;
+        }
 
-            const Camera& camera = wxGetApp().plater()->get_camera();
-            Transform3d view_model_matrix = camera.get_view_matrix()  * Geometry::assemble_transform(m_cut_contours[m_volumes_index].shift);
+        for (size_t cutIndex = 0; cutIndex < cache.cuts.size(); ++cutIndex)
+        {
+            UpdateHeightPreviewCut(cache, cutIndex, zs[cutIndex], min_z, max_z);
 
-            shader->set_uniform("view_model_matrix", view_model_matrix);
+            // Contours are already in world coordinates; no extra shift.
+            shader->set_uniform("view_model_matrix", camera.get_view_matrix());
             shader->set_uniform("projection_matrix", camera.get_projection_matrix());
             glsafe(::glLineWidth(2.0f));
-            m_cut_contours[m_volumes_index].contours.render();
-            m_volumes_index++;
+            cache.cuts[cutIndex].contours.render();
         }
-
     }
 
     shader->stop_using();
+}
+
+GLGizmoPainterBase::HeightPreviewVolumeCache&
+GLGizmoPainterBase::GetHeightPreviewVolumeCache(size_t rawVolumeIndex) const
+{
+    if (m_heightPreviewVolumes.size() <= rawVolumeIndex)
+        m_heightPreviewVolumes.resize(rawVolumeIndex + 1);
+
+    auto& entry = m_heightPreviewVolumes[rawVolumeIndex];
+    if (!entry)
+        entry = std::make_unique<HeightPreviewVolumeCache>();
+
+    return *entry;
+}
+
+bool GLGizmoPainterBase::EnsureHeightPreviewMesh(HeightPreviewVolumeCache& cache,
+                                                 const ModelObject& object,
+                                                 const ModelInstance& instance,
+                                                 const ModelVolume& volume,
+                                                 const Transform3d& effectiveTransform) const
+{
+    std::shared_ptr<const TriangleMesh> source = volume.mesh_ptr();
+    if (!source || !effectiveTransform.matrix().allFinite())
+        return false;
+
+    // Exact matrix compare: a missed hit only costs performance, a false hit shows wrong geometry.
+    if (cache.worldMesh != nullptr &&
+        cache.sourceMesh == source &&
+        cache.objectId == object.id() &&
+        cache.instanceId == instance.id() &&
+        cache.volumeId == volume.id() &&
+        (cache.effectiveTransform.matrix().array() == effectiveTransform.matrix().array()).all())
+        return true;
+
+    // Build the new data first; publish the cache identity only after success.
+    auto newWorldMesh = std::make_unique<TriangleMesh>(*source);
+    newWorldMesh->transform(effectiveTransform);
+
+    cache.worldMesh = std::move(newWorldMesh);
+    cache.sourceMesh = std::move(source);
+    cache.objectId = object.id();
+    cache.instanceId = instance.id();
+    cache.volumeId = volume.id();
+    cache.effectiveTransform = effectiveTransform;
+    ++cache.meshRevision;
+
+    // CPU metadata invalidation; cut GLModels are governed by their own keys.
+    for (HeightPreviewCut& cut : cache.cuts)
+        cut.key.reset();
+
+    return true;
+}
+
+void GLGizmoPainterBase::UpdateHeightPreviewCut(HeightPreviewVolumeCache& cache, size_t cutIndex,
+                                                float zWorld, float minZ, float maxZ) const
+{
+    assert(cutIndex < cache.cuts.size());
+    HeightPreviewCut& cut = cache.cuts[cutIndex];
+
+    const bool finiteRange =
+        std::isfinite(zWorld) && std::isfinite(minZ) && std::isfinite(maxZ) && minZ <= maxZ;
+    const bool enabled = finiteRange && cache.worldMesh != nullptr && minZ < zWorld && zWorld < maxZ;
+
+    const HeightPreviewCutKey currentKey{cache.meshRevision, zWorld, enabled};
+
+    if (cut.key.has_value() && *cut.key == currentKey)
+        return;
+
+    cut.key.reset();
+
+    if (!enabled) {
+        cut.contours.reset();
+        // Non-finite input is not cached; normal out-of-range results are.
+        if (finiteRange)
+            cut.key = currentKey;
+        return;
+    }
+
+    MeshSlicingParams slicingParams;
+    slicingParams.trafo = Transform3d::Identity().matrix();
+    const Polygons polygons = slice_mesh(cache.worldMesh->its, zWorld, slicingParams);
+
+    cut.contours.reset();
+    if (!polygons.empty()) {
+        cut.contours.init_from(polygons, zWorld);
+        cut.contours.set_color({ 1.0f, 1.0f, 1.0f, 1.0f });
+    }
+
+    // Empty polygons are a valid computed result; publish the key only after success.
+    cut.key = currentKey;
+}
+
+void GLGizmoPainterBase::InvalidateHeightPreviewCaches(const char* reason) const
+{
+    (void) reason; // Reserved for diagnostic logging at the call sites.
+    for (const auto& entry : m_heightPreviewVolumes) {
+        if (!entry)
+            continue;
+        for (HeightPreviewCut& cut : entry->cuts)
+            cut.key.reset();
+        entry->sourceMesh.reset();
+        entry->worldMesh.reset();
+    }
+}
+
+void GLGizmoPainterBase::ReleaseHeightPreviewGlResources()
+{
+    for (const auto& entry : m_heightPreviewVolumes)
+        if (entry)
+            for (HeightPreviewCut& cut : entry->cuts) {
+                cut.contours.reset();
+                cut.key.reset();
+            }
+}
+
+void GLGizmoPainterBase::DetachHeightPreviewGlResources(std::vector<unsigned int>& bufferIds)
+{
+    for (const auto& entry : m_heightPreviewVolumes)
+        if (entry)
+            for (HeightPreviewCut& cut : entry->cuts) {
+                cut.contours.DetachGpuBuffers(bufferIds);
+                cut.key.reset();
+            }
 }
 
 BoundingBoxf3 GLGizmoPainterBase::bounding_box() const
@@ -490,43 +622,6 @@ BoundingBoxf3 GLGizmoPainterBase::bounding_box() const
             ret.merge(volume->transformed_convex_hull_bounding_box());
     }
     return ret;
-}
-
-void GLGizmoPainterBase::update_contours(int i, const TriangleMesh& vol_mesh, float cursor_z, float max_z, float min_z) const
-{
-    const Selection& selection = m_parent.get_selection();
-    const GLVolume* first_glvolume = selection.get_first_volume();
-    const BoundingBoxf3& box = first_glvolume->transformed_convex_hull_bounding_box();
-
-    const ModelObject* model_object = wxGetApp().model().objects[selection.get_object_idx()];
-    const int instance_idx = selection.get_instance_idx();
-
-        if (min_z < cursor_z && cursor_z < max_z) {
-            if (m_cut_contours[i].cut_z != cursor_z || m_cut_contours[i].object_id != model_object->id() || m_cut_contours[i].instance_idx != instance_idx) {
-                m_cut_contours[i].cut_z = cursor_z;
-
-                m_cut_contours[i].mesh = vol_mesh;
-
-                m_cut_contours[i].position = box.center();
-                m_cut_contours[i].shift = Vec3d::Zero();
-                m_cut_contours[i].object_id = model_object->id();
-                m_cut_contours[i].instance_idx = instance_idx;
-                m_cut_contours[i].contours.reset();
-
-                MeshSlicingParams slicing_params;
-                slicing_params.trafo = Transform3d::Identity().matrix();
-                const Polygons polys = slice_mesh(m_cut_contours[i].mesh.its, cursor_z, slicing_params);
-                if (!polys.empty()) {
-                    m_cut_contours[i].contours.init_from(polys, static_cast<float>(cursor_z));
-                    m_cut_contours[i].contours.set_color({ 1.0f, 1.0f, 1.0f, 1.0f });
-                }
-            }
-            else if (box.center() != m_cut_contours[i].position) {
-                m_cut_contours[i].shift = box.center() - m_cut_contours[i].position;
-            }
-        }
-        else
-            m_cut_contours[i].contours.reset();
 }
 
 bool GLGizmoPainterBase::is_mesh_point_clipped(const Vec3d& point, const Transform3d& trafo) const
@@ -1291,6 +1386,7 @@ void GLGizmoPainterBase::on_set_state()
         m_old_mo_id = -1;
         //m_iva.release_geometry();
         DetachTriangleSelectorGlResources();
+        m_heightPreviewVolumes.clear();
         m_triangle_selectors.clear();
         m_heightRangeIndices.clear();
 
@@ -1312,6 +1408,7 @@ void GLGizmoPainterBase::on_load(cereal::BinaryInputArchive&)
     // a flag to do the update in set_painter_gizmo_data, which will be called
     // soon after.
     m_schedule_update = true;
+    InvalidateHeightPreviewCaches("undo_redo");
 }
 
 TriangleSelector::ClippingPlane GLGizmoPainterBase::get_clipping_plane_in_volume_coordinates(const Transform3d &trafo) const {

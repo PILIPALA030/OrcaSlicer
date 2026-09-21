@@ -524,26 +524,65 @@ private:
     };
     mutable RaycastResult m_rr = {Vec2d::Zero(), -1, Vec3f::Zero(), 0};
 
-    // BBS
-    struct CutContours
+    // BBS: height preview caches one transformed mesh per raw volume plus two cut contours.
+    struct HeightPreviewCutKey
     {
-        TriangleMesh mesh;
-        GLModel contours;
-        double cut_z{ 0.0 };
-        Vec3d position{ Vec3d::Zero() };
-        Vec3d shift{ Vec3d::Zero() };
-        ObjectID object_id;
-        int instance_idx{ -1 };
+        uint64_t meshRevision = 0;
+        float zWorld = 0.f;
+        bool enabled = false;
+
+        bool operator==(const HeightPreviewCutKey& rhs) const noexcept
+        {
+            return meshRevision == rhs.meshRevision &&
+                   zWorld == rhs.zWorld &&
+                   enabled == rhs.enabled;
+        }
     };
-    mutable std::vector<CutContours> m_cut_contours;
-    mutable int                      m_volumes_index = 0;
+
+    struct HeightPreviewCut
+    {
+        GLModel contours;
+        std::optional<HeightPreviewCutKey> key;
+    };
+
+    struct HeightPreviewVolumeCache
+    {
+        ObjectID objectId;
+        ObjectID instanceId;
+        ObjectID volumeId;
+
+        // Keeps the source alive so a released mesh address cannot be reused for a false hit.
+        std::shared_ptr<const TriangleMesh> sourceMesh;
+        std::unique_ptr<TriangleMesh> worldMesh;
+        Transform3d effectiveTransform = Transform3d::Identity();
+
+        // Geometry version of this cache entry, not a selector revision.
+        uint64_t meshRevision = 0;
+        std::array<HeightPreviewCut, 2> cuts;
+    };
+    mutable std::vector<std::unique_ptr<HeightPreviewVolumeCache>> m_heightPreviewVolumes;
+
+    HeightPreviewVolumeCache& GetHeightPreviewVolumeCache(size_t rawVolumeIndex) const;
+    /** Identity-checked mesh preparation; hit leaves the cache untouched. */
+    bool EnsureHeightPreviewMesh(HeightPreviewVolumeCache& cache, const ModelObject& object,
+                                 const ModelInstance& instance, const ModelVolume& volume,
+                                 const Transform3d& effectiveTransform) const;
+    /** Per-Z cut cache; empty results are cached too. */
+    void UpdateHeightPreviewCut(HeightPreviewVolumeCache& cache, size_t cutIndex,
+                                float zWorld, float minZ, float maxZ) const;
+    /** CPU-only invalidation; never touches GL resources. */
+    void InvalidateHeightPreviewCaches(const char* reason) const;
+    /** Releases cut GLModels; requires a current GL context. */
+    void ReleaseHeightPreviewGlResources();
+    /** Moves cut buffer IDs into the pending-delete queue without GL calls. */
+    void DetachHeightPreviewGlResources(std::vector<unsigned int>& bufferIds);
+
     mutable float       m_cursor_z{0};
     mutable double      m_height_start_z_in_imgui{0};
     mutable bool        m_is_set_height_start_z_by_imgui{false};
     mutable Vec2i32       m_height_start_pos{0, 0};
     mutable bool        m_is_cursor_in_imgui{false};
     BoundingBoxf3 bounding_box() const;
-    void update_contours(int i, const TriangleMesh& vol_mesh, float cursor_z, float max_z, float min_z) const;
 
 protected:
     void on_set_state() override;
