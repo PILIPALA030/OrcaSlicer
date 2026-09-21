@@ -27,7 +27,6 @@ namespace Slic3r::GUI {
 namespace {
 
 constexpr size_t RENDER_CHUNK_ROOT_TARGET = 8192;
-constexpr size_t RENDER_CHUNK_BUILD_BATCH_SIZE = 4;
 constexpr size_t MAX_COLOR_UPLOAD_RANGES = 8;
 
 uint32_t ExpandMortonBits(uint32_t value)
@@ -1341,6 +1340,7 @@ void TriangleSelectorGUI::SetPointerPreviewEnabled(bool enabled)
     m_pointerPreviewLeaf = -1;
     m_pointerPreviewVertices.reset();
     m_pointerPreviewDirty = enabled;
+    InvalidateSeedFillContourCache();
     m_update_render_data = true;
 }
 
@@ -1412,8 +1412,16 @@ void TriangleSelectorGUI::OnLeafIdentityWillChange()
 void TriangleSelectorGUI::OnSelectorMutation(MutationKind kind, int sourceTriangle)
 {
     (void) sourceTriangle;
-    if (kind == MutationKind::Topology || kind == MutationKind::IndexRebuild || kind == MutationKind::FullReset)
+    if (kind == MutationKind::Topology || kind == MutationKind::IndexRebuild || kind == MutationKind::FullReset) {
         InvalidatePointerPreview();
+        InvalidateSeedFillContourCache();
+    }
+}
+
+void TriangleSelectorGUI::InvalidateSeedFillContourCache()
+{
+    m_seedFillContourKey.reset();
+    m_update_render_data = true;
 }
 
 TriangleSelectorGUI::~TriangleSelectorGUI()
@@ -1435,6 +1443,7 @@ void TriangleSelectorGUI::ReleaseOwnedGlResources()
 #endif
     m_paint_contour.reset();
     InvalidatePointerPreview();
+    InvalidateSeedFillContourCache();
 }
 
 void TriangleSelectorGUI::DetachOwnedGlResources(std::vector<unsigned int>& bufferIds)
@@ -1449,6 +1458,7 @@ void TriangleSelectorGUI::DetachOwnedGlResources(std::vector<unsigned int>& buff
 #endif
     m_paint_contour.DetachGpuBuffers(bufferIds);
     InvalidatePointerPreview();
+    InvalidateSeedFillContourCache();
 }
 
 bool TriangleSelectorGUI::HasOwnedGlResources() const
@@ -1710,10 +1720,7 @@ std::optional<ColorRGBA> TriangleSelectorPatch::FinalRenderColorForState(Enforce
 
 void TriangleSelectorPatch::AppendTriangleColor(std::vector<uint8_t>& colors, EnforcerBlockerType state) const
 {
-    const std::optional<ColorRGBA> color = FinalRenderColorForState(state);
-    const std::array<uint8_t, 4> rgba = color.has_value() ?
-        std::array<uint8_t, 4>{color->r_uchar(), color->g_uchar(), color->b_uchar(), color->a_uchar()} :
-        std::array<uint8_t, 4>{0, 0, 0, 0};
+    const Rgba8 rgba = RenderColorForState8(state);
 
     for (size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex)
         colors.insert(colors.end(), rgba.begin(), rgba.end());
@@ -1751,16 +1758,54 @@ void TriangleSelectorPatch::AppendTriangleLeaves(int triangleIndex, bool showWir
     result.vertexCount += 3;
 }
 
-TriangleSelectorPatch::ChunkBuildResult TriangleSelectorPatch::BuildChunkCpu(uint32_t chunkId, bool showWireframe) const
+size_t TriangleSelectorPatch::CountLeafTriangles(int triangleIndex) const
 {
-    ChunkBuildResult result;
+    if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
+        return 0;
+
+    const Triangle& triangle = m_triangles[triangleIndex];
+    if (!triangle.valid())
+        return 0;
+
+    if (triangle.is_split()) {
+        size_t leafCount = 0;
+        for (int childIndex = 0; childIndex <= triangle.number_of_split_sides(); ++childIndex)
+            leafCount += CountLeafTriangles(triangle.children[childIndex]);
+        return leafCount;
+    }
+    return 1;
+}
+
+TriangleSelectorPatch::ChunkBuildPlan TriangleSelectorPatch::MakeChunkBuildPlan(uint32_t chunkId, bool showWireframe) const
+{
+    ChunkBuildPlan plan;
+    plan.chunkId = chunkId;
     if (chunkId >= m_renderChunks.size())
-        return result;
+        return plan;
 
     const RenderChunk& chunk = m_renderChunks[chunkId];
+    for (uint32_t source : chunk.sourceRoots)
+        plan.leafCount += CountLeafTriangles(static_cast<int>(source));
+    plan.vertexCount = plan.leafCount * 3;
+
     const size_t floatsPerVertex = showWireframe ? 6 : 3;
-    result.geometryStaging.reserve(chunk.sourceRoots.size() * 3 * floatsPerVertex);
-    result.colorsRgba.reserve(chunk.sourceRoots.size() * 3 * 4);
+    const size_t geometryBytes   = plan.vertexCount * floatsPerVertex * sizeof(float);
+    const size_t colorBytes      = plan.vertexCount * 4;
+    const size_t rootInfoBytes   = chunk.sourceRoots.size() * sizeof(RootDrawInfo);
+    plan.stagingBytes = geometryBytes + colorBytes + rootInfoBytes;
+    return plan;
+}
+
+TriangleSelectorPatch::ChunkBuildResult TriangleSelectorPatch::BuildChunkCpu(const ChunkBuildPlan& plan, bool showWireframe) const
+{
+    ChunkBuildResult result;
+    if (plan.chunkId >= m_renderChunks.size())
+        return result;
+
+    const RenderChunk& chunk = m_renderChunks[plan.chunkId];
+    const size_t floatsPerVertex = showWireframe ? 6 : 3;
+    result.geometryStaging.reserve(plan.vertexCount * floatsPerVertex);
+    result.colorsRgba.reserve(plan.vertexCount * 4);
     result.rootDrawInfos.reserve(chunk.sourceRoots.size());
 
     for (uint32_t source : chunk.sourceRoots) {
@@ -1772,6 +1817,64 @@ TriangleSelectorPatch::ChunkBuildResult TriangleSelectorPatch::BuildChunkCpu(uin
     }
 
     return result;
+}
+
+void TriangleSelectorPatch::RebuildRenderChunks(const std::vector<uint32_t>& chunkIds, bool showWireframe,
+                                                const ChunkBatchLimits& limits)
+{
+    std::vector<ChunkBuildPlan> plans;
+    plans.reserve(chunkIds.size());
+    for (uint32_t chunkId : chunkIds)
+        plans.push_back(MakeChunkBuildPlan(chunkId, showWireframe));
+
+    size_t batchBegin = 0;
+    while (batchBegin < plans.size())
+    {
+        // Greedy batch bounded by chunk count and estimated staging bytes.
+        size_t batchEnd = batchBegin;
+        size_t batchStagingBytes = 0;
+        while (batchEnd < plans.size())
+        {
+            const ChunkBuildPlan& plan = plans[batchEnd];
+            if (batchEnd > batchBegin && (batchEnd - batchBegin >= limits.maxChunks ||
+                batchStagingBytes + plan.stagingBytes > limits.maxStagingBytes))
+                break;
+            // An oversized single chunk still proceeds alone.
+            batchStagingBytes += plan.stagingBytes;
+            ++batchEnd;
+        }
+
+        std::vector<ChunkBuildResult> results(batchEnd - batchBegin);
+        if (results.size() == 1)
+            results[0] = BuildChunkCpu(plans[batchBegin], showWireframe);
+        else
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, results.size()), [&](const tbb::blocked_range<size_t>& range) {
+                for (size_t resultIndex = range.begin(); resultIndex != range.end(); ++resultIndex)
+                    results[resultIndex] = BuildChunkCpu(plans[batchBegin + resultIndex], showWireframe);
+            });
+        for (size_t resultIndex = 0; resultIndex < results.size(); ++resultIndex)
+            UploadChunk(plans[batchBegin + resultIndex].chunkId, std::move(results[resultIndex]));
+        // Batch results leave scope here, releasing this batch's geometry staging only.
+        batchBegin = batchEnd;
+    }
+}
+
+void TriangleSelectorPatch::RefreshRenderColorLut()
+{
+    m_renderColorLut.assign(m_ebt_colors.size(), Rgba8{0, 0, 0, 0});
+    for (size_t stateIndex = 0; stateIndex < m_ebt_colors.size(); ++stateIndex) {
+        const std::optional<ColorRGBA> color = FinalRenderColorForState(static_cast<EnforcerBlockerType>(stateIndex));
+        if (color.has_value())
+            m_renderColorLut[stateIndex] = Rgba8{color->r_uchar(), color->g_uchar(), color->b_uchar(), color->a_uchar()};
+    }
+}
+
+TriangleSelectorPatch::Rgba8 TriangleSelectorPatch::RenderColorForState8(EnforcerBlockerType state) const noexcept
+{
+    const int stateIndex = static_cast<int>(state);
+    if (stateIndex < 0 || static_cast<size_t>(stateIndex) >= m_renderColorLut.size())
+        return Rgba8{0, 0, 0, 0};
+    return m_renderColorLut[static_cast<size_t>(stateIndex)];
 }
 
 void TriangleSelectorPatch::render(ImGuiWrapper* imgui, const Transform3d& matrix)
@@ -2182,10 +2285,7 @@ void TriangleSelectorPatch::RewriteTriangleColors(int triangleIndex, RenderChunk
         return;
     }
 
-    const std::optional<ColorRGBA> color = FinalRenderColorForState(triangle.get_state());
-    const std::array<uint8_t, 4> rgba = color.has_value() ?
-        std::array<uint8_t, 4>{color->r_uchar(), color->g_uchar(), color->b_uchar(), color->a_uchar()} :
-        std::array<uint8_t, 4>{0, 0, 0, 0};
+    const Rgba8 rgba = RenderColorForState8(triangle.get_state());
     for (size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex) {
         const size_t byteOffset = static_cast<size_t>(vertexOffset) * 4;
         if (byteOffset + rgba.size() > chunk.colorsRgba.size())
@@ -2261,7 +2361,7 @@ void TriangleSelectorPatch::UploadColorAdaptive(uint32_t chunkId, ColorUploadRea
     if (chunk.colorsRgba.empty() || chunk.dirtyColorRanges.empty())
         return;
 
-    MergeDirtyRanges(chunk);
+    // Ranges are already merged by PrepareChunkColorsCpu.
     size_t dirtyBytes = 0;
     for (const DirtyRange& range : chunk.dirtyColorRanges)
         dirtyBytes += static_cast<size_t>(range.endVertex - range.beginVertex) * 4;
@@ -2307,17 +2407,16 @@ void TriangleSelectorPatch::UpdateRenderChunks(bool showWireframe)
     if (wireframeLayoutChanged && m_renderChunksInitialized)
         MarkAllChunksTopologyDirty();
 
+    // Main thread only: workers read the LUT, never GUI color config.
+    RefreshRenderColorLut();
+    const ChunkBatchLimits limits;
+
     if (!m_renderChunksInitialized) {
-        for (size_t batchBegin = 0; batchBegin < m_renderChunks.size(); batchBegin += RENDER_CHUNK_BUILD_BATCH_SIZE) {
-            const size_t batchEnd = std::min(batchBegin + RENDER_CHUNK_BUILD_BATCH_SIZE, m_renderChunks.size());
-            std::vector<ChunkBuildResult> results(batchEnd - batchBegin);
-            tbb::parallel_for(tbb::blocked_range<size_t>(0, results.size()), [&](const tbb::blocked_range<size_t>& range) {
-                for (size_t resultIndex = range.begin(); resultIndex != range.end(); ++resultIndex)
-                    results[resultIndex] = BuildChunkCpu(static_cast<uint32_t>(batchBegin + resultIndex), showWireframe);
-            });
-            for (size_t resultIndex = 0; resultIndex < results.size(); ++resultIndex)
-                UploadChunk(static_cast<uint32_t>(batchBegin + resultIndex), std::move(results[resultIndex]));
-        }
+        std::vector<uint32_t> chunkIds;
+        chunkIds.reserve(m_renderChunks.size());
+        for (uint32_t chunkId = 0; chunkId < m_renderChunks.size(); ++chunkId)
+            chunkIds.push_back(chunkId);
+        RebuildRenderChunks(chunkIds, showWireframe, limits);
         m_renderChunksInitialized = true;
         _renderChunkWireframeLayout = showWireframe;
         ClearRenderDirtyState();
@@ -2325,30 +2424,75 @@ void TriangleSelectorPatch::UpdateRenderChunks(bool showWireframe)
     }
 
     AggregateDirtyRoots();
+
+    // Freeze the dirty input into two disjoint task tables.
+    std::vector<uint32_t>    geometryChunkIds;
+    std::vector<ChunkColorTask> colorTasks;
     if (m_allColorDirty) {
+        geometryChunkIds.reserve(m_renderChunks.size());
+        colorTasks.reserve(m_renderChunks.size());
         for (uint32_t chunkId = 0; chunkId < m_renderChunks.size(); ++chunkId) {
-            RenderChunk& chunk = m_renderChunks[chunkId];
-            if (chunk.dirty == DirtyLevel::Topology) {
-                UploadChunk(chunkId, BuildChunkCpu(chunkId, showWireframe));
-            } else {
-                RewriteChunkColors(chunkId);
-                UploadColorAdaptive(chunkId, ColorUploadReason::AllColor);
-            }
+            if (m_renderChunks[chunkId].dirty == DirtyLevel::Topology)
+                geometryChunkIds.push_back(chunkId);
+            else
+                colorTasks.push_back({chunkId, ColorUploadReason::AllColor});
         }
     } else {
+        geometryChunkIds.reserve(m_dirtyChunks.size());
+        colorTasks.reserve(m_dirtyChunks.size());
         for (uint32_t chunkId : m_dirtyChunks) {
-            RenderChunk& chunk = m_renderChunks[chunkId];
-            if (chunk.dirty == DirtyLevel::Topology) {
-                UploadChunk(chunkId, BuildChunkCpu(chunkId, showWireframe));
-                continue;
-            }
-            for (uint32_t source : chunk.stateDirtyRoots)
-                RewriteRootColors(source);
-            UploadColorAdaptive(chunkId, ColorUploadReason::State);
+            if (m_renderChunks[chunkId].dirty == DirtyLevel::Topology)
+                geometryChunkIds.push_back(chunkId);
+            else
+                colorTasks.push_back({chunkId, ColorUploadReason::State});
         }
     }
+
+    // Geometry rebuild first: color workers then read a stable m_rootDrawInfo.
+    RebuildRenderChunks(geometryChunkIds, showWireframe, limits);
+    UpdateChunkColors(colorTasks, limits);
+
     _renderChunkWireframeLayout = showWireframe;
     ClearRenderDirtyState();
+}
+
+void TriangleSelectorPatch::PrepareChunkColorsCpu(const ChunkColorTask& task)
+{
+    RenderChunk& chunk = m_renderChunks[task.chunkId];
+
+    // stateDirtyRoots were aggregated on the main thread; this task owns the chunk.
+    chunk.dirtyColorRanges.clear();
+    const size_t rangeUpperBound = task.reason == ColorUploadReason::AllColor ?
+        size_t(1) : chunk.stateDirtyRoots.size();
+    chunk.dirtyColorRanges.reserve(rangeUpperBound);
+
+    if (task.reason == ColorUploadReason::AllColor)
+        RewriteChunkColors(task.chunkId);
+    else
+        for (uint32_t sourceRoot : chunk.stateDirtyRoots)
+            RewriteRootColors(sourceRoot);
+
+    MergeDirtyRanges(chunk);
+}
+
+void TriangleSelectorPatch::UpdateChunkColors(const std::vector<ChunkColorTask>& tasks, const ChunkBatchLimits& limits)
+{
+    size_t batchBegin = 0;
+    while (batchBegin < tasks.size())
+    {
+        const size_t batchEnd   = std::min(batchBegin + limits.maxChunks, tasks.size());
+        const size_t batchCount = batchEnd - batchBegin;
+        if (batchCount == 1)
+            PrepareChunkColorsCpu(tasks[batchBegin]);
+        else
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, batchCount), [&](const tbb::blocked_range<size_t>& range) {
+                for (size_t taskIndex = range.begin(); taskIndex != range.end(); ++taskIndex)
+                    PrepareChunkColorsCpu(tasks[batchBegin + taskIndex]);
+            });
+        for (size_t taskIndex = batchBegin; taskIndex < batchEnd; ++taskIndex)
+            UploadColorAdaptive(tasks[taskIndex].chunkId, tasks[taskIndex].reason);
+        batchBegin = batchEnd;
+    }
 }
 
 void TriangleSelectorPatch::RenderChunks(bool showWireframe)
@@ -2682,6 +2826,17 @@ void TriangleSelectorGUI::update_paint_contour()
     if (m_pointerPreviewEnabled && !m_pointerPreviewDirty)
         return;
 
+    if (!m_pointerPreviewEnabled) {
+        // Fill contour cache: same preview membership and tree identity keep the GLModel valid.
+        const SeedFillContourKey currentKey{GetSeedFillPreviewRevision(), GetTopologyRevision(), GetTriangleIndexRevision()};
+        if (m_seedFillContourKey.has_value() && *m_seedFillContourKey == currentKey) {
+            if (m_seedFillContourKey->edgeCount > 0)
+                return; // keep the existing GLModel
+            m_paint_contour.reset(); // empty preview: stay empty
+            return;
+        }
+    }
+
     m_paint_contour.reset();
 
     GLModel::Geometry init_data;
@@ -2719,6 +2874,9 @@ void TriangleSelectorGUI::update_paint_contour()
 
     if (!init_data.is_empty())
         m_paint_contour.init_from(std::move(init_data));
+
+    m_seedFillContourKey = SeedFillContourKey{GetSeedFillPreviewRevision(), GetTopologyRevision(),
+                                              GetTriangleIndexRevision(), contour_edges.size()};
 }
 
 void TriangleSelectorGUI::render_paint_contour(const Transform3d& matrix)

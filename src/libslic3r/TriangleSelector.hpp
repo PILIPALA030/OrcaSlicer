@@ -360,6 +360,8 @@ public:
     uint64_t GetTopologyRevision() const noexcept { return m_topologyRevision; }
     uint64_t GetTriangleIndexRevision() const noexcept { return m_triangleIndexRevision; }
     uint64_t GetStateRevision() const noexcept { return m_stateRevision; }
+    // Diagnostics/preview-cache identity: bumped whenever the seed-fill preview membership changes.
+    uint64_t GetSeedFillPreviewRevision() const noexcept { return m_seedFillPreviewRevision; }
 
     /** Changes a valid leaf state and either cleans its source root immediately or records it for deferred cleanup. */
     bool SetLeafState(int triangleIndex, EnforcerBlockerType state, CleanupMode cleanupMode = CleanupMode::Immediate);
@@ -630,9 +632,12 @@ private:
     void get_facets_split_by_tjoints(const Vec3i32 &vertices, const Vec3i32 &neighbors, std::vector<stl_triangle_vertex_indices> &out_triangles) const;
 
     void get_seed_fill_contour_recursive(int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<Vec2i32> &edges_out) const;
+    /** Appends contour edges for roots that are already range-checked and unique; no copy, no sort. */
+    void AppendSeedFillContourForUniqueRoots(const std::vector<uint32_t>& sourceRoots, std::vector<Vec2i32>& edgesOut) const;
 
     std::vector<uint32_t> m_deferredCleanupRoots;
     std::vector<int> m_seedFillSelectedLeaves;
+    uint64_t m_seedFillPreviewRevision = 1;
     uint32_t m_rootQueryGeneration { 0 };
     std::vector<uint32_t> m_rootQueryStamp;
     uint32_t m_triangleQueryGeneration { 0 };

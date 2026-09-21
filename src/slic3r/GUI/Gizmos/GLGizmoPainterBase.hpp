@@ -97,6 +97,25 @@ private:
 protected:
     GLModel                      m_paint_contour;
 
+    // Contour cache key: skip rebuilds when the fill preview did not change.
+    struct SeedFillContourKey
+    {
+        uint64_t previewRevision = 0;
+        uint64_t topologyRevision = 0;
+        uint64_t indexRevision = 0;
+        size_t   edgeCount = 0;
+
+        bool operator==(const SeedFillContourKey& rhs) const noexcept
+        {
+            return previewRevision == rhs.previewRevision &&
+                   topologyRevision == rhs.topologyRevision &&
+                   indexRevision == rhs.indexRevision;
+        }
+    };
+    std::optional<SeedFillContourKey> m_seedFillContourKey;
+    /** Drops the cached fill-contour key so the next update rebuilds it. */
+    void InvalidateSeedFillContourCache();
+
     /** Releases every GLModel owned by the selector. A compatible context must be current. */
     void ReleaseOwnedGlResources();
     /** Detaches every owned buffer ID without issuing OpenGL calls. */
@@ -250,11 +269,46 @@ private:
         State
     };
 
+    struct ChunkBatchLimits
+    {
+        size_t maxChunks = 4;
+        size_t maxStagingBytes = size_t(64) * 1024 * 1024;
+    };
+
+    struct ChunkBuildPlan
+    {
+        uint32_t chunkId = 0;
+        size_t leafCount = 0;
+        size_t vertexCount = 0;
+        size_t stagingBytes = 0;
+    };
+
+    struct ChunkColorTask
+    {
+        uint32_t chunkId = 0;
+        ColorUploadReason reason = ColorUploadReason::State;
+    };
+
+    using Rgba8 = std::array<uint8_t, 4>;
+
     void update_render_data();
     void render(int buffer_idx, bool show_wireframe=false);
     void BuildRenderChunkLayout();
     void UpdateRenderChunks(bool showWireframe);
-    ChunkBuildResult BuildChunkCpu(uint32_t chunkId, bool showWireframe) const;
+    /** Counts current valid leaves under a triangle without building geometry. */
+    size_t CountLeafTriangles(int triangleIndex) const;
+    /** Estimates exact staging sizes for one chunk rebuild from the current tree. */
+    ChunkBuildPlan MakeChunkBuildPlan(uint32_t chunkId, bool showWireframe) const;
+    ChunkBuildResult BuildChunkCpu(const ChunkBuildPlan& plan, bool showWireframe) const;
+    /** Bounded-batch parallel CPU rebuild followed by serial GL upload on the render thread. */
+    void RebuildRenderChunks(const std::vector<uint32_t>& chunkIds, bool showWireframe, const ChunkBatchLimits& limits);
+    /** CPU-side color rewrite and range merge for one chunk; touches no GL. */
+    void PrepareChunkColorsCpu(const ChunkColorTask& task);
+    /** Bounded-batch parallel color prepare followed by serial GL upload. */
+    void UpdateChunkColors(const std::vector<ChunkColorTask>& tasks, const ChunkBatchLimits& limits);
+    /** Recomputes the State->RGBA8 table on the render thread before workers run. */
+    void RefreshRenderColorLut();
+    Rgba8 RenderColorForState8(EnforcerBlockerType state) const noexcept;
     void AppendTriangleLeaves(int triangleIndex, bool showWireframe, ChunkBuildResult& result) const;
     void UploadChunk(uint32_t chunkId, ChunkBuildResult&& result);
     void EnsureVboCapacity(unsigned int target, unsigned int& vboId, size_t& capacityBytes, size_t requiredBytes,
@@ -271,6 +325,8 @@ private:
     void ClearRenderDirtyState();
     std::optional<ColorRGBA> FinalRenderColorForState(EnforcerBlockerType state) const;
     void AppendTriangleColor(std::vector<uint8_t>& colors, EnforcerBlockerType state) const;
+
+    std::vector<Rgba8>     m_renderColorLut;
 
     std::vector<RenderChunk> m_renderChunks;
     std::vector<uint32_t> m_sourceToChunk;

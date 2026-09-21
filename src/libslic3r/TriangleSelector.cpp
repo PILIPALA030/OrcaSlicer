@@ -519,6 +519,7 @@ bool TriangleSelector::SelectSeedFillLeaf(int triangleIndex)
 
     triangle.select_by_seed_fill();
     m_seedFillSelectedLeaves.push_back(triangleIndex);
+    ++m_seedFillPreviewRevision;
     return true;
 }
 
@@ -751,28 +752,38 @@ void TriangleSelector::seed_fill_select_triangles(const Vec3f &hit, int facet_st
         m_triangleQueryStamp, m_triangleQueryGeneration, m_triangles.size());
     std::queue<int>   facet_queue;
     facet_queue.push(facet_start);
+    // Mark-on-enqueue: every queued facet gets exactly one processing pass.
+    m_triangleQueryStamp[facet_start] = queryGeneration;
 
     const double facet_angle_limit     = cos(Geometry::deg2rad(seed_fill_angle)) - EPSILON;
     const float  highlight_angle_limit = -cos(Geometry::deg2rad(highlight_by_angle_deg));
+    const Matrix3f normal_matrix       = static_cast<Matrix3f>(
+        trafo_no_translate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
 
     // Depth-first traversal of neighbors of the face hit by the ray thrown from the mouse cursor.
     while (!facet_queue.empty()) {
         int current_facet = facet_queue.front();
         facet_queue.pop();
 
-        const Vec3f &facet_normal = m_face_normals[m_triangles[current_facet].source_triangle];
-        Matrix3f     normal_matrix  = static_cast<Matrix3f>(trafo_no_translate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
-        float        world_normal_z = (normal_matrix * facet_normal).normalized().z();
-        if (m_triangleQueryStamp[current_facet] != queryGeneration &&
-            (highlight_by_angle_deg == 0.f || world_normal_z < highlight_angle_limit)) {
+        // Keep the original overhang gate; world normal is only needed when it is active.
+        bool passesOverhang = true;
+        if (highlight_by_angle_deg != 0.f) {
+            const Vec3f &facet_normal   = m_face_normals[m_triangles[current_facet].source_triangle];
+            const float  world_normal_z = (normal_matrix * facet_normal).normalized().z();
+            passesOverhang = world_normal_z < highlight_angle_limit;
+        }
+
+        if (passesOverhang) {
             if (m_triangles[current_facet].is_split()) {
                 for (int split_triangle_idx = 0; split_triangle_idx <= m_triangles[current_facet].number_of_split_sides(); ++split_triangle_idx) {
                     assert(split_triangle_idx < int(m_triangles[current_facet].children.size()));
                     assert(m_triangles[current_facet].children[split_triangle_idx] < int(m_triangles.size()));
                     if (int child = m_triangles[current_facet].children[split_triangle_idx];
-                        m_triangleQueryStamp[child] != queryGeneration)
+                        m_triangleQueryStamp[child] != queryGeneration) {
                         // Child triangle shares normal with its parent. Select it.
+                        m_triangleQueryStamp[child] = queryGeneration;
                         facet_queue.push(child);
+                    }
                 }
             } else
                 SelectSeedFillLeaf(current_facet);
@@ -786,12 +797,13 @@ void TriangleSelector::seed_fill_select_triangles(const Vec3f &hit, int facet_st
                         // Check if neighbour_facet_idx is satisfies angle in seed_fill_angle and append it to facet_queue if it do.
                         const Vec3f &n1 = m_face_normals[m_triangles[neighbor_idx].source_triangle];
                         const Vec3f &n2 = m_face_normals[m_triangles[current_facet].source_triangle];
-                        if (std::clamp(n1.dot(n2), 0.f, 1.f) >= facet_angle_limit)
+                        if (std::clamp(n1.dot(n2), 0.f, 1.f) >= facet_angle_limit) {
+                            m_triangleQueryStamp[neighbor_idx] = queryGeneration;
                             facet_queue.push(neighbor_idx);
+                        }
                     }
                 }
         }
-        m_triangleQueryStamp[current_facet] = queryGeneration;
     }
 }
 
@@ -930,54 +942,58 @@ void TriangleSelector::bucket_fill_select_triangles(const Vec3f& hit, int facet_
     // seed_fill_angle < 0.f to disable edge detection
     const double facet_angle_limit = (seed_fill_angle < 0.f ? -1.f : cos(Geometry::deg2rad(seed_fill_angle))) - EPSILON;
 
-    auto get_all_touching_triangles = [this](int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated) -> std::vector<int> {
+    // Reused scratch container: cleared per visit, no per-leaf vector allocation.
+    auto collect_touching_triangles = [this](int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated,
+                                             std::vector<int> &output) {
         assert(facet_idx != -1 && facet_idx < int(m_triangles.size()));
         assert(this->verify_triangle_neighbors(m_triangles[facet_idx], neighbors));
-        std::vector<int> touching_triangles;
-        Vec3i32            vertices = {m_triangles[facet_idx].verts_idxs[0], m_triangles[facet_idx].verts_idxs[1], m_triangles[facet_idx].verts_idxs[2]};
-        append_touching_subtriangles(neighbors(0), vertices(1), vertices(0), touching_triangles);
-        append_touching_subtriangles(neighbors(1), vertices(2), vertices(1), touching_triangles);
-        append_touching_subtriangles(neighbors(2), vertices(0), vertices(2), touching_triangles);
+        output.clear();
+        Vec3i32 vertices = {m_triangles[facet_idx].verts_idxs[0], m_triangles[facet_idx].verts_idxs[1], m_triangles[facet_idx].verts_idxs[2]};
+        append_touching_subtriangles(neighbors(0), vertices(1), vertices(0), output);
+        append_touching_subtriangles(neighbors(1), vertices(2), vertices(1), output);
+        append_touching_subtriangles(neighbors(2), vertices(0), vertices(2), output);
 
         for (int neighbor_idx : neighbors_propagated)
             if (neighbor_idx != -1 && !m_triangles[neighbor_idx].is_split())
-                touching_triangles.emplace_back(neighbor_idx);
-
-        return touching_triangles;
+                output.emplace_back(neighbor_idx);
     };
 
     const NeighborCache& neighborCache = EnsureNeighborCache();
     const uint32_t queryGeneration = BeginQueryGeneration(
         m_triangleQueryStamp, m_triangleQueryGeneration, m_triangles.size());
     std::queue<int>    facet_queue;
+    std::vector<int>   touching_triangles;
+    touching_triangles.reserve(8);
 
+    // Mark-on-enqueue: every queued facet gets exactly one processing pass.
+    m_triangleQueryStamp[start_facet_idx] = queryGeneration;
     facet_queue.push(start_facet_idx);
     while (!facet_queue.empty()) {
         int current_facet = facet_queue.front();
         facet_queue.pop();
         assert(!m_triangles[current_facet].is_split());
 
-        if (m_triangleQueryStamp[current_facet] != queryGeneration) {
-            SelectSeedFillLeaf(current_facet);
+        SelectSeedFillLeaf(current_facet);
 
-            std::vector<int> touching_triangles = get_all_touching_triangles(
-                current_facet, neighborCache.neighbors[current_facet], neighborCache.propagated[current_facet]);
-            for(const int tr_idx : touching_triangles) {
-                if (tr_idx < 0 || m_triangleQueryStamp[tr_idx] == queryGeneration ||
-                    m_triangles[tr_idx].get_state() != start_facet_state || is_facet_clipped(tr_idx, clp))
-                    continue;
+        collect_touching_triangles(current_facet, neighborCache.neighbors[current_facet], neighborCache.propagated[current_facet],
+                                   touching_triangles);
+        for(const int tr_idx : touching_triangles) {
+            if (tr_idx < 0 || m_triangleQueryStamp[tr_idx] == queryGeneration)
+                continue;
+            if (m_triangles[tr_idx].get_state() != start_facet_state)
+                continue;
+            if (is_facet_clipped(tr_idx, clp))
+                continue;
 
-                const Vec3f& n1 = m_face_normals[m_triangles[tr_idx].source_triangle];
-                const Vec3f& n2 = m_face_normals[m_triangles[current_facet].source_triangle];
-                if (seed_fill_angle >= -EPSILON && std::clamp(n1.dot(n2), 0.f, 1.f) < facet_angle_limit)
-                    continue;
+            const Vec3f& n1 = m_face_normals[m_triangles[tr_idx].source_triangle];
+            const Vec3f& n2 = m_face_normals[m_triangles[current_facet].source_triangle];
+            if (seed_fill_angle >= -EPSILON && std::clamp(n1.dot(n2), 0.f, 1.f) < facet_angle_limit)
+                continue;
 
-                assert(!m_triangles[tr_idx].is_split());
-                facet_queue.push(tr_idx);
-            }
+            assert(!m_triangles[tr_idx].is_split());
+            m_triangleQueryStamp[tr_idx] = queryGeneration;
+            facet_queue.push(tr_idx);
         }
-
-        m_triangleQueryStamp[current_facet] = queryGeneration;
     }
 }
 
@@ -2088,6 +2104,7 @@ std::vector<Vec2i32> TriangleSelector::get_seed_fill_contour() const
 
     std::vector<uint32_t> sourceRoots;
     sourceRoots.reserve(m_seedFillSelectedLeaves.size());
+    bool originalLeavesOnly = true;
     for (int triangleIndex : m_seedFillSelectedLeaves)
     {
         if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
@@ -2099,9 +2116,19 @@ std::vector<Vec2i32> TriangleSelector::get_seed_fill_contour() const
             continue;
 
         sourceRoots.push_back(static_cast<uint32_t>(triangle.source_triangle));
+        // Original leaves are pairwise distinct roots already: skip sort/unique.
+        originalLeavesOnly &= triangleIndex == triangle.source_triangle;
     }
 
-    return get_seed_fill_contour(sourceRoots);
+    if (!originalLeavesOnly)
+    {
+        std::sort(sourceRoots.begin(), sourceRoots.end());
+        sourceRoots.erase(std::unique(sourceRoots.begin(), sourceRoots.end()), sourceRoots.end());
+    }
+
+    std::vector<Vec2i32> edgesOut;
+    AppendSeedFillContourForUniqueRoots(sourceRoots, edgesOut);
+    return edgesOut;
 }
 
 std::vector<Vec2i32> TriangleSelector::get_seed_fill_contour(const std::vector<uint32_t>& sourceRoots) const
@@ -2118,19 +2145,26 @@ std::vector<Vec2i32> TriangleSelector::get_seed_fill_contour(const std::vector<u
     if (uniqueSourceRoots.empty())
         return {};
 
+    // Caller-supplied roots are not guaranteed unique.
     std::sort(uniqueSourceRoots.begin(), uniqueSourceRoots.end());
     uniqueSourceRoots.erase(std::unique(uniqueSourceRoots.begin(), uniqueSourceRoots.end()), uniqueSourceRoots.end());
 
     std::vector<Vec2i32> edgesOut;
-    for (uint32_t sourceRoot : uniqueSourceRoots)
+    AppendSeedFillContourForUniqueRoots(uniqueSourceRoots, edgesOut);
+    return edgesOut;
+}
+
+// Roots must already be range-checked and unique; appends contour edges without copying them again.
+void TriangleSelector::AppendSeedFillContourForUniqueRoots(const std::vector<uint32_t>& sourceRoots,
+                                                           std::vector<Vec2i32>& edgesOut) const
+{
+    for (uint32_t sourceRoot : sourceRoots)
     {
         const int rootIndex = static_cast<int>(sourceRoot);
         const Vec3i32 neighbors = m_neighbors[rootIndex];
         assert(verify_triangle_neighbors(m_triangles[rootIndex], neighbors));
         get_seed_fill_contour_recursive(rootIndex, neighbors, neighbors, edgesOut);
     }
-
-    return edgesOut;
 }
 
 void TriangleSelector::get_seed_fill_contour_recursive(const int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<Vec2i32> &edges_out) const {
@@ -2506,6 +2540,10 @@ bool TriangleSelector::has_facets(const TriangleSplittingData &data, const Enfor
 
 void TriangleSelector::seed_fill_unselect_all_triangles()
 {
+    // Only a non-empty preview removal changes the preview revision.
+    if (!m_seedFillSelectedLeaves.empty())
+        ++m_seedFillPreviewRevision;
+
     for (int triangleIndex : m_seedFillSelectedLeaves)
     {
         if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
@@ -2522,6 +2560,7 @@ void TriangleSelector::seed_fill_apply_on_triangles(EnforcerBlockerType new_stat
 {
     std::vector<uint32_t> touchedRoots;
     touchedRoots.reserve(m_seedFillSelectedLeaves.size());
+    bool originalLeavesOnly = true;
     for (int triangleIndex : m_seedFillSelectedLeaves)
     {
         if (triangleIndex < 0 || triangleIndex >= static_cast<int>(m_triangles.size()))
@@ -2536,14 +2575,19 @@ void TriangleSelector::seed_fill_apply_on_triangles(EnforcerBlockerType new_stat
 
         triangle.set_state(new_state);
         touchedRoots.push_back(static_cast<uint32_t>(triangle.source_triangle));
+        originalLeavesOnly &= triangleIndex == triangle.source_triangle;
     }
 
     seed_fill_unselect_all_triangles();
     if (touchedRoots.empty())
         return;
 
-    std::sort(touchedRoots.begin(), touchedRoots.end());
-    touchedRoots.erase(std::unique(touchedRoots.begin(), touchedRoots.end()), touchedRoots.end());
+    // Changed original leaves are pairwise distinct roots already: skip sort/unique.
+    if (!originalLeavesOnly)
+    {
+        std::sort(touchedRoots.begin(), touchedRoots.end());
+        touchedRoots.erase(std::unique(touchedRoots.begin(), touchedRoots.end()), touchedRoots.end());
+    }
 
     ++m_stateRevision;
     for (uint32_t sourceTriangle : touchedRoots)
