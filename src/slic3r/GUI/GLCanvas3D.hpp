@@ -17,6 +17,7 @@
 #include "MeshUtils.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "GCodeViewer.hpp"
+#include "PCSSShadowRenderer.hpp"
 #include "Camera.hpp"
 #include "SceneRaycaster.hpp"
 #include "IMToolbar.hpp"
@@ -586,6 +587,10 @@ private:
 
     GLVolumeCollection m_volumes;
     GCodeViewer m_gcode_viewer;
+    PCSSShadowRenderer m_pcss_shadows;
+    std::uint64_t      m_pcss_scene_revision{1};
+    bool               m_pcss_frame_active{false};
+    bool               m_pcss_error_reported{false};
 
     RenderTimer m_render_timer;
 
@@ -760,7 +765,8 @@ public:
 
     bool is_initialized() const { return m_initialized; }
 
-    void set_context(wxGLContext* context) { m_context = context; }
+    // The previous context must remain alive until this call returns.
+    void        set_context(wxGLContext* context);
     void set_type(ECanvasType type) { m_canvas_type = type; }
     ECanvasType get_canvas_type() { return m_canvas_type; }
 
@@ -1287,6 +1293,10 @@ private:
     void _render_platelist(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool only_current, bool only_body = false, int hover_id = -1, bool render_cali = false, bool show_grid = true);
     //BBS: add outline drawing logic
     void _render_objects(GLVolumeCollection::ERenderType type, bool with_outline = true);
+    // Called only with this canvas's context current, after visibility/transform input has settled.
+    void _prepare_pcss_shadow_map();
+    // Apply pending slider input before both depth and color draws; also called after the slider UI changes.
+    void _apply_gcode_slider_changes();
     //BBS: GUI refactor: add canvas size as parameters
     void _render_gcode(int canvas_width, int canvas_height);
     //BBS: render a plane for assemble

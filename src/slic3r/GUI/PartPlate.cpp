@@ -34,6 +34,7 @@
 #include "3DBed.hpp"
 #include "PartPlate.hpp"
 #include "Camera.hpp"
+#include "PCSSShadowRenderer.hpp"
 #include "GUI_Colors.hpp"
 #include "GUI_ObjectList.hpp"
 #include "Tab.hpp"
@@ -2777,7 +2778,16 @@ bool PartPlate::intersects(const BoundingBoxf3& bb) const
 	return print_volume.intersects(bb);
 }
 
-void PartPlate::render(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool only_body, bool force_background_color, HeightLimitMode mode, int hover_id, bool render_cali, bool show_grid)
+void PartPlate::render(const Transform3d&        view_matrix,
+                       const Transform3d&        projection_matrix,
+                       bool                      bottom,
+                       bool                      only_body,
+                       bool                      force_background_color,
+                       HeightLimitMode           mode,
+                       int                       hover_id,
+                       bool                      render_cali,
+                       bool                      show_grid,
+                       const PCSSShadowRenderer* shadows)
 {
     glsafe(::glEnable(GL_DEPTH_TEST));
 
@@ -2816,6 +2826,16 @@ void PartPlate::render(const Transform3d& view_matrix, const Transform3d& projec
             render_logo(bottom, m_partplate_list->render_cali_logo && render_cali);
         else
             render_logo(bottom);
+    }
+
+    if (!bottom && !force_background_color && shadows != nullptr && shadows->is_ready()) {
+        GLShaderProgram* shadow_shader = wxGetApp().get_shader("pcss_plate");
+        if (shadow_shader != nullptr && m_triangles.model.is_initialized()) {
+            const Matrix4f        view_projection = (projection_matrix.matrix() * view_matrix.matrix()).cast<float>();
+            std::array<float, 16> matrix{};
+            std::copy(view_projection.data(), view_projection.data() + matrix.size(), matrix.begin());
+            shadows->render_plate(shadow_shader->get_id(), matrix, static_cast<float>(m_origin.z()), [&]() { m_triangles.model.render(); });
+        }
     }
 
     render_icons(bottom, only_body, hover_id);
@@ -4940,7 +4960,15 @@ void PartPlateList::postprocess_arrange_polygon(arrangement::ArrangePolygon& arr
 
 /*rendering related functions*/
 //render
-void PartPlateList::render(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool only_current, bool only_body, int hover_id, bool render_cali, bool show_grid)
+void PartPlateList::render(const Transform3d&        view_matrix,
+                           const Transform3d&        projection_matrix,
+                           bool                      bottom,
+                           bool                      only_current,
+                           bool                      only_body,
+                           int                       hover_id,
+                           bool                      render_cali,
+                           bool                      show_grid,
+                           const PCSSShadowRenderer* shadows)
 {
 	const std::lock_guard<std::mutex> local_lock(m_plates_mutex);
 	std::vector<PartPlate*>::iterator it = m_plate_list.begin();
@@ -4965,16 +4993,19 @@ void PartPlateList::render(const Transform3d& view_matrix, const Transform3d& pr
 		if (current_index == m_current_plate) {
 			PartPlate::HeightLimitMode height_mode = (only_current)?PartPlate::HEIGHT_LIMIT_NONE:m_height_limit_mode;
 			if (plate_hover_index == current_index)
-                (*it)->render(view_matrix, projection_matrix, bottom, only_body, false, height_mode, plate_hover_action, render_cali, show_grid);
-			else
-                (*it)->render(view_matrix, projection_matrix, bottom, only_body, false, height_mode, -1, render_cali, show_grid);
-		}
+                (*it)->render(view_matrix, projection_matrix, bottom, only_body, false, height_mode, plate_hover_action, render_cali,
+                              show_grid, shadows);
+            else
+                (*it)->render(view_matrix, projection_matrix, bottom, only_body, false, height_mode, -1, render_cali, show_grid, shadows);
+        }
 		else {
 			if (plate_hover_index == current_index)
-				(*it)->render(view_matrix, projection_matrix, bottom, only_body, false, PartPlate::HEIGHT_LIMIT_NONE, plate_hover_action, render_cali, show_grid);
-			else
-                (*it)->render(view_matrix, projection_matrix, bottom, only_body, false, PartPlate::HEIGHT_LIMIT_NONE, -1, render_cali, show_grid);
-		}
+                (*it)->render(view_matrix, projection_matrix, bottom, only_body, false, PartPlate::HEIGHT_LIMIT_NONE, plate_hover_action,
+                              render_cali, show_grid, shadows);
+            else
+                (*it)->render(view_matrix, projection_matrix, bottom, only_body, false, PartPlate::HEIGHT_LIMIT_NONE, -1, render_cali,
+                              show_grid, shadows);
+        }
 	}
 }
 

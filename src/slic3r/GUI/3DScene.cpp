@@ -741,7 +741,8 @@ void GLVolume::simple_render(GLShaderProgram*        shader,
         // Select LOD model based on current LOD level
         static int lodRenderLogCounter = 0;
         lodRenderLogCounter++;
-        if (!picking) {
+        // Shadow receivers must match the depth mesh; camera-dependent LOD would cause false self-occlusion.
+        if (!picking && (shader == nullptr || shader->get_name() != "gouraud_pcss")) {
             // DEBUG: color-code LOD levels for visual verification
             // GREEN = HIGH (original), BLUE = MIDDLE, RED = SMALL
             if (m_curLodLevel == LODLevel::Small && m_modelSmall && !m_modelSmall->is_render_disabled() && m_modelSmall->is_initialized()) {

@@ -1558,6 +1558,10 @@ GLCanvas3D::GLCanvas3D(wxGLCanvas* canvas, Bed3D &bed)
 
 GLCanvas3D::~GLCanvas3D()
 {
+    if (m_canvas != nullptr && _set_current())
+        m_pcss_shadows.shutdown_gl();
+    else
+        m_pcss_shadows.abandon_lost_context();
     const bool hasSelectionHighlightResources =
         m_selectionHighlightResources.fullResolutionMaskFramebuffer != 0 ||
         m_selectionHighlightResources.fullResolutionMaskTexture != 0 ||
@@ -2351,6 +2355,8 @@ unsigned int GLCanvas3D::get_volumes_count() const
 
 void GLCanvas3D::reset_volumes(ResetVolumesMode mode)
 {
+    ++m_pcss_scene_revision;
+    m_pcss_shadows.invalidate();
     if (!m_initialized)
         return;
 
@@ -3000,6 +3006,10 @@ void GLCanvas3D::render(bool only_init)
     else if (gizmo_type == GLGizmosManager::BrimEars && !camera.is_looking_downward())
         show_grid = false;
 
+    if (m_canvas_type == ECanvasType::CanvasPreview && m_render_preview)
+        _apply_gcode_slider_changes();
+    _prepare_pcss_shadow_map();
+
     /* view3D render*/
     int hover_id = (m_hover_plate_idxs.size() > 0)?m_hover_plate_idxs.front():-1;
     if (m_canvas_type == ECanvasType::CanvasView3D) {
@@ -3432,6 +3442,9 @@ void GLCanvas3D::mirror_selection(Axis axis)
 // 5) Out of bed collision status & message overlay (texture)
 void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_refresh)
 {
+    // Source geometry can change without changing the number of vertices or its ModelVolume ID.
+    ++m_pcss_scene_revision;
+    m_pcss_shadows.invalidate();
     if (m_canvas == nullptr || m_config == nullptr || m_model == nullptr)
         return;
 
@@ -8518,7 +8531,133 @@ void GLCanvas3D::_render_bed(const Transform3d& view_matrix, const Transform3d& 
 
 void GLCanvas3D::_render_platelist(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool only_current, bool only_body, int hover_id, bool render_cali, bool show_grid)
 {
-    wxGetApp().plater()->get_partplate_list().render(view_matrix, projection_matrix, bottom, only_current, only_body, hover_id, render_cali, show_grid);
+    wxGetApp().plater()->get_partplate_list().render(view_matrix, projection_matrix, bottom, only_current, only_body, hover_id, render_cali,
+                                                     show_grid, m_pcss_frame_active ? &m_pcss_shadows : nullptr);
+}
+
+void GLCanvas3D::set_context(wxGLContext* context)
+{
+    if (m_context == context)
+        return;
+    if (m_context != nullptr && _set_current())
+        m_pcss_shadows.shutdown_gl();
+    else
+        m_pcss_shadows.abandon_lost_context();
+    m_context             = context;
+    m_pcss_frame_active   = false;
+    m_pcss_error_reported = false;
+}
+
+void GLCanvas3D::_prepare_pcss_shadow_map()
+{
+    m_pcss_frame_active = false;
+    if (!wxGetApp().app_config->get_bool("enable_shadow_map")) {
+        m_pcss_shadows.shutdown_gl();
+        m_pcss_error_reported = false;
+        return;
+    }
+    const auto gizmo            = m_gizmos.get_current_type();
+    const bool supported_editor = m_canvas_type == ECanvasType::CanvasView3D && !m_layers_editing.is_enabled() &&
+                                  (gizmo == GLGizmosManager::Undefined || gizmo == GLGizmosManager::Move ||
+                                   gizmo == GLGizmosManager::Rotate || gizmo == GLGizmosManager::Scale ||
+                                   gizmo == GLGizmosManager::Flatten);
+    const bool supported_preview = m_canvas_type == ECanvasType::CanvasPreview && m_render_preview;
+    if (!supported_editor && !supported_preview) {
+        m_pcss_shadows.invalidate();
+        return;
+    }
+    GLShaderProgram* depth_shader = wxGetApp().get_shader("pcss_depth");
+    if (depth_shader == nullptr || wxGetApp().get_shader("pcss_plate") == nullptr) {
+        m_pcss_shadows.invalidate();
+        return;
+    }
+
+    PCSSFrameInput  input;
+    pcss::Signature signature;
+    signature.add(m_pcss_scene_revision);
+    auto merge_box = [](pcss::Bounds& target, const BoundingBoxf3& box) {
+        if (box.defined) {
+            target.merge({box.min.x(), box.min.y(), box.min.z()});
+            target.merge({box.max.x(), box.max.y(), box.max.z()});
+        }
+    };
+    if (supported_preview) {
+        if (!m_gcode_viewer.has_shadow_geometry()) {
+            m_pcss_shadows.invalidate();
+            return;
+        }
+        merge_box(input.casters, m_gcode_viewer.get_paths_bounding_box());
+        input.receivers = input.casters;
+        if (PartPlate* plate = wxGetApp().plater()->get_partplate_list().get_curr_plate())
+            merge_box(input.receivers, plate->get_bounding_box());
+        // Existing G-code lighting uploads an identity normal matrix for world-space path vertices.
+        // Preserve that convention rather than silently rotating an unrelated camera-space light.
+        input.to_light      = {-0.4574957, 0.4574957, 0.7624929};
+        input.revision      = m_gcode_viewer.shadow_revision();
+        m_pcss_frame_active = m_pcss_shadows.update(input, depth_shader->get_id(),
+                                                    [&]() { m_gcode_viewer.render_shadow_depth(*depth_shader); });
+        if (!m_pcss_frame_active && !m_pcss_shadows.error().empty() && !m_pcss_error_reported) {
+            BOOST_LOG_TRIVIAL(warning) << m_pcss_shadows.error();
+            m_pcss_error_reported = true;
+        }
+        return;
+    }
+    std::vector<GLVolume*> casters;
+    for (GLVolume* volume : m_volumes.volumes) {
+        if (volume == nullptr || !volume->is_active || !volume->visible || volume->is_modifier || volume->is_wipe_tower ||
+            volume->is_extrusion_path || volume->volume_idx() < 0 || volume->force_transparent || volume->color.is_transparent() ||
+            !volume->model.is_initialized())
+            continue;
+        casters.push_back(volume);
+        const Transform3d world = volume->world_matrix();
+        merge_box(input.casters, volume->bounding_box().transformed(world));
+        signature.add(volume->geometry_id.first);
+        signature.add(volume->geometry_id.second);
+        signature.add(volume->model.vertices_count());
+        signature.add(volume->model.indices_count());
+        signature.add(volume->tverts_range.first);
+        signature.add(volume->tverts_range.second);
+        for (int i = 0; i < 16; ++i)
+            signature.add_real(world.matrix().data()[i]);
+    }
+    signature.add(casters.size());
+    input.receivers = input.casters;
+    merge_box(input.receivers, wxGetApp().plater()->get_partplate_list().get_bounding_box());
+
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    // Gouraud's main diffuse light is defined in eye space. Translation must not affect its direction.
+    const Matrix3d rotation             = camera.get_view_matrix().matrix().block<3, 3>(0, 0);
+    const Vec3d    to_light             = rotation.transpose() * Vec3d(-0.4574957, 0.4574957, 0.7624929);
+    input.to_light                      = {to_light.x(), to_light.y(), to_light.z()};
+    std::array<double, 4> clip          = m_gizmos.get_clipping_plane().get_data();
+    GLGizmoBase*          current_gizmo = m_gizmos.get_current();
+    if (current_gizmo != nullptr && !current_gizmo->apply_clipping_plane())
+        clip = ClippingPlane::ClipsNothing().get_data();
+    const std::array<float, 2> z_range = m_use_clipping_planes ?
+                                             std::array<float, 2>{static_cast<float>(-m_clipping_planes[0].get_data()[3]),
+                                                                  static_cast<float>(m_clipping_planes[1].get_data()[3])} :
+                                             std::array<float, 2>{-FLT_MAX, FLT_MAX};
+    for (double value : clip)
+        signature.add_real(value);
+    for (float value : z_range)
+        signature.add_real(value);
+    input.revision      = signature.value();
+    m_pcss_frame_active = m_pcss_shadows.update(input, depth_shader->get_id(), [&]() {
+        depth_shader->set_uniform("clipping_plane", clip);
+        depth_shader->set_uniform("z_range", z_range);
+        for (GLVolume* volume : casters) {
+            depth_shader->set_uniform("volume_world_matrix", volume->world_matrix());
+            const size_t count = volume->model.indices_count();
+            const size_t first = std::min(count, volume->tverts_range.first);
+            const size_t last  = std::min(count, volume->tverts_range.second);
+            if (first < last)
+                volume->model.render({first, last});
+        }
+    });
+    if (!m_pcss_frame_active && !m_pcss_shadows.error().empty() && !m_pcss_error_reported) {
+        BOOST_LOG_TRIVIAL(warning) << m_pcss_shadows.error();
+        m_pcss_error_reported = true;
+    }
 }
 
 void GLCanvas3D::_render_plane() const
@@ -8591,11 +8730,17 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
     else
         m_volumes.set_show_sinking_contours(!m_gizmos.is_hiding_instances());
 
-    GLShaderProgram* shader = wxGetApp().get_shader("gouraud");
+    const bool receive_shadows = m_pcss_frame_active && m_canvas_type == ECanvasType::CanvasView3D &&
+                                 type == GLVolumeCollection::ERenderType::Opaque;
+    GLShaderProgram* shader         = receive_shadows ? wxGetApp().get_shader("gouraud_pcss") : nullptr;
+    const bool       shadow_variant = shader != nullptr;
+    if (shader == nullptr)
+        shader = wxGetApp().get_shader("gouraud");
     ECanvasType canvas_type = this->m_canvas_type;
     bool                 partly_inside_enable = canvas_type == ECanvasType::CanvasAssembleView ? false : true;
     if (shader != nullptr) {
         shader->start_using();
+        PCSSReceiverScope shadow_scope(shadow_variant ? &m_pcss_shadows : nullptr, shader->get_id());
 
         switch (type)
         {
@@ -8691,14 +8836,22 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
 //BBS: GUI refactor: add canvas size as parameters
 void GLCanvas3D::_render_gcode(int canvas_width, int canvas_height)
 {
-    m_gcode_viewer.render(canvas_width, canvas_height, SLIDER_RIGHT_MARGIN * GCODE_VIEWER_SLIDER_SCALE);
+    m_gcode_viewer.render(canvas_width, canvas_height, SLIDER_RIGHT_MARGIN * GCODE_VIEWER_SLIDER_SCALE,
+                          m_pcss_frame_active ? &m_pcss_shadows : nullptr);
+    _apply_gcode_slider_changes();
+}
+
+void GLCanvas3D::_apply_gcode_slider_changes()
+{
     IMSlider *layers_slider = m_gcode_viewer.get_layers_slider();
     IMSlider *moves_slider  = m_gcode_viewer.get_moves_slider();
+    if (layers_slider == nullptr || moves_slider == nullptr)
+        return;
 
     if (layers_slider->is_need_post_tick_event()) {
-        auto evt = new wxCommandEvent(EVT_CUSTOMEVT_TICKSCHANGED, m_canvas->GetId());
-        evt->SetInt((int)layers_slider->get_post_tick_event_type());
-        wxPostEvent(m_canvas, *evt);
+        wxCommandEvent evt(EVT_CUSTOMEVT_TICKSCHANGED, m_canvas->GetId());
+        evt.SetInt((int) layers_slider->get_post_tick_event_type());
+        wxPostEvent(m_canvas, evt);
         layers_slider->reset_post_tick_event();
     }
 
@@ -8709,14 +8862,22 @@ void GLCanvas3D::_render_gcode(int canvas_width, int canvas_height)
         }
         layers_slider->set_as_dirty(false);
         post_event(SimpleEvent(EVT_GLCANVAS_UPDATE));
-        m_gcode_viewer.update_marker_curr_move();
+        request_extra_frame();
+        if (m_gcode_viewer.has_data())
+            m_gcode_viewer.update_marker_curr_move();
     }
 
     if (moves_slider->is_dirty()) {
         moves_slider->set_as_dirty(false);
-        m_gcode_viewer.update_sequential_view_current((moves_slider->GetLowerValueD() - 1.0), static_cast<unsigned int>(moves_slider->GetHigherValueD() - 1.0));
+        if (m_gcode_viewer.has_data()) {
+            const auto first = static_cast<unsigned int>(std::max(0.0, moves_slider->GetLowerValueD() - 1.0));
+            const auto last  = static_cast<unsigned int>(std::max(0.0, moves_slider->GetHigherValueD() - 1.0));
+            m_gcode_viewer.update_sequential_view_current(first, last);
+        }
         post_event(SimpleEvent(EVT_GLCANVAS_UPDATE));
-        m_gcode_viewer.update_marker_curr_move();
+        request_extra_frame();
+        if (m_gcode_viewer.has_data())
+            m_gcode_viewer.update_marker_curr_move();
     }
 }
 
