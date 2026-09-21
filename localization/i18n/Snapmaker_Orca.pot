@@ -16283,3 +16283,11 @@ msgstr ""
 
 msgid "Incompatible filament types cannot be mixed. Please correct the selection."
 msgstr ""
+
+#: src/slic3r/GUI/Preferences.cpp
+msgid "Enable soft shadows (PCSS)"
+msgstr ""
+
+#: src/slic3r/GUI/Preferences.cpp
+msgid "Show dynamic shadows in the editor and G-code preview. Requires OpenGL 3.1 or newer."
+msgstr ""

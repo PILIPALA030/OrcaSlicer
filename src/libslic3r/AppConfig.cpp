@@ -182,6 +182,10 @@ void AppConfig::set_defaults()
 #endif // _WIN32
     }
 
+    // Display-only setting: never enters the slicing configuration.
+    if (get("enable_shadow_map").empty())
+        set_bool("enable_shadow_map", false);
+
     if (get("use_perspective_camera").empty())
         set_bool("use_perspective_camera", true);
 
