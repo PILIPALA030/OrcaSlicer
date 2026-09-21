@@ -25,6 +25,7 @@ namespace GUI {
 
 class PartPlateList;
 class OpenGLManager;
+class PCSSShadowRenderer;
 
 static const float GCODE_VIEWER_SLIDER_SCALE = 0.6f;
 static const float SLIDER_DEFAULT_RIGHT_MARGIN  = 10.0f;
@@ -738,6 +739,7 @@ private:
     //BBS: add only gcode mode
     bool m_only_gcode_in_preview {false};
     bool m_loading{ false };
+    mutable std::uint64_t m_shadow_revision{1};
     std::vector<size_t> m_ssid_to_moveid_map;
 
     std::vector<TBuffer> m_buffers{ static_cast<size_t>(EMoveType::Extrude) };
@@ -821,7 +823,11 @@ public:
     //BBS: add all plates filament statistics
     void render_all_plates_stats(const std::vector<const GCodeProcessorResult*>& gcode_result_list, bool show = true) const;
     //BBS: GUI refactor: add canvas width and height
-    void render(int canvas_width, int canvas_height, int right_margin);
+    void render(int canvas_width, int canvas_height, int right_margin, const PCSSShadowRenderer* shadows = nullptr);
+    // Only visible extrusion triangles and their sequential caps; no shells, travel lines or UI markers.
+    bool          has_shadow_geometry() const;
+    void          render_shadow_depth(GLShaderProgram& shader) const;
+    std::uint64_t shadow_revision() const { return m_shadow_revision; }
     //BBS
     void _render_calibration_thumbnail_internal(ThumbnailData& thumbnail_data, const ThumbnailsParams& thumbnail_params, PartPlateList& partplate_list, OpenGLManager& opengl_manager);
     void _render_calibration_thumbnail_framebuffer(ThumbnailData& thumbnail_data, unsigned int w, unsigned int h, const ThumbnailsParams& thumbnail_params, PartPlateList& partplate_list, OpenGLManager& opengl_manager);
@@ -898,7 +904,7 @@ private:
     //BBS: always load shell at preview
     //void load_shells(const Print& print);
     void refresh_render_paths(bool keep_sequential_current_first, bool keep_sequential_current_last) const;
-    void render_toolpaths();
+    void render_toolpaths(const PCSSShadowRenderer* shadows = nullptr);
     void render_shells();
 
     //BBS: GUI refactor: add canvas size

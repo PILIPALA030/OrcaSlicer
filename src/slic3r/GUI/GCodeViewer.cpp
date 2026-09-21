@@ -1,5 +1,6 @@
 #include "libslic3r/libslic3r.h"
 #include "GCodeViewer.hpp"
+#include "PCSSShadowRenderer.hpp"
 
 #include "libslic3r/BuildVolume.hpp"
 #include "libslic3r/ClipperUtils.hpp"
@@ -1325,6 +1326,7 @@ void GCodeViewer::reset()
 {
     if (m_loading)
         return;
+    ++m_shadow_revision;
     //BBS: should also reset the result id
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": current result id %1% ")%m_last_result_id;
     m_last_result_id = -1;
@@ -1363,7 +1365,7 @@ void GCodeViewer::reset()
 }
 
 //BBS: GUI refactor: add canvas width and height
-void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
+void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin, const PCSSShadowRenderer* shadows)
 {
 #if ENABLE_GCODE_VIEWER_STATISTICS
     m_statistics.reset_opengl();
@@ -1376,7 +1378,7 @@ void GCodeViewer::render(int canvas_width, int canvas_height, int right_margin)
     if (m_roles.empty())
         return;
 
-    render_toolpaths();
+    render_toolpaths(shadows);
     float legend_height = 0.0f;
     render_legend(legend_height, canvas_width, canvas_height, right_margin);
 
@@ -1928,6 +1930,8 @@ bool GCodeViewer::is_toolpath_move_type_visible(EMoveType type) const
 
 void GCodeViewer::set_toolpath_move_type_visible(EMoveType type, bool visible)
 {
+    if (is_toolpath_move_type_visible(type) != visible)
+        ++m_shadow_revision;
     size_t id = static_cast<size_t>(buffer_id(type));
     if (id < m_buffers.size())
         m_buffers[id].visible = visible;
@@ -3271,6 +3275,8 @@ void GCodeViewer::load_shells(const Print& print, bool initialized, bool force_p
 
 void GCodeViewer::refresh_render_paths(bool keep_sequential_current_first, bool keep_sequential_current_last) const
 {
+    // This is the shared range rebuild for layer limits, sequential progress, tool/role filters and reloads.
+    ++m_shadow_revision;
 #if ENABLE_GCODE_VIEWER_STATISTICS
     auto start_time = std::chrono::high_resolution_clock::now();
 #endif // ENABLE_GCODE_VIEWER_STATISTICS
@@ -3824,7 +3830,63 @@ m_no_render_path = false;
 #endif // ENABLE_GCODE_VIEWER_STATISTICS
 }
 
-void GCodeViewer::render_toolpaths()
+bool GCodeViewer::has_shadow_geometry() const
+{
+    const size_t id = buffer_id(EMoveType::Extrude);
+    if (m_loading || !has_data() || id >= m_buffers.size())
+        return false;
+    const TBuffer& buffer = m_buffers[id];
+    return buffer.visible && buffer.has_data() && !buffer.render_paths.empty() &&
+           buffer.render_primitive_type == TBuffer::ERenderPrimitiveType::Triangle;
+}
+
+void GCodeViewer::render_shadow_depth(GLShaderProgram& shader) const
+{
+    if (!has_shadow_geometry())
+        return;
+    const TBuffer& buffer   = m_buffers[buffer_id(EMoveType::Extrude)];
+    const int      position = shader.get_attrib_location("v_position");
+    if (position < 0)
+        return;
+    // The depth pass already owns a private VAO and restores the caller's state.
+    shader.set_uniform("volume_world_matrix", Matrix4f(Matrix4f::Identity()));
+    shader.set_uniform("clipping_plane", std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f});
+    shader.set_uniform("z_range", std::array<float, 2>{-FLT_MAX, FLT_MAX});
+    glsafe(::glEnableVertexAttribArray(position));
+    unsigned previous_vbo  = 0;
+    auto     bind_vertices = [&](unsigned vbo) {
+        if (vbo == previous_vbo)
+            return;
+        glsafe(::glBindBuffer(GL_ARRAY_BUFFER, vbo));
+        glsafe(::glVertexAttribPointer(position, buffer.vertices.position_size_floats(), GL_FLOAT, GL_FALSE,
+                                           buffer.vertices.vertex_size_bytes(), (const void*) buffer.vertices.position_offset_bytes()));
+        previous_vbo = vbo;
+    };
+    for (const RenderPath& path : buffer.render_paths) {
+        if (path.ibuffer_id >= buffer.indices.size() || path.sizes.empty() || path.sizes.size() != path.offsets.size())
+            continue;
+        const IBuffer& indices = buffer.indices[path.ibuffer_id];
+        if (indices.vbo == 0 || indices.ibo == 0)
+            continue;
+        bind_vertices(indices.vbo);
+        glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indices.ibo));
+        // Identical selected ranges and index type to render_as_triangles; offsets are byte offsets, not vertex IDs.
+        glsafe(::glMultiDrawElements(GL_TRIANGLES, (const GLsizei*) path.sizes.data(), GL_UNSIGNED_SHORT,
+                                     (const void* const*) path.offsets.data(), (GLsizei) path.sizes.size()));
+    }
+    for (const SequentialRangeCap& cap : m_sequential_range_caps) {
+        if (cap.buffer != &buffer || !cap.is_renderable() || cap.vbo == 0 || cap.ibo == 0)
+            continue;
+        bind_vertices(cap.vbo);
+        glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, cap.ibo));
+        glsafe(::glDrawElements(GL_TRIANGLES, (GLsizei) cap.indices_count(), GL_UNSIGNED_SHORT, nullptr));
+    }
+    glsafe(::glDisableVertexAttribArray(position));
+    glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
+    glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
+}
+
+void GCodeViewer::render_toolpaths(const PCSSShadowRenderer* shadows)
 {
     const Camera& camera = wxGetApp().plater()->get_camera();
     const double zoom = camera.get_zoom();
@@ -3963,11 +4025,17 @@ void GCodeViewer::render_toolpaths()
         if (!buffer.visible || !buffer.has_data())
             continue;
 
-        GLShaderProgram* shader = wxGetApp().get_shader(buffer.shader.c_str());
+        const bool receive_shadows = shadows != nullptr && shadows->is_ready() && i == buffer_id(EMoveType::Extrude) &&
+                                     m_view_type != EViewType::FilamentId && buffer.shader == "gouraud_light";
+        GLShaderProgram* shader         = receive_shadows ? wxGetApp().get_shader("gouraud_light_pcss") : nullptr;
+        const bool       shadow_variant = shader != nullptr;
+        if (shader == nullptr)
+            shader = wxGetApp().get_shader(buffer.shader.c_str());
         if (shader == nullptr)
             continue;
 
         shader->start_using();
+        PCSSReceiverScope shadow_scope(shadow_variant ? shadows : nullptr, shader->get_id());
 
         shader->set_uniform("view_model_matrix", camera.get_view_matrix());
         shader->set_uniform("projection_matrix", camera.get_projection_matrix());
@@ -4042,18 +4110,19 @@ void GCodeViewer::render_toolpaths()
         shader->stop_using();
     }
 
-#if ENABLE_GCODE_VIEWER_STATISTICS
-    auto render_sequential_range_cap = [this, &camera]
-#else
-    auto render_sequential_range_cap = [&camera]
-#endif // ENABLE_GCODE_VIEWER_STATISTICS
-    (const SequentialRangeCap& cap) {
+    auto render_sequential_range_cap = [this, &camera, shadows](const SequentialRangeCap& cap) {
         const TBuffer* buffer = cap.buffer;
-        GLShaderProgram* shader = wxGetApp().get_shader(buffer->shader.c_str());
+        const bool     receive_shadows = shadows != nullptr && shadows->is_ready() && buffer == &m_buffers[buffer_id(EMoveType::Extrude)] &&
+                                     m_view_type != EViewType::FilamentId && buffer->shader == "gouraud_light";
+        GLShaderProgram* shader         = receive_shadows ? wxGetApp().get_shader("gouraud_light_pcss") : nullptr;
+        const bool       shadow_variant = shader != nullptr;
+        if (shader == nullptr)
+            shader = wxGetApp().get_shader(buffer->shader.c_str());
         if (shader == nullptr)
             return;
 
         shader->start_using();
+        PCSSReceiverScope shadow_scope(shadow_variant ? shadows : nullptr, shader->get_id());
 
         shader->set_uniform("view_model_matrix", camera.get_view_matrix());
         shader->set_uniform("projection_matrix", camera.get_projection_matrix());
@@ -4082,7 +4151,7 @@ void GCodeViewer::render_toolpaths()
         glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
 
 #if ENABLE_GCODE_VIEWER_STATISTICS
-            ++m_statistics.gl_triangles_calls_count;
+        ++m_statistics.gl_triangles_calls_count;
 #endif // ENABLE_GCODE_VIEWER_STATISTICS
 
         if (normal_id != -1)
