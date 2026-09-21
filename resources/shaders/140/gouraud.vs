@@ -43,6 +43,9 @@ in vec3 v_normal;
 
 // x = diffuse, y = specular;
 out vec2 intensity;
+#ifdef ENABLE_PCSS
+out float pcss_main_diffuse;
+#endif
 
 out vec3 clipping_planes_dots;
 out float color_clip_plane_dot;
@@ -61,6 +64,9 @@ void main()
 	float NdotL = max(dot(eye_normal, LIGHT_TOP_DIR), 0.0);
 
 	intensity.x = INTENSITY_AMBIENT + NdotL * LIGHT_TOP_DIFFUSE;
+#ifdef ENABLE_PCSS
+    pcss_main_diffuse = NdotL * LIGHT_TOP_DIFFUSE;
+#endif
     vec4 position = view_model_matrix * vec4(v_position, 1.0);
     intensity.y = LIGHT_TOP_SPECULAR * pow(max(dot(-normalize(position.xyz), reflect(-LIGHT_TOP_DIR, eye_normal)), 0.0), LIGHT_TOP_SHININESS);
 

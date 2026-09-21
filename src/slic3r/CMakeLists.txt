@@ -14,6 +14,9 @@ set(SLIC3R_GUI_SOURCES
     GUI/3DBed.hpp
     GUI/3DScene.cpp
     GUI/3DScene.hpp
+    GUI/PCSSShadowMath.hpp
+    GUI/PCSSShadowRenderer.hpp
+    GUI/PCSSShadowRenderer.cpp
     GUI/AboutDialog.cpp
     GUI/AboutDialog.hpp
     GUI/AmsMappingPopup.cpp

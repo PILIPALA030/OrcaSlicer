@@ -23,6 +23,10 @@ in vec3 v_normal;
 
 // x = tainted, y = specular;
 out vec2 intensity;
+#ifdef ENABLE_PCSS
+out float pcss_main_diffuse;
+out vec3 pcss_world_position;
+#endif
 
 void main()
 {
@@ -34,6 +38,9 @@ void main()
     float NdotL = max(dot(normal, LIGHT_TOP_DIR), 0.0);
 
     intensity.x = INTENSITY_AMBIENT + NdotL * LIGHT_TOP_DIFFUSE;
+#ifdef ENABLE_PCSS
+    pcss_main_diffuse = NdotL * LIGHT_TOP_DIFFUSE;
+#endif
     vec4 position = view_model_matrix * vec4(v_position, 1.0);
     intensity.y = LIGHT_TOP_SPECULAR * pow(max(dot(-normalize(position.xyz), reflect(-LIGHT_TOP_DIR, normal)), 0.0), LIGHT_TOP_SHININESS);
 
@@ -41,5 +48,9 @@ void main()
     NdotL = max(dot(normal, LIGHT_FRONT_DIR), 0.0);
     intensity.x += NdotL * LIGHT_FRONT_DIFFUSE;
 
+#ifdef ENABLE_PCSS
+    // This variant is used only by GCodeViewer extrusion buffers, whose vertices are world-space.
+    pcss_world_position = v_position;
+#endif
     gl_Position = projection_matrix * position;
 }

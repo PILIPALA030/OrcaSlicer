@@ -46,6 +46,9 @@ in float color_clip_plane_dot;
 
 // x = diffuse, y = specular;
 in vec2 intensity;
+#ifdef ENABLE_PCSS
+in float pcss_main_diffuse;
+#endif
 
 in vec4 world_pos;
 in float world_normal_z;
@@ -55,6 +58,13 @@ out vec4 out_color;
 
 void main()
 {
+    vec2 shaded_intensity = intensity;
+#ifdef ENABLE_PCSS
+    // Evaluate derivatives before clipping discards; only shadow this light's direct contribution.
+    float visibility = pcss_visibility(world_pos.xyz);
+    shaded_intensity.x -= pcss_main_diffuse * (1.0 - visibility);
+    shaded_intensity.y *= visibility;
+#endif
     if (any(lessThan(clipping_planes_dots, ZERO)))
         discard;
 
@@ -96,8 +106,8 @@ void main()
 
 #ifdef ENABLE_ENVIRONMENT_MAP
     if (use_environment_tex)
-        out_color = vec4(0.45 * texture(environment_tex, normalize(eye_normal).xy * 0.5 + 0.5).xyz + 0.8 * color.rgb * intensity.x, color.a);
+        out_color = vec4(0.45 * texture(environment_tex, normalize(eye_normal).xy * 0.5 + 0.5).xyz + 0.8 * color.rgb * shaded_intensity.x, color.a);
     else
 #endif
-        out_color = vec4(vec3(intensity.y) + color.rgb * intensity.x, color.a);
+        out_color = vec4(vec3(shaded_intensity.y) + color.rgb * shaded_intensity.x, color.a);
 }

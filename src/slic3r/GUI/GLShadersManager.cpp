@@ -3,6 +3,10 @@
 #include "GLShadersManager.hpp"
 #include "3DScene.hpp"
 #include "GUI_App.hpp"
+#include "libslic3r/Utils.hpp"
+
+#include <boost/nowide/fstream.hpp>
+#include <iterator>
 
 #include <cassert>
 #include <algorithm>
@@ -96,6 +100,51 @@ std::pair<bool, std::string> GLShadersManager::init()
         valid &= append_shader("mm_gouraud", { prefix + "mm_gouraud.vs", prefix + "mm_gouraud.fs" }, { "FLIP_TRIANGLE_NORMALS"sv });
     else
         valid &= append_shader("mm_gouraud", { prefix + "mm_gouraud.vs", prefix + "mm_gouraud.fs" });
+
+    // Keep PCSS optional: a missing shader or old GPU must not break the ordinary GUI pipeline.
+    if (prefix == "140/") {
+        const size_t error_length = error.size();
+        if (!append_shader("pcss_depth", {"140/pcss_depth.vs", "140/pcss_depth.fs"}))
+            BOOST_LOG_TRIVIAL(warning) << "PCSS depth shader unavailable";
+        error.resize(error_length);
+
+        auto read_source = [](const std::string& filename) -> std::string {
+            boost::nowide::ifstream stream(resources_dir() + "/shaders/140/" + filename, std::ios::binary);
+            if (!stream)
+                return {};
+            return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+        };
+        const std::string common = read_source("pcss.glsl");
+        auto append_pcss = [this, &read_source, &common](const std::string& name, const std::string& vertex, const std::string& fragment) {
+            GLShaderProgram::ShaderSources sources{};
+            sources[0] = read_source(vertex);
+            sources[1] = read_source(fragment);
+            if (common.empty() || sources[0].empty() || sources[1].empty()) {
+                BOOST_LOG_TRIVIAL(warning) << "PCSS shader source missing: " << name;
+                return;
+            }
+            for (size_t stage = 0; stage < 2; ++stage) {
+                const size_t version_end = sources[stage].find('\n');
+                if (sources[stage].compare(0, 8, "#version") != 0 || version_end == std::string::npos)
+                    return;
+                std::string prefix = "#define ENABLE_PCSS\n";
+#if ENABLE_ENVIRONMENT_MAP
+                prefix += "#define ENABLE_ENVIRONMENT_MAP\n";
+#endif
+                if (stage == 1)
+                    prefix += common + "\n";
+                sources[stage].insert(version_end + 1, prefix);
+            }
+            auto shader = std::make_unique<GLShaderProgram>();
+            if (shader->init_from_texts(name, sources))
+                m_shaders.push_back(std::move(shader));
+            else
+                BOOST_LOG_TRIVIAL(warning) << "PCSS receiver shader unavailable: " << name;
+        };
+        append_pcss("pcss_plate", "pcss_plate.vs", "pcss_plate.fs");
+        append_pcss("gouraud_pcss", "gouraud.vs", "gouraud.fs");
+        append_pcss("gouraud_light_pcss", "gouraud_light.vs", "gouraud_light.fs");
+    }
 
     return { valid, error };
 }
