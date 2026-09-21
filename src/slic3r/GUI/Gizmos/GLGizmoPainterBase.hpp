@@ -292,11 +292,10 @@ private:
 
     using Rgba8 = std::array<uint8_t, 4>;
 
-    bool update_render_data();
+    void update_render_data();
     void render(int buffer_idx, bool show_wireframe=false);
     void BuildRenderChunkLayout();
-    /** Returns false when a chunk plan was rejected; success state must not advance. */
-    bool UpdateRenderChunks(bool showWireframe);
+    void UpdateRenderChunks(bool showWireframe);
     /** Counts current valid leaves under a triangle without building geometry. */
     size_t CountLeafTriangles(int triangleIndex) const;
     /** Estimates exact staging sizes for one chunk rebuild from the current tree. */
@@ -339,8 +338,8 @@ private:
     std::vector<uint8_t> m_chunkInDirtyList;
     std::vector<uint32_t> m_dirtyChunks;
     bool m_renderChunksInitialized = false;
-    /** True after a rejected rebuild: pauses per-frame retry until the next mutation. */
-    bool m_chunkRebuildBlocked = false;
+    //Permanently disables RenderChunk rendering after a rebuild exceeds hard renderer limits
+    bool m_renderChunksUnsupported = false;
     bool m_useRenderChunks = false;
     bool m_allColorDirty = false;
     std::optional<bool> _renderChunkWireframeLayout;
