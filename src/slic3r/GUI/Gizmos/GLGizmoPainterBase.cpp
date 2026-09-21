@@ -1833,7 +1833,7 @@ TriangleSelectorPatch::ChunkBuildResult TriangleSelectorPatch::BuildChunkCpu(con
     return result;
 }
 
-void TriangleSelectorPatch::RebuildRenderChunks(const std::vector<uint32_t>& chunkIds, bool showWireframe,
+bool TriangleSelectorPatch::RebuildRenderChunks(const std::vector<uint32_t>& chunkIds, bool showWireframe,
                                                 const ChunkBatchLimits& limits)
 {
     std::vector<ChunkBuildPlan> plans;
@@ -1841,10 +1841,10 @@ void TriangleSelectorPatch::RebuildRenderChunks(const std::vector<uint32_t>& chu
     for (uint32_t chunkId : chunkIds) {
         ChunkBuildPlan plan = MakeChunkBuildPlan(chunkId, showWireframe);
         if (!plan.supported) {
-            // Clear rejection: keep the existing chunk geometry instead of truncating.
+            // All-or-nothing: reject before any build/upload commits partial results.
             BOOST_LOG_TRIVIAL(warning) << "TriangleSelectorPatch: chunk " << chunkId
                 << " exceeds supported vertex count, skipping rebuild";
-            continue;
+            return false;
         }
         plans.push_back(std::move(plan));
     }
@@ -1879,6 +1879,7 @@ void TriangleSelectorPatch::RebuildRenderChunks(const std::vector<uint32_t>& chu
         // Batch results leave scope here, releasing this batch's geometry staging only.
         batchBegin = batchEnd;
     }
+    return true;
 }
 
 void TriangleSelectorPatch::RefreshRenderColorLut()
@@ -1901,20 +1902,23 @@ TriangleSelectorPatch::Rgba8 TriangleSelectorPatch::RenderColorForState8(Enforce
 
 void TriangleSelectorPatch::render(ImGuiWrapper* imgui, const Transform3d& matrix)
 {
-    const bool showWireframe = m_need_wireframe && wxGetApp().plater()->is_wireframe_enabled() &&
-                               wxGetApp().plater()->is_show_wireframe();
+    bool showWireframe = m_need_wireframe && wxGetApp().plater()->is_wireframe_enabled() &&
+                         wxGetApp().plater()->is_show_wireframe();
     const bool useLegacyRenderer = m_filter_state || !m_useRenderChunks;
     if (useLegacyRenderer &&
         (!_legacyWireframeLayout.has_value() || *_legacyWireframeLayout != showWireframe)) {
         m_update_render_data = true;
         m_paint_changed = true;
-    } else if (!useLegacyRenderer &&
+    } else if (!useLegacyRenderer && !m_chunkRebuildBlocked &&
                (!_renderChunkWireframeLayout.has_value() || *_renderChunkWireframeLayout != showWireframe)) {
         m_update_render_data = true;
     }
     if (m_update_render_data) {
-        update_render_data();
+        const bool updateComplete = update_render_data();
         m_update_render_data = false;
+        if (!updateComplete && _renderChunkWireframeLayout.has_value())
+            // Old buffers keep their own vertex layout; draw with it.
+            showWireframe = *_renderChunkWireframeLayout;
     }
 
     auto* shader = wxGetApp().get_current_shader();
@@ -2160,15 +2164,15 @@ void TriangleSelectorPatch::set_filter_state(bool is_filter_state)
     m_update_render_data = true;
 }
 
-void TriangleSelectorPatch::update_render_data()
+bool TriangleSelectorPatch::update_render_data()
 {
     const bool showWireframe = m_need_wireframe && wxGetApp().plater()->is_wireframe_enabled() &&
                                wxGetApp().plater()->is_show_wireframe();
     if (m_useRenderChunks && !m_filter_state) {
-        UpdateRenderChunks(showWireframe);
+        const bool chunksUpdated = UpdateRenderChunks(showWireframe);
         m_paint_changed = false;
         update_paint_contour();
-        return;
+        return chunksUpdated;
     }
 
     if (m_paint_changed || m_triangle_patches.empty()) {
@@ -2194,6 +2198,7 @@ void TriangleSelectorPatch::update_render_data()
 
     //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", before paint_contour");
     update_paint_contour();
+    return true;
 }
 
 void TriangleSelectorPatch::EnsureVboCapacity(unsigned int target, unsigned int& vboId, size_t& capacityBytes,
@@ -2426,7 +2431,7 @@ void TriangleSelectorPatch::ClearRenderDirtyState()
     m_allColorDirty = false;
 }
 
-void TriangleSelectorPatch::UpdateRenderChunks(bool showWireframe)
+bool TriangleSelectorPatch::UpdateRenderChunks(bool showWireframe)
 {
     const bool wireframeLayoutChanged = !_renderChunkWireframeLayout.has_value() ||
                                         *_renderChunkWireframeLayout != showWireframe;
@@ -2442,11 +2447,16 @@ void TriangleSelectorPatch::UpdateRenderChunks(bool showWireframe)
         chunkIds.reserve(m_renderChunks.size());
         for (uint32_t chunkId = 0; chunkId < m_renderChunks.size(); ++chunkId)
             chunkIds.push_back(chunkId);
-        RebuildRenderChunks(chunkIds, showWireframe, limits);
+        if (!RebuildRenderChunks(chunkIds, showWireframe, limits)) {
+            // Rejected plan: stay uninitialized, keep the dirty state pending.
+            m_chunkRebuildBlocked = true;
+            return false;
+        }
         m_renderChunksInitialized = true;
         _renderChunkWireframeLayout = showWireframe;
         ClearRenderDirtyState();
-        return;
+        m_chunkRebuildBlocked = false;
+        return true;
     }
 
     AggregateDirtyRoots();
@@ -2475,11 +2485,17 @@ void TriangleSelectorPatch::UpdateRenderChunks(bool showWireframe)
     }
 
     // Geometry rebuild first: color workers then read a stable m_rootDrawInfo.
-    RebuildRenderChunks(geometryChunkIds, showWireframe, limits);
+    if (!RebuildRenderChunks(geometryChunkIds, showWireframe, limits)) {
+        // Rejected plan: keep dirty pending, do not advance the recorded layout.
+        m_chunkRebuildBlocked = true;
+        return false;
+    }
     UpdateChunkColors(colorTasks, limits);
 
     _renderChunkWireframeLayout = showWireframe;
     ClearRenderDirtyState();
+    m_chunkRebuildBlocked = false;
+    return true;
 }
 
 void TriangleSelectorPatch::PrepareChunkColorsCpu(const ChunkColorTask& task)
