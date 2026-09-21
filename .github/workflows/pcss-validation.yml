@@ -1,0 +1,75 @@
+name: PCSS validation
+on:
+  push:
+    branches: [feature/pcss-editor-gcode-shadows]
+    paths:
+      - 'src/slic3r/GUI/**'
+      - 'src/libslic3r/AppConfig.cpp'
+      - 'resources/shaders/140/**'
+      - 'tests/pcss/**'
+      - '.github/workflows/pcss-validation.yml'
+  pull_request:
+    paths:
+      - 'src/slic3r/GUI/PCSS*'
+      - 'resources/shaders/140/pcss*'
+      - 'tests/pcss/**'
+      - '.github/workflows/pcss-validation.yml'
+permissions:
+  contents: read
+concurrency:
+  group: pcss-validation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  portable-contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: cmake -S tests/pcss -B build-pcss -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build-pcss --config Debug --parallel 2
+      - run: ctest --test-dir build-pcss -C Debug --output-on-failure -V
+  native-opengl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install native test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build libglew-dev libglfw3-dev libgl1-mesa-dev xvfb xauth
+      - name: Build the shipping renderer with warnings as errors
+        run: |
+          cmake -S tests/pcss -B build-pcss-gl -G Ninja -DPCSS_TEST_OPENGL=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS='-Wall -Wextra -Werror -pedantic'
+          cmake --build build-pcss-gl --parallel 2
+      - name: Test OpenGL 3.1 and 3.3 Core
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          mkdir -p pcss-results
+          set -o pipefail
+          MESA_GL_VERSION_OVERRIDE=3.1 MESA_GLSL_VERSION_OVERRIDE=140 xvfb-run -a ctest --test-dir build-pcss-gl --output-on-failure -V 2>&1 | tee pcss-results/opengl31.log
+          MESA_GL_VERSION_OVERRIDE=3.3 MESA_GLSL_VERSION_OVERRIDE=330 xvfb-run -a ./build-pcss-gl/pcss_gl_tests --core 2>&1 | tee pcss-results/opengl33-core.log
+      - name: Check address and undefined behavior sanitizers
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          set -o pipefail
+          cmake -S tests/pcss -B build-pcss-sanitized -G Ninja -DPCSS_TEST_OPENGL=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+          cmake --build build-pcss-sanitized --parallel 2
+          xvfb-run -a ctest --test-dir build-pcss-sanitized --output-on-failure -V 2>&1 | tee pcss-results/sanitized.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pcss-opengl-results
+          path: pcss-results
+          retention-days: 14
+          if-no-files-found: warn

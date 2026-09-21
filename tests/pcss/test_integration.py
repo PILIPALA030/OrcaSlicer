@@ -50,13 +50,13 @@ class IntegrationContracts(unittest.TestCase):
             self.assertIn(token, body)
 
     def test_display_preference_not_slicing_configuration(self):
-        config = (ROOT / 'src/libslic3r/AppConfig.cpp').read_text()
+        config = (ROOT / 'src/libslic3r/AppConfig.cpp').read_text(encoding="utf-8")
         self.assertRegex(config, r'get\("enable_shadow_map"\)\.empty\(\)\)\s*set_bool\("enable_shadow_map", false\)')
         pref = read('Preferences.cpp')
         self.assertIn('Enable soft shadows (PCSS)', pref)
         self.assertIn('get_preview_canvas3D()', pref)
         self.assertIn('get_view3D_canvas3D()', pref)
-        self.assertNotIn('enable_shadow_map', (ROOT / 'src/libslic3r/PrintConfig.cpp').read_text())
+        self.assertNotIn('enable_shadow_map', (ROOT / 'src/libslic3r/PrintConfig.cpp').read_text(encoding="utf-8"))
 
     def test_off_skips_shadow_update(self):
         body = function(read('GLCanvas3D.cpp'), 'void GLCanvas3D::_prepare_pcss_shadow_map()')
@@ -80,7 +80,7 @@ class IntegrationContracts(unittest.TestCase):
         self.assertIn('error.resize(error_length)', source)
 
     def test_shipping_sources_in_build(self):
-        cmake = (ROOT / 'src/slic3r/CMakeLists.txt').read_text()
+        cmake = (ROOT / 'src/slic3r/CMakeLists.txt').read_text(encoding="utf-8")
         for filename in ('PCSSShadowRenderer.hpp', 'PCSSShadowRenderer.cpp', 'PCSSShadowMath.hpp'):
             self.assertIn('GUI/' + filename, cmake)
         for filename in ('pcss.glsl', 'pcss_depth.vs', 'pcss_depth.fs', 'pcss_plate.vs', 'pcss_plate.fs'):
@@ -88,17 +88,17 @@ class IntegrationContracts(unittest.TestCase):
 
     def test_main_light_only_and_legacy_materials(self):
         for filename in ('gouraud.fs', 'gouraud_light.fs'):
-            source = (ROOT / 'resources/shaders/140' / filename).read_text()
+            source = (ROOT / 'resources/shaders/140' / filename).read_text(encoding="utf-8")
             self.assertIn('#ifdef ENABLE_PCSS', source)
             self.assertIn('pcss_main_diffuse', source)
             self.assertIn('uniform_color', source)
-        common = (ROOT / 'resources/shaders/140/pcss.glsl').read_text()
+        common = (ROOT / 'resources/shaders/140/pcss.glsl').read_text(encoding="utf-8")
         self.assertIn('texelFetch', common)
         self.assertLess(common.index('dFdx'), common.index('if (!pcss_enabled'))
         self.assertIn('if (blockers == 0)', common)
 
     def test_chinese_translation(self):
-        source = (ROOT / 'localization/i18n/zh_CN/Snapmaker_Orca_zh_CN.po').read_text()
+        source = (ROOT / 'localization/i18n/zh_CN/Snapmaker_Orca_zh_CN.po').read_text(encoding="utf-8")
         self.assertIn('msgid "Enable soft shadows (PCSS)"', source)
         self.assertIn('启用柔和阴影（PCSS）', source)
 
