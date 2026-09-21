@@ -103,7 +103,6 @@ protected:
         uint64_t previewRevision = 0;
         uint64_t topologyRevision = 0;
         uint64_t indexRevision = 0;
-        size_t   edgeCount = 0;
 
         bool operator==(const SeedFillContourKey& rhs) const noexcept
         {
@@ -281,6 +280,8 @@ private:
         size_t leafCount = 0;
         size_t vertexCount = 0;
         size_t stagingBytes = 0;
+        /** False when the counts exceed supported render limits; the plan must be rejected. */
+        bool supported = true;
     };
 
     struct ChunkColorTask

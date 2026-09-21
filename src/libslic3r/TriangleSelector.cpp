@@ -568,6 +568,24 @@ bool TriangleSelector::FlushDeferredCleanup()
     if (m_deferredCleanupRoots.empty())
         return false;
 
+    // Drop roots that cannot merge anything before sorting: unsplit roots are
+    // no-ops in remove_useless_children, and large original-leaf fills record
+    // millions of them. Split state is judged here, at flush time.
+    m_deferredCleanupRoots.erase(
+        std::remove_if(m_deferredCleanupRoots.begin(), m_deferredCleanupRoots.end(),
+            [this](uint32_t source)
+            {
+                if (source >= static_cast<uint32_t>(m_orig_size_indices))
+                    return true;
+
+                const Triangle& triangle = m_triangles[source];
+                return !triangle.valid() || !triangle.is_split();
+            }),
+        m_deferredCleanupRoots.end());
+
+    if (m_deferredCleanupRoots.empty())
+        return false;
+
     std::sort(m_deferredCleanupRoots.begin(), m_deferredCleanupRoots.end());
     m_deferredCleanupRoots.erase(std::unique(m_deferredCleanupRoots.begin(), m_deferredCleanupRoots.end()),
                                  m_deferredCleanupRoots.end());
@@ -576,10 +594,8 @@ bool TriangleSelector::FlushDeferredCleanup()
     roots.swap(m_deferredCleanupRoots);
 
     bool topologyChanged = false;
-    for (uint32_t sourceTriangle : roots) {
-        if (sourceTriangle < static_cast<uint32_t>(m_orig_size_indices) && m_triangles[sourceTriangle].valid())
-            topologyChanged |= remove_useless_children(static_cast<int>(sourceTriangle));
-    }
+    for (uint32_t sourceTriangle : roots)
+        topologyChanged |= remove_useless_children(static_cast<int>(sourceTriangle));
     return topologyChanged;
 }
 
@@ -757,8 +773,9 @@ void TriangleSelector::seed_fill_select_triangles(const Vec3f &hit, int facet_st
 
     const double facet_angle_limit     = cos(Geometry::deg2rad(seed_fill_angle)) - EPSILON;
     const float  highlight_angle_limit = -cos(Geometry::deg2rad(highlight_by_angle_deg));
-    const Matrix3f normal_matrix       = static_cast<Matrix3f>(
-        trafo_no_translate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
+    // The world-normal matrix is only needed by the overhang gate.
+    const Matrix3f normal_matrix = highlight_by_angle_deg != 0.f ? static_cast<Matrix3f>(
+        trafo_no_translate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>()) : Matrix3f::Identity();
 
     // Depth-first traversal of neighbors of the face hit by the ray thrown from the mouse cursor.
     while (!facet_queue.empty()) {

@@ -13,9 +13,12 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
+#include <boost/log/trivial.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <tbb/blocked_range.h>
@@ -28,6 +31,8 @@ namespace {
 
 constexpr size_t RENDER_CHUNK_ROOT_TARGET = 8192;
 constexpr size_t MAX_COLOR_UPLOAD_RANGES = 8;
+// Vertex budget per chunk draw call: chunk.vertexCount is uint32_t and drawn via GLsizei.
+constexpr size_t MAX_SUPPORTED_CHUNK_VERTICES = 2147483647u;
 
 uint32_t ExpandMortonBits(uint32_t value)
 {
@@ -1786,12 +1791,21 @@ TriangleSelectorPatch::ChunkBuildPlan TriangleSelectorPatch::MakeChunkBuildPlan(
     const RenderChunk& chunk = m_renderChunks[chunkId];
     for (uint32_t source : chunk.sourceRoots)
         plan.leafCount += CountLeafTriangles(static_cast<int>(source));
+
+    if (plan.leafCount > MAX_SUPPORTED_CHUNK_VERTICES / 3) {
+        plan.supported = false;
+        return plan;
+    }
     plan.vertexCount = plan.leafCount * 3;
 
     const size_t floatsPerVertex = showWireframe ? 6 : 3;
     const size_t geometryBytes   = plan.vertexCount * floatsPerVertex * sizeof(float);
     const size_t colorBytes      = plan.vertexCount * 4;
     const size_t rootInfoBytes   = chunk.sourceRoots.size() * sizeof(RootDrawInfo);
+    if (geometryBytes > std::numeric_limits<size_t>::max() - colorBytes - rootInfoBytes) {
+        plan.supported = false;
+        return plan;
+    }
     plan.stagingBytes = geometryBytes + colorBytes + rootInfoBytes;
     return plan;
 }
@@ -1824,8 +1838,16 @@ void TriangleSelectorPatch::RebuildRenderChunks(const std::vector<uint32_t>& chu
 {
     std::vector<ChunkBuildPlan> plans;
     plans.reserve(chunkIds.size());
-    for (uint32_t chunkId : chunkIds)
-        plans.push_back(MakeChunkBuildPlan(chunkId, showWireframe));
+    for (uint32_t chunkId : chunkIds) {
+        ChunkBuildPlan plan = MakeChunkBuildPlan(chunkId, showWireframe);
+        if (!plan.supported) {
+            // Clear rejection: keep the existing chunk geometry instead of truncating.
+            BOOST_LOG_TRIVIAL(warning) << "TriangleSelectorPatch: chunk " << chunkId
+                << " exceeds supported vertex count, skipping rebuild";
+            continue;
+        }
+        plans.push_back(std::move(plan));
+    }
 
     size_t batchBegin = 0;
     while (batchBegin < plans.size())
@@ -2249,6 +2271,10 @@ void TriangleSelectorPatch::MarkAllChunksTopologyDirty()
 
 void TriangleSelectorPatch::AggregateDirtyRoots()
 {
+    for (uint32_t chunkId : m_dirtyChunks)
+        if (chunkId < m_renderChunks.size())
+            m_renderChunks[chunkId].stateDirtyRoots.clear();
+
     for (uint32_t source : m_dirtyRoots) {
         if (source >= m_sourceToChunk.size())
             continue;
@@ -2828,13 +2854,10 @@ void TriangleSelectorGUI::update_paint_contour()
 
     if (!m_pointerPreviewEnabled) {
         // Fill contour cache: same preview membership and tree identity keep the GLModel valid.
+        // Empty previews cache an empty model, so both hit cases can return directly.
         const SeedFillContourKey currentKey{GetSeedFillPreviewRevision(), GetTopologyRevision(), GetTriangleIndexRevision()};
-        if (m_seedFillContourKey.has_value() && *m_seedFillContourKey == currentKey) {
-            if (m_seedFillContourKey->edgeCount > 0)
-                return; // keep the existing GLModel
-            m_paint_contour.reset(); // empty preview: stay empty
+        if (m_seedFillContourKey.has_value() && *m_seedFillContourKey == currentKey)
             return;
-        }
     }
 
     m_paint_contour.reset();
@@ -2876,7 +2899,7 @@ void TriangleSelectorGUI::update_paint_contour()
         m_paint_contour.init_from(std::move(init_data));
 
     m_seedFillContourKey = SeedFillContourKey{GetSeedFillPreviewRevision(), GetTopologyRevision(),
-                                              GetTriangleIndexRevision(), contour_edges.size()};
+                                              GetTriangleIndexRevision()};
 }
 
 void TriangleSelectorGUI::render_paint_contour(const Transform3d& matrix)
