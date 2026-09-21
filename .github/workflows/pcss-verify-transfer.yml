@@ -1,0 +1,28 @@
+name: PCSS verify transfer
+on:
+  push:
+    branches: [feature/pcss-editor-gcode-shadows]
+    paths: [.github/workflows/pcss-verify-transfer.yml]
+permissions:
+  contents: read
+jobs:
+  verify:
+    if: github.repository == 'PILIPALA030/OrcaSlicer' && github.ref == 'refs/heads/feature/pcss-editor-gcode-shadows'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read the transferred blob without executing it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, json, pathlib, subprocess
+          sha = 'b0b4254edbfc7a12e326078b1b1345e099e3b895'
+          response = json.loads(subprocess.check_output(['gh', 'api', 'repos/PILIPALA030/OrcaSlicer/git/blobs/' + sha]))
+          pathlib.Path('part1.bin').write_bytes(base64.b64decode(response['content']))
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pcss-transfer-check
+          path: part1.bin
+          retention-days: 1
+          if-no-files-found: error
