@@ -975,16 +975,47 @@ void TriangleSelector::bucket_fill_select_triangles(const Vec3f& hit, int facet_
                 output.emplace_back(neighbor_idx);
     };
 
-    const NeighborCache& neighborCache = EnsureNeighborCache();
+    // Decide BEFORE preparing the neighbor cache; the fast path must not allocate it.
+    const bool originalMeshOnly = CanUseOriginalMeshFillPath();
+    const NeighborCache* neighborCache = nullptr;
+    if (!originalMeshOnly)
+        neighborCache = &EnsureNeighborCache();
+
     const uint32_t queryGeneration = BeginQueryGeneration(
         m_triangleQueryStamp, m_triangleQueryGeneration, m_triangles.size());
     std::queue<int>    facet_queue;
     std::vector<int>   touching_triangles;
-    touching_triangles.reserve(8);
+    if (!originalMeshOnly)
+        touching_triangles.reserve(8);
 
     // Mark-on-enqueue: every queued facet gets exactly one processing pass.
     m_triangleQueryStamp[start_facet_idx] = queryGeneration;
     facet_queue.push(start_facet_idx);
+
+    // Both paths share this filter so their semantics cannot drift apart.
+    const auto tryEnqueue = [&](int currentFacet, int nextFacet)
+    {
+        if (nextFacet < 0)
+            return;
+        assert(nextFacet < static_cast<int>(m_triangles.size()));
+
+        if (m_triangleQueryStamp[nextFacet] == queryGeneration)
+            return;
+        if (m_triangles[nextFacet].get_state() != start_facet_state)
+            return;
+        if (is_facet_clipped(nextFacet, clp))
+            return;
+
+        const Vec3f& n1 = m_face_normals[m_triangles[nextFacet].source_triangle];
+        const Vec3f& n2 = m_face_normals[m_triangles[currentFacet].source_triangle];
+        if (seed_fill_angle >= -EPSILON && std::clamp(n1.dot(n2), 0.f, 1.f) < facet_angle_limit)
+            return;
+
+        assert(!m_triangles[nextFacet].is_split());
+        m_triangleQueryStamp[nextFacet] = queryGeneration;
+        facet_queue.push(nextFacet);
+    };
+
     while (!facet_queue.empty()) {
         int current_facet = facet_queue.front();
         facet_queue.pop();
@@ -992,24 +1023,16 @@ void TriangleSelector::bucket_fill_select_triangles(const Vec3f& hit, int facet_
 
         SelectSeedFillLeaf(current_facet);
 
-        collect_touching_triangles(current_facet, neighborCache.neighbors[current_facet], neighborCache.propagated[current_facet],
-                                   touching_triangles);
-        for(const int tr_idx : touching_triangles) {
-            if (tr_idx < 0 || m_triangleQueryStamp[tr_idx] == queryGeneration)
-                continue;
-            if (m_triangles[tr_idx].get_state() != start_facet_state)
-                continue;
-            if (is_facet_clipped(tr_idx, clp))
-                continue;
-
-            const Vec3f& n1 = m_face_normals[m_triangles[tr_idx].source_triangle];
-            const Vec3f& n2 = m_face_normals[m_triangles[current_facet].source_triangle];
-            if (seed_fill_angle >= -EPSILON && std::clamp(n1.dot(n2), 0.f, 1.f) < facet_angle_limit)
-                continue;
-
-            assert(!m_triangles[tr_idx].is_split());
-            m_triangleQueryStamp[tr_idx] = queryGeneration;
-            facet_queue.push(tr_idx);
+        if (originalMeshOnly) {
+            // Original mesh: the three edge neighbors, in the original edge order.
+            for (int edgeIndex = 0; edgeIndex < 3; ++edgeIndex)
+                tryEnqueue(current_facet, m_neighbors[current_facet](edgeIndex));
+        }
+        else {
+            collect_touching_triangles(current_facet, neighborCache->neighbors[current_facet], neighborCache->propagated[current_facet],
+                                       touching_triangles);
+            for (const int tr_idx : touching_triangles)
+                tryEnqueue(current_facet, tr_idx);
         }
     }
 }
@@ -2119,6 +2142,11 @@ std::vector<Vec2i32> TriangleSelector::get_seed_fill_contour() const
     if (m_seedFillSelectedLeaves.empty())
         return {};
 
+    // No subdivision anywhere: check the three original neighbors directly,
+    // skipping the roots array and the recursive walk entirely.
+    if (CanUseOriginalMeshFillPath())
+        return GetOriginalMeshSeedFillContour();
+
     std::vector<uint32_t> sourceRoots;
     sourceRoots.reserve(m_seedFillSelectedLeaves.size());
     bool originalLeavesOnly = true;
@@ -2182,6 +2210,47 @@ void TriangleSelector::AppendSeedFillContourForUniqueRoots(const std::vector<uin
         assert(verify_triangle_neighbors(m_triangles[rootIndex], neighbors));
         get_seed_fill_contour_recursive(rootIndex, neighbors, neighbors, edgesOut);
     }
+}
+
+bool TriangleSelector::CanUseOriginalMeshFillPath() const noexcept
+{
+    // Original roots stay at the front of m_triangles; equal sizes mean no valid children.
+    return m_orig_size_indices >= 0 &&
+           m_triangles.size() == static_cast<size_t>(m_orig_size_indices) &&
+           m_neighbors.size() == static_cast<size_t>(m_orig_size_indices) &&
+           m_invalid_triangles == 0;
+}
+
+std::vector<Vec2i32> TriangleSelector::GetOriginalMeshSeedFillContour() const
+{
+    assert(CanUseOriginalMeshFillPath());
+    std::vector<Vec2i32> edges;
+
+    for (int facet : m_seedFillSelectedLeaves)
+    {
+        if (facet < 0 || facet >= m_orig_size_indices)
+            continue;
+
+        const Triangle& triangle = m_triangles[facet];
+        if (!triangle.valid() || triangle.is_split() || !triangle.is_selected_by_seed_fill())
+            continue;
+
+        for (int edgeIndex = 0; edgeIndex < 3; ++edgeIndex) {
+            const int neighbor = m_neighbors[facet](edgeIndex);
+            // Baseline open boundaries produce no edge; keep that behavior.
+            if (neighbor < 0)
+                continue;
+
+            assert(neighbor < m_orig_size_indices);
+            assert(!m_triangles[neighbor].is_split());
+
+            if (!m_triangles[neighbor].is_selected_by_seed_fill())
+                edges.emplace_back(triangle.verts_idxs[edgeIndex],
+                                   triangle.verts_idxs[(edgeIndex + 1) % 3]);
+        }
+    }
+
+    return edges;
 }
 
 void TriangleSelector::get_seed_fill_contour_recursive(const int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<Vec2i32> &edges_out) const {

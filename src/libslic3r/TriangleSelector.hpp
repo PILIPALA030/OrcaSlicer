@@ -634,6 +634,10 @@ private:
     void get_seed_fill_contour_recursive(int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<Vec2i32> &edges_out) const;
     /** Appends contour edges for roots that are already range-checked and unique; no copy, no sort. */
     void AppendSeedFillContourForUniqueRoots(const std::vector<uint32_t>& sourceRoots, std::vector<Vec2i32>& edgesOut) const;
+    /** O(1) sufficient condition: the selector holds only original unsplit roots. */
+    bool CanUseOriginalMeshFillPath() const noexcept;
+    /** Contour straight from original-mesh adjacency; requires CanUseOriginalMeshFillPath(). */
+    std::vector<Vec2i32> GetOriginalMeshSeedFillContour() const;
 
     std::vector<uint32_t> m_deferredCleanupRoots;
     std::vector<int> m_seedFillSelectedLeaves;
