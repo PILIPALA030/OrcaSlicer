@@ -106,3 +106,109 @@ pd_replace("            if (readyFlag)\n                readyFlag->store(true, s
 pd_replace("        std::move(itsCopy));" [=[
         std::move(itsCopy));
     PD_EVENT("LOD_SPAWN_END", "task=" << diagnosticTaskId);]=])
+
+# Display-only MMU LOD experiment. Default ON in this diagnostic build.
+# ORCA_MMU_DISPLAY_LOD=0 (set before starting a new process) restores the
+# original multicolor display path without recompiling. Runtime logging OFF
+# does not disable the experiment, so logging-overhead comparisons stay valid.
+# Middle/Small use the existing single-color LOD; High keeps original colors.
+# No paint data, picking policy, LOD evaluation policy, or GL state is changed.
+pd_entry("void GLVolume::simple_render(" [=[
+    static const bool diagnosticMmuDisplayLodEnabled = []() {
+#if defined(_MSC_VER)
+        size_t required = 0;
+        char value[2] = {};
+        return ::getenv_s(&required, value, sizeof(value), "ORCA_MMU_DISPLAY_LOD") != 0 ||
+               required != 2 || value[0] != '0';
+#else
+        const char* value = ::getenv("ORCA_MMU_DISPLAY_LOD");
+        return value == nullptr || ::strcmp(value, "0") != 0;
+#endif
+    }();
+    // The main scene uses gouraud; thumbnails and ID/mask shaders stay unchanged.
+    const bool diagnosticMainDisplayShader = shader != nullptr && shader->get_name() == "gouraud";
+    const bool diagnosticFullRange = tverts_range == std::make_pair<size_t, size_t>(0, -1);
+    // Never inspect unpublished geometry. The existing main-thread promotion
+    // enables render only after acquiring the worker's ready flag.
+    const bool diagnosticSmallAvailable = m_modelSmall && !m_modelSmall->is_render_disabled() && m_modelSmall->is_initialized();
+    const bool diagnosticMiddleAvailable = m_modelMiddle && !m_modelMiddle->is_render_disabled() && m_modelMiddle->is_initialized();
+    bool diagnosticUseMmuDisplayLod = false;
+]=])
+pd_replace("        color_volume = true;" [=[
+        color_volume = true;
+        // Only switch the display path when the requested LOD is ready.
+        // Material-ID rendering (ban_light) and partial index ranges retain
+        // their original MMU path. Picking preparation/drawing is unchanged.
+        diagnosticUseMmuDisplayLod = diagnosticMmuDisplayLodEnabled && !picking && !ban_light && diagnosticMainDisplayShader && diagnosticFullRange &&
+            ((m_curLodLevel == LODLevel::Small && diagnosticSmallAvailable) ||
+             (m_curLodLevel == LODLevel::Middle && diagnosticMiddleAvailable));
+        if (diagnosticUseMmuDisplayLod)
+            break; // Defer MMU cache construction until the display needs it.
+]=])
+pd_replace("    if (color_volume && !picking) {" [=[
+    if (color_volume && !picking && ::Slic3r::GUI::PickerDiag::enabled()) {
+        const GUI::GLModel* diagnosticSelectedLod = diagnosticUseMmuDisplayLod
+            ? (m_curLodLevel == LODLevel::Small ? m_modelSmall.get() : m_modelMiddle.get()) : nullptr;
+        const char* diagnosticEffectivePath = !diagnosticUseMmuDisplayLod ? "MMU_HIGH"
+            : (m_curLodLevel == LODLevel::Small ? "MMU_SMALL_PLAIN" : "MMU_MIDDLE_PLAIN");
+        const char* diagnosticReason = diagnosticUseMmuDisplayLod ? "requested_lod_ready"
+            : !diagnosticMmuDisplayLodEnabled ? "experiment_disabled"
+            : ban_light ? "material_id_pass"
+            : !diagnosticMainDisplayShader ? "other_shader_pass"
+            : !diagnosticFullRange ? "partial_index_range"
+            : m_curLodLevel == LODLevel::High ? "requested_high" : "requested_lod_unavailable";
+        uint64_t diagnosticGeometryIndices = 0;
+        uint64_t diagnosticRequestedIndices = 0;
+        size_t diagnosticSubmodels = 0;
+        bool diagnosticRangeValid = true;
+        if (diagnosticSelectedLod != nullptr) {
+            diagnosticGeometryIndices = diagnosticSelectedLod->indices_count();
+            diagnosticRequestedIndices = diagnosticGeometryIndices;
+            diagnosticSubmodels = 1;
+        } else {
+            for (const GUI::GLModel& diagnosticModel : mmuseg_models) {
+                if (diagnosticModel.is_render_disabled() || !diagnosticModel.is_initialized())
+                    continue;
+                ++diagnosticSubmodels;
+                const size_t diagnosticCount = diagnosticModel.indices_count();
+                diagnosticGeometryIndices += diagnosticCount;
+                if (diagnosticFullRange) {
+                    diagnosticRequestedIndices += diagnosticCount;
+                } else if (tverts_range.second >= tverts_range.first) {
+                    // Report the original request; do not clamp or fix it here.
+                    diagnosticRequestedIndices += tverts_range.second - tverts_range.first;
+                    diagnosticRangeValid &= tverts_range.second <= diagnosticCount;
+                } else {
+                    diagnosticRangeValid = false;
+                }
+            }
+        }
+        PD_EVENT("MMU_LOD_SELECTION", "object=" << object_idx() << " instance=" << instance_idx()
+            << " volume_index=" << volume_idx() << " requested_lod=" << static_cast<int>(m_curLodLevel)
+            << " effective_path=" << diagnosticEffectivePath << " lod_applied=" << diagnosticUseMmuDisplayLod
+            << " experiment_enabled=" << diagnosticMmuDisplayLodEnabled << " reason=" << diagnosticReason
+            << " small_available=" << diagnosticSmallAvailable << " middle_available=" << diagnosticMiddleAvailable
+            << " selected_geometry=" << diagnosticSelectedLod << " submodels=" << diagnosticSubmodels
+            << " geometry_indices=" << diagnosticGeometryIndices << " requested_indices=" << diagnosticRequestedIndices
+            << " requested_triangles=" << diagnosticRequestedIndices / 3 << " range_full=" << diagnosticFullRange
+            << " range_valid=" << diagnosticRangeValid << " ban_light=" << ban_light
+            << " main_display_shader=" << diagnosticMainDisplayShader
+            << " single_color_display=" << diagnosticUseMmuDisplayLod << " gpu_completion_not_implied=1");
+    }
+
+    if (color_volume && !picking && !diagnosticUseMmuDisplayLod) {]=])
+
+# Log the existing LOD decision inputs without changing thresholds, evaluation
+# frequency, camera state, or the order of rendering passes. The volume tag
+# ties LOD_SCREEN_SIZE to the following LOD_EVALUATED record.
+pd_replace("            LODLevel prevLod = v->m_curLodLevel;" [=[
+            PD_TAG(Volume, v);
+            LODLevel prevLod = v->m_curLodLevel;]=])
+pd_replace("    double sizeY = box2d.size().y();" [=[
+    double sizeY = box2d.size().y();
+    PD_EVENT("LOD_SCREEN_SIZE", "projected_width_px=" << sizeX << " projected_height_px=" << sizeY
+        << " viewport_width=" << windowWidth << " viewport_height=" << windowHeight
+        << " small_max_width=" << LOD_SCREEN_MIN.x() << " small_max_height=" << LOD_SCREEN_MIN.y()
+        << " high_min_width=" << LOD_SCREEN_MAX.x() << " high_min_height=" << LOD_SCREEN_MAX.y());]=])
+pd_replace("            PD_DETAIL(\"LOD_EVALUATED\"," "            PD_EVENT(\"LOD_EVALUATED\",")
+message(STATUS "MMU display LOD experiment: default ON; ORCA_MMU_DISPLAY_LOD=0 restores full multicolor display. Picking unchanged.")
