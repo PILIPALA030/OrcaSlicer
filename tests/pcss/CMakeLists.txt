@@ -19,6 +19,13 @@ if(PCSS_TEST_OPENGL)
     target_compile_definitions(pcss_gl_tests PRIVATE PCSS_SHADER_DIRECTORY="${CMAKE_CURRENT_LIST_DIR}/../../resources/shaders/140")
     target_compile_definitions(pcss_gl_tests PRIVATE PCSS_REFERENCE_DIRECTORY="${CMAKE_CURRENT_LIST_DIR}/reference")
     add_test(NAME pcss_gl COMMAND pcss_gl_tests)
+    add_executable(pcss_depth_bounds_tests test_depth_bounds.cpp "${PCSS_GUI_DIR}/PCSSShadowRenderer.cpp")
+    target_include_directories(pcss_depth_bounds_tests PRIVATE "${PCSS_GUI_DIR}")
+    target_link_libraries(pcss_depth_bounds_tests PRIVATE GLEW::GLEW glfw OpenGL::GL)
+    target_compile_definitions(pcss_depth_bounds_tests PRIVATE
+        PCSS_SHADER_DIRECTORY="${CMAKE_CURRENT_LIST_DIR}/../../resources/shaders/140"
+        PCSS_REFERENCE_DIRECTORY="${CMAKE_CURRENT_LIST_DIR}/reference")
+    add_test(NAME pcss_depth_bounds COMMAND pcss_depth_bounds_tests)
 endif()
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)

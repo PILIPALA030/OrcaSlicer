@@ -1,4 +1,5 @@
 #include "PCSSShadowRenderer.hpp"
+#include "PCSSShadowAcceleration.hpp"
 
 #include <GL/glew.h>
 
@@ -101,7 +102,28 @@ public:
 void uniform_int(unsigned program, const char* name, int value) { glUniform1i(glGetUniformLocation(program, name), value); }
 void uniform_float(unsigned program, const char* name, float value) { glUniform1f(glGetUniformLocation(program, name), value); }
 
+class ShadowTimingScope
+{
+    PCSSShadowAcceleration* m_acceleration;
+    int                     m_ticket;
+
+public:
+    ShadowTimingScope(PCSSShadowAcceleration* acceleration, PCSSShadowAcceleration::Stage stage)
+        : m_acceleration(acceleration), m_ticket(acceleration ? acceleration->begin(stage) : -1)
+    {}
+    ~ShadowTimingScope()
+    {
+        if (m_acceleration)
+            m_acceleration->end(m_ticket);
+    }
+    ShadowTimingScope(const ShadowTimingScope&)            = delete;
+    ShadowTimingScope& operator=(const ShadowTimingScope&) = delete;
+};
+
 } // namespace
+
+PCSSShadowRenderer::PCSSShadowRenderer()  = default;
+PCSSShadowRenderer::~PCSSShadowRenderer() = default;
 
 bool PCSSShadowRenderer::set_settings(const PCSSSettings& settings)
 {
@@ -195,6 +217,8 @@ bool PCSSShadowRenderer::initialize_gl()
 
 void PCSSShadowRenderer::shutdown_gl()
 {
+    if (m_acceleration)
+        m_acceleration->shutdown_gl();
     if (m_depth_texture != 0)
         glDeleteTextures(1, &m_depth_texture);
     if (m_framebuffer != 0)
@@ -206,6 +230,7 @@ void PCSSShadowRenderer::shutdown_gl()
 
 void PCSSShadowRenderer::abandon_lost_context()
 {
+    m_acceleration.reset(); // Destructor never deletes GL names in a possibly different context.
     m_depth_texture = m_framebuffer = m_vertex_array = m_resolution = m_max_texture_size = 0;
     m_ready = m_failed = false;
     m_error.clear();
@@ -223,6 +248,9 @@ bool PCSSShadowRenderer::update(const PCSSFrameInput& input, unsigned depth_prog
         invalidate();
         return false;
     }
+    if (!m_acceleration)
+        m_acceleration = std::make_unique<PCSSShadowAcceleration>();
+    m_acceleration->frame(m_resolution, m_settings.blocker_samples, m_settings.filter_samples);
     if (m_resolution != m_settings.resolution &&
         !pcss::fit_projection(input.casters, input.receivers, input.to_light, m_settings.max_radius_mm, m_resolution, next)) {
         invalidate();
@@ -232,45 +260,70 @@ bool PCSSShadowRenderer::update(const PCSSFrameInput& input, unsigned depth_prog
         next.min_caster_depth == m_projection.min_caster_depth) {
         // Bounds can change without changing the fitted domain. Receiver culling must not use stale bounds.
         m_projection.caster_uv_bounds = next.caster_uv_bounds;
+        update_depth_bounds();
         return true;
     }
 
     ShadowGLState state;
     m_ready = false; // Also invalid if the host draw callback throws.
-    glBindFramebuffer(GL_FRAMEBUFFER, m_framebuffer);
-    glBindVertexArray(m_vertex_array);
-    glViewport(0, 0, m_resolution, m_resolution);
-    glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_STENCIL_TEST);
-    glDisable(GL_BLEND);
-    glDisable(GL_CULL_FACE); // Thin/open meshes and mirrored instances must still cast shadows.
-    glDisable(GL_POLYGON_OFFSET_FILL);
-    glDisable(GL_RASTERIZER_DISCARD);
-    glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
-    if (GLEW_VERSION_3_2 || GLEW_ARB_depth_clamp)
-        glDisable(GL_DEPTH_CLAMP);
-    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LESS);
-    glDepthMask(GL_TRUE);
-    glDepthRange(0.0, 1.0);
-    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-    glClearDepth(1.0);
-    glClear(GL_DEPTH_BUFFER_BIT);
-    glUseProgram(depth_program);
-    glUniformMatrix4fv(glGetUniformLocation(depth_program, "pcss_matrix"), 1, GL_FALSE, next.matrix.data());
-    draw_depth();
+    {
+        ShadowTimingScope timing(m_acceleration.get(), PCSSShadowAcceleration::Stage::Depth);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_framebuffer);
+        glBindVertexArray(m_vertex_array);
+        glViewport(0, 0, m_resolution, m_resolution);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE); // Thin/open meshes and mirrored instances must still cast shadows.
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        glDisable(GL_RASTERIZER_DISCARD);
+        glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+        if (GLEW_VERSION_3_2 || GLEW_ARB_depth_clamp)
+            glDisable(GL_DEPTH_CLAMP);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        glDepthMask(GL_TRUE);
+        glDepthRange(0.0, 1.0);
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glClearDepth(1.0);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        glUseProgram(depth_program);
+        glUniformMatrix4fv(glGetUniformLocation(depth_program, "pcss_matrix"), 1, GL_FALSE, next.matrix.data());
+        draw_depth();
+    }
     m_projection = next;
     m_revision   = input.revision;
     ++m_depth_generation;
     m_ready = true;
+    update_depth_bounds(false); // The surrounding guard already owns the caller's GL state.
     return true;
+}
+
+void PCSSShadowRenderer::update_depth_bounds(bool restore_state)
+{
+    if (!m_acceleration || !m_settings.use_depth_bounds || m_settings.angular_diameter_deg <= 0.0f ||
+        !m_acceleration->needs_bounds(m_resolution, m_depth_generation))
+        return;
+    const auto build = [&]() {
+        glBindVertexArray(m_vertex_array);
+        ShadowTimingScope timing(m_acceleration.get(), PCSSShadowAcceleration::Stage::Bounds);
+        m_acceleration->update_bounds(m_depth_texture, m_resolution, m_depth_generation);
+    };
+    if (restore_state) {
+        ShadowGLState state;
+        build();
+    } else
+        build();
 }
 
 void PCSSShadowRenderer::set_receiver_uniforms(unsigned program) const
 {
     uniform_int(program, "pcss_enabled", 1);
     uniform_int(program, "pcss_depth", SHADOW_TEXTURE_UNIT);
+    uniform_int(program, "pcss_depth_ranges", PCSSShadowAcceleration::TEXTURE_UNIT);
+    uniform_int(program, "pcss_ranges_enabled", m_settings.use_depth_bounds && m_acceleration && m_acceleration->bounds_ready());
+    uniform_int(program, "pcss_range_max_level", m_acceleration ? m_acceleration->levels() : 0);
     uniform_int(program, "pcss_blocker_samples", m_settings.blocker_samples);
     uniform_int(program, "pcss_filter_samples", m_settings.filter_samples);
     glUniform2fv(glGetUniformLocation(program, "pcss_blocker_disk[0]"), m_settings.blocker_samples, m_blocker_disk.data());
@@ -280,17 +333,21 @@ void PCSSShadowRenderer::set_receiver_uniforms(unsigned program) const
     glUniform2fv(glGetUniformLocation(program, "pcss_extent"), 1, m_projection.extent.data());
     uniform_float(program, "pcss_depth_span", m_projection.depth_span);
     uniform_float(program, "pcss_min_caster_depth", m_projection.min_caster_depth);
-    uniform_float(program, "pcss_tan_half_angle", pcss::tan_half_angle(m_settings.angular_diameter_deg));
+    uniform_float(program, "pcss_tan_half_angle",
+                  (m_acceleration && m_acceleration->hard_shadows()) ? 0.0f : pcss::tan_half_angle(m_settings.angular_diameter_deg));
     uniform_float(program, "pcss_bias_mm", m_settings.bias_mm);
     uniform_float(program, "pcss_max_radius_mm", m_settings.max_radius_mm);
     uniform_float(program, "pcss_plate_strength", m_settings.plate_strength);
 }
 
-PCSSReceiverScope::PCSSReceiverScope(const PCSSShadowRenderer* shadow, unsigned program)
+PCSSReceiverScope::PCSSReceiverScope(const PCSSShadowRenderer* shadow, unsigned program, bool plate_receiver)
 {
     if (program == 0 || shadow == nullptr || !shadow->is_ready())
         return;
-    m_program = program;
+    m_program      = program;
+    m_acceleration = shadow->m_acceleration.get();
+    if (m_acceleration)
+        m_timing_slot = m_acceleration->begin_receiver(program, plate_receiver, shadow->m_settings.use_depth_bounds);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &m_active_texture);
     glActiveTexture(GL_TEXTURE0 + SHADOW_TEXTURE_UNIT);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &m_previous_texture);
@@ -300,14 +357,25 @@ PCSSReceiverScope::PCSSReceiverScope(const PCSSShadowRenderer* shadow, unsigned 
         glBindSampler(SHADOW_TEXTURE_UNIT, 0); // Raw depth; an inherited comparison sampler would be incorrect.
     }
     glBindTexture(GL_TEXTURE_2D, shadow->m_depth_texture);
+    glActiveTexture(GL_TEXTURE0 + PCSSShadowAcceleration::TEXTURE_UNIT);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &m_previous_bounds_texture);
+    if (m_has_samplers) {
+        glGetIntegerv(GL_SAMPLER_BINDING, &m_previous_bounds_sampler);
+        glBindSampler(PCSSShadowAcceleration::TEXTURE_UNIT, 0);
+    }
+    glBindTexture(GL_TEXTURE_2D, m_acceleration ? m_acceleration->texture() : 0);
     glActiveTexture(m_active_texture); // Existing material textures keep using their original active unit.
     shadow->set_receiver_uniforms(program);
+    if (m_acceleration && !m_acceleration->receives(plate_receiver))
+        uniform_int(program, "pcss_enabled", 0);
 }
 
 PCSSReceiverScope::~PCSSReceiverScope()
 {
     if (m_program == 0)
         return;
+    if (m_acceleration)
+        m_acceleration->end(m_timing_slot);
     GLint program = 0;
     glGetIntegerv(GL_CURRENT_PROGRAM, &program);
     glUseProgram(m_program);
@@ -317,6 +385,10 @@ PCSSReceiverScope::~PCSSReceiverScope()
     glBindTexture(GL_TEXTURE_2D, m_previous_texture);
     if (m_has_samplers)
         glBindSampler(SHADOW_TEXTURE_UNIT, m_previous_sampler);
+    glActiveTexture(GL_TEXTURE0 + PCSSShadowAcceleration::TEXTURE_UNIT);
+    glBindTexture(GL_TEXTURE_2D, m_previous_bounds_texture);
+    if (m_has_samplers)
+        glBindSampler(PCSSShadowAcceleration::TEXTURE_UNIT, m_previous_bounds_sampler);
     glActiveTexture(m_active_texture);
 }
 
@@ -343,7 +415,7 @@ void PCSSShadowRenderer::render_plate(unsigned                     program,
     glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
     glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
-    PCSSReceiverScope receiver(this, program);
+    PCSSReceiverScope receiver(this, program, true);
     draw_polygon();
 }
 

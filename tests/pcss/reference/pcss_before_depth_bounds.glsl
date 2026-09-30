@@ -2,9 +2,6 @@
 // Directional-light PCSS: orthographic, standard depth, millimeters, visibility 1 = lit.
 uniform bool pcss_enabled;
 uniform sampler2D pcss_depth;
-uniform sampler2D pcss_depth_ranges;
-uniform bool pcss_ranges_enabled;
-uniform int pcss_range_max_level;
 uniform mat4 pcss_matrix;
 uniform vec2 pcss_extent;
 uniform vec4 pcss_caster_uv_bounds;
@@ -28,46 +25,6 @@ float pcss_raw_depth(vec2 uv)
 {
     ivec2 size = textureSize(pcss_depth, 0);
     return texelFetch(pcss_depth, clamp(ivec2(uv * vec2(size)), ivec2(0), size - ivec2(1)), 0).r;
-}
-
-// Each node bounds a depth plane, not just raw min/max. Subtracting the receiver slope before
-// bounding preserves tight bounds on sloped surfaces. Node W encloses every source texel's residual.
-vec4 pcss_node_range(ivec2 node, int level, vec3 coord, vec2 gradient)
-{
-    vec4 plane = texelFetch(pcss_depth_ranges, node, level);
-    float footprint = float(4 << level);
-    vec2 size = vec2(textureSize(pcss_depth, 0));
-    vec2 receiver_gradient = gradient / size;
-    vec2 center = (vec2(node) + 0.5) * footprint - 0.5;
-    float receiver_at_center = coord.z + dot(receiver_gradient, center - (coord.xy * size - 0.5));
-    float half_width = (footprint - 1.0) * 0.5;
-    float delta = plane.x - receiver_at_center;
-    // The PCSS comparison uses the requested UV, not the nearest texel's center. Enclose that half-texel shift too.
-    float error = plane.w + half_width * dot(abs(plane.yz - receiver_gradient), vec2(1.0)) +
-                  0.5 * dot(abs(receiver_gradient), vec2(1.0)) + 2e-6;
-    float depth_error = plane.w + half_width * dot(abs(plane.yz), vec2(1.0));
-    return vec4(delta - error, delta + error, plane.x - depth_error, plane.x + depth_error);
-}
-
-// Four hierarchy nodes cover the ENTIRE texel rectangle; these are not four visibility probes.
-vec4 pcss_query_depth_range(vec3 coord, vec2 gradient, vec2 radius)
-{
-    ivec2 size = textureSize(pcss_depth, 0);
-    ivec2 low = clamp(ivec2(floor((coord.xy - radius) * vec2(size))) - ivec2(1), ivec2(0), size - ivec2(1)) / 4;
-    ivec2 high = clamp(ivec2(floor((coord.xy + radius) * vec2(size))) + ivec2(1), ivec2(0), size - ivec2(1)) / 4;
-    ivec2 span = high - low + ivec2(1);
-    int width = max(span.x, span.y);
-    int level = clamp(int(ceil(log2(float(width)))), 0, pcss_range_max_level);
-    if ((1 << level) < width && level < pcss_range_max_level)
-        ++level;
-    low /= (1 << level);
-    high /= (1 << level);
-    vec4 a = pcss_node_range(low, level, coord, gradient);
-    vec4 b = pcss_node_range(ivec2(high.x, low.y), level, coord, gradient);
-    vec4 c = pcss_node_range(ivec2(low.x, high.y), level, coord, gradient);
-    vec4 d = pcss_node_range(high, level, coord, gradient);
-    return vec4(min(min(a.x, b.x), min(c.x, d.x)), max(max(a.y, b.y), max(c.y, d.y)),
-                min(min(a.z, b.z), min(c.z, d.z)), max(max(a.w, b.w), max(c.w, d.w)));
 }
 
 struct PCSSReceiver
@@ -113,27 +70,6 @@ float pcss_visibility_prepared(PCSSReceiver prepared)
     if (any(lessThan(coord.xy + search_uv, pcss_caster_uv_bounds.xy - guard)) ||
         any(greaterThan(coord.xy - search_uv, pcss_caster_uv_bounds.zw + guard)))
         return 1.0;
-    if (pcss_ranges_enabled) {
-        vec4 range = pcss_query_depth_range(coord, gradient, search_uv);
-        float receiver_max = coord.z + dot(abs(gradient), search_uv);
-        // Include arithmetic/depth rounding in the conservative threshold, never bias toward an early-out.
-        const float range_epsilon = 2e-6;
-        if (range.z >= 1.0 || range.x >= -bias)
-            return 1.0;
-
-        // The minimum depth and maximum receiver depth bound every possible average blocker gap.
-        // Thus this footprint contains both the search disk and any resulting PCF filter disk.
-        float radius_bound_mm = min(max(0.0, receiver_max - range.z + range_epsilon) *
-                                    pcss_depth_span * pcss_tan_half_angle, pcss_max_radius_mm);
-        vec2 support_uv = max(search_uv, vec2(radius_bound_mm) / pcss_extent);
-        if (all(greaterThanEqual(coord.xy - support_uv, vec2(0.0))) &&
-            all(lessThan(coord.xy + support_uv, vec2(1.0)))) {
-            if (any(greaterThan(support_uv, search_uv)))
-                range = pcss_query_depth_range(coord, gradient, support_uv);
-            if (range.w < 1.0 && range.y < -bias)
-                return 0.0;
-        }
-    }
     int blockers = 0;
     float gap_sum = 0.0;
     for (int i = 0; i < 64; ++i) {

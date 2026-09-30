@@ -4,9 +4,12 @@
 #include "PCSSShadowMath.hpp"
 
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace Slic3r { namespace GUI {
+
+class PCSSShadowAcceleration;
 
 struct PCSSSettings
 {
@@ -16,7 +19,8 @@ struct PCSSSettings
     float    angular_diameter_deg{4.0f}; // Full angular diameter, not angular radius.
     float    bias_mm{0.02f};
     float    max_radius_mm{12.0f};
-    float    plate_strength{0.55f}; // Presentation alpha, not light transmission.
+    float    plate_strength{0.55f};  // Presentation alpha, not light transmission.
+    bool     use_depth_bounds{true}; // Conservative early-outs; false selects full PCSS sampling.
 };
 
 struct PCSSFrameInput
@@ -27,7 +31,8 @@ struct PCSSFrameInput
     std::uint64_t revision{0};       // Geometry, transforms, clipping and visible draw ranges.
 };
 
-// One owner per actual GL context. Shader programs and geometry are borrowed, never deleted here.
+// One owner per actual GL context. Host shader programs and geometry are borrowed.
+// The optional reduction program, textures and timer queries are owned by this renderer.
 // All methods touching GL require that owner's context current on the UI rendering thread.
 class PCSSShadowRenderer
 {
@@ -46,13 +51,16 @@ class PCSSShadowRenderer
     pcss::Projection       m_projection;
     std::string            m_error;
 
+    std::unique_ptr<PCSSShadowAcceleration> m_acceleration;
+
     bool initialize_gl();
+    void update_depth_bounds(bool restore_state = true);
     friend class PCSSReceiverScope;
     void set_receiver_uniforms(unsigned program) const;
 
 public:
-    PCSSShadowRenderer()                                     = default;
-    ~PCSSShadowRenderer()                                    = default; // Host must call shutdown_gl before destroying the context.
+    PCSSShadowRenderer();
+    ~PCSSShadowRenderer(); // Host must call shutdown_gl before destroying the context.
     PCSSShadowRenderer(const PCSSShadowRenderer&)            = delete;
     PCSSShadowRenderer& operator=(const PCSSShadowRenderer&) = delete;
 
@@ -80,14 +88,18 @@ public:
 // The caller starts its registered receiver shader first. Destruction disables its PCSS uniform and restores bindings.
 class PCSSReceiverScope
 {
-    unsigned m_program{0};
-    int      m_active_texture{0};
-    int      m_previous_texture{0};
-    int      m_previous_sampler{0};
-    bool     m_has_samplers{false};
+    unsigned                m_program{0};
+    int                     m_active_texture{0};
+    int                     m_previous_texture{0};
+    int                     m_previous_sampler{0};
+    bool                    m_has_samplers{false};
+    int                     m_previous_bounds_texture{0};
+    int                     m_previous_bounds_sampler{0};
+    int                     m_timing_slot{-1};
+    PCSSShadowAcceleration* m_acceleration{nullptr};
 
 public:
-    PCSSReceiverScope(const PCSSShadowRenderer* shadow, unsigned program);
+    PCSSReceiverScope(const PCSSShadowRenderer* shadow, unsigned program, bool plate_receiver = false);
     ~PCSSReceiverScope();
     PCSSReceiverScope(const PCSSReceiverScope&)            = delete;
     PCSSReceiverScope& operator=(const PCSSReceiverScope&) = delete;
