@@ -9,9 +9,11 @@ on:
       - 'tests/pcss/**'
       - '.github/workflows/pcss-validation.yml'
   pull_request:
+    # LOD selection and receiver changes outside PCSS-named files also require regression coverage.
     paths:
-      - 'src/slic3r/GUI/PCSS*'
-      - 'resources/shaders/140/pcss*'
+      - 'src/slic3r/GUI/**'
+      - 'src/libslic3r/AppConfig.cpp'
+      - 'resources/shaders/140/**'
       - 'tests/pcss/**'
       - '.github/workflows/pcss-validation.yml'
 permissions:
@@ -48,7 +50,7 @@ jobs:
       - name: Build the shipping renderer with warnings as errors
         run: |
           cmake -S tests/pcss -B build-pcss-gl -G Ninja -DPCSS_TEST_OPENGL=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS='-Wall -Wextra -Werror -pedantic'
-          cmake --build build-pcss-gl --parallel 2
+          cmake --build build-pcss-gl --config Debug --parallel 2
       - name: Test OpenGL 3.1 and 3.3 Core
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
