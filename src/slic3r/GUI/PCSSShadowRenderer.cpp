@@ -16,19 +16,40 @@ void set_enabled(GLenum capability, GLboolean enabled)
         glDisable(capability);
 }
 
+// GL 3.1 guarantees at least eight user clip distances. Do not inherit undefined outputs from another shader.
+void set_clip_distances(unsigned count)
+{
+    for (unsigned i = 0; i < 8; ++i)
+        set_enabled(GL_CLIP_DISTANCE0 + i, i < count);
+}
+
 // The private VAO is essential: restoring a VAO name cannot undo edits made to that same VAO's attributes.
 class ShadowGLState
 {
-    GLint                       m_draw_fbo{}, m_read_fbo{}, m_program{}, m_vao{}, m_array_buffer{}, m_element_buffer{}, m_unpack_buffer{};
-    GLint                       m_viewport[4]{}, m_polygon_mode[2]{}, m_depth_func{}, m_front_face{}, m_cull_face{};
-    GLint                       m_blend_src_rgb{}, m_blend_dst_rgb{}, m_blend_src_alpha{}, m_blend_dst_alpha{};
-    GLint                       m_blend_eq_rgb{}, m_blend_eq_alpha{}, m_active_texture{}, m_texture{};
-    GLboolean                   m_color_mask[4]{}, m_depth_mask{};
-    GLdouble                    m_depth_range[2]{}, m_clear_depth{};
-    const std::array<GLenum, 9> m_capabilities{GL_BLEND,        GL_DEPTH_TEST,          GL_CULL_FACE,          GL_SCISSOR_TEST,
-                                               GL_STENCIL_TEST, GL_POLYGON_OFFSET_FILL, GL_RASTERIZER_DISCARD, GL_SAMPLE_ALPHA_TO_COVERAGE,
-                                               GL_DEPTH_CLAMP};
-    std::array<GLboolean, 9>    m_enabled{};
+    GLint                        m_draw_fbo{}, m_read_fbo{}, m_program{}, m_vao{}, m_array_buffer{}, m_element_buffer{}, m_unpack_buffer{};
+    GLint                        m_viewport[4]{}, m_polygon_mode[2]{}, m_depth_func{}, m_front_face{}, m_cull_face{};
+    GLint                        m_blend_src_rgb{}, m_blend_dst_rgb{}, m_blend_src_alpha{}, m_blend_dst_alpha{};
+    GLint                        m_blend_eq_rgb{}, m_blend_eq_alpha{}, m_active_texture{}, m_texture{};
+    GLboolean                    m_color_mask[4]{}, m_depth_mask{};
+    GLdouble                     m_depth_range[2]{}, m_clear_depth{};
+    const std::array<GLenum, 17> m_capabilities{GL_BLEND,
+                                                GL_DEPTH_TEST,
+                                                GL_CULL_FACE,
+                                                GL_SCISSOR_TEST,
+                                                GL_STENCIL_TEST,
+                                                GL_POLYGON_OFFSET_FILL,
+                                                GL_RASTERIZER_DISCARD,
+                                                GL_SAMPLE_ALPHA_TO_COVERAGE,
+                                                GL_DEPTH_CLAMP,
+                                                GL_CLIP_DISTANCE0,
+                                                GL_CLIP_DISTANCE1,
+                                                GL_CLIP_DISTANCE2,
+                                                GL_CLIP_DISTANCE3,
+                                                GL_CLIP_DISTANCE4,
+                                                GL_CLIP_DISTANCE5,
+                                                GL_CLIP_DISTANCE0 + 6,
+                                                GL_CLIP_DISTANCE0 + 7};
+    std::array<GLboolean, 17>    m_enabled{};
 
 public:
     ShadowGLState()
@@ -76,7 +97,7 @@ public:
         glViewport(m_viewport[0], m_viewport[1], m_viewport[2], m_viewport[3]);
         if (m_polygon_mode[0] == m_polygon_mode[1])
             glPolygonMode(GL_FRONT_AND_BACK, m_polygon_mode[0]);
-        else { // Separate face modes are only possible in compatibility contexts.
+        else {
             glPolygonMode(GL_FRONT, m_polygon_mode[0]);
             glPolygonMode(GL_BACK, m_polygon_mode[1]);
         }
@@ -128,10 +149,12 @@ PCSSShadowRenderer::~PCSSShadowRenderer() = default;
 bool PCSSShadowRenderer::set_settings(const PCSSSettings& settings)
 {
     if (settings.resolution < 256 || settings.resolution > 8192 || settings.blocker_samples < 1 || settings.blocker_samples > 64 ||
-        settings.filter_samples < 1 || settings.filter_samples > 64 || !std::isfinite(settings.angular_diameter_deg) ||
-        settings.angular_diameter_deg < 0.0f || settings.angular_diameter_deg > 20.0f || !std::isfinite(settings.bias_mm) ||
-        settings.bias_mm < 0.0f || !std::isfinite(settings.max_radius_mm) || settings.max_radius_mm <= 0.0f ||
-        !std::isfinite(settings.plate_strength) || settings.plate_strength < 0.0f || settings.plate_strength > 1.0f)
+        settings.filter_samples < 1 || settings.filter_samples > 64 || settings.model_blocker_samples < 1 ||
+        settings.model_blocker_samples > 64 || settings.model_filter_samples < 1 || settings.model_filter_samples > 64 ||
+        !std::isfinite(settings.angular_diameter_deg) || settings.angular_diameter_deg < 0.0f || settings.angular_diameter_deg > 20.0f ||
+        !std::isfinite(settings.bias_mm) || settings.bias_mm < 0.0f || !std::isfinite(settings.max_radius_mm) ||
+        settings.max_radius_mm <= 0.0f || !std::isfinite(settings.plate_strength) || settings.plate_strength < 0.0f ||
+        settings.plate_strength > 1.0f)
         return false;
     if (settings.resolution != m_settings.resolution || settings.max_radius_mm != m_settings.max_radius_mm)
         invalidate();
@@ -139,8 +162,24 @@ bool PCSSShadowRenderer::set_settings(const PCSSSettings& settings)
         m_blocker_disk = pcss::make_disk_samples(settings.blocker_samples);
     if (settings.filter_samples != m_settings.filter_samples)
         m_filter_disk = pcss::make_disk_samples(settings.filter_samples);
+    const auto previous = pcss::model_sample_budget(m_settings.blocker_samples, m_settings.filter_samples, m_settings.model_blocker_samples,
+                                                    m_settings.model_filter_samples, false);
+    const auto next     = pcss::model_sample_budget(settings.blocker_samples, settings.filter_samples, settings.model_blocker_samples,
+                                                    settings.model_filter_samples, false);
+    // Regenerate over the whole disk for the actual count. Truncating a 16-tap disk to its first eight taps
+    // would shrink the search support and change the light size instead of only reducing sampling density.
+    if (previous.blockers != next.blockers)
+        m_model_blocker_disk = pcss::make_disk_samples(next.blockers);
+    if (previous.filters != next.filters)
+        m_model_filter_disk = pcss::make_disk_samples(next.filters);
     m_settings = settings;
     return true;
+}
+
+pcss::SampleBudget PCSSShadowRenderer::model_sample_budget() const
+{
+    return pcss::model_sample_budget(m_settings.blocker_samples, m_settings.filter_samples, m_settings.model_blocker_samples,
+                                     m_settings.model_filter_samples, m_acceleration && m_acceleration->reference_model_quality());
 }
 
 bool PCSSShadowRenderer::initialize_gl()
@@ -174,7 +213,7 @@ bool PCSSShadowRenderer::initialize_gl()
 
     ShadowGLState state;
     GLuint        texture = 0, framebuffer = 0, vao = 0;
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0); // nullptr means no upload, never an offset into a caller PBO.
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -200,7 +239,6 @@ bool PCSSShadowRenderer::initialize_gl()
         m_ready  = false;
         return false;
     }
-    // Allocate successfully before replacing the old map. No live receiver scope is allowed during update.
     if (m_depth_texture != 0)
         glDeleteTextures(1, &m_depth_texture);
     if (m_framebuffer != 0)
@@ -230,8 +268,9 @@ void PCSSShadowRenderer::shutdown_gl()
 
 void PCSSShadowRenderer::abandon_lost_context()
 {
-    m_acceleration.reset(); // Destructor never deletes GL names in a possibly different context.
-    m_depth_texture = m_framebuffer = m_vertex_array = m_resolution = m_max_texture_size = 0;
+    m_acceleration.reset();
+    m_depth_texture = m_framebuffer = m_vertex_array = m_resolution = m_max_texture_size = m_depth_program = 0;
+    m_to_light                                                                                             = {};
     m_ready = m_failed = false;
     m_error.clear();
 }
@@ -250,22 +289,39 @@ bool PCSSShadowRenderer::update(const PCSSFrameInput& input, unsigned depth_prog
     }
     if (!m_acceleration)
         m_acceleration = std::make_unique<PCSSShadowAcceleration>();
-    m_acceleration->frame(m_resolution, m_settings.blocker_samples, m_settings.filter_samples);
+    const auto model_budget = model_sample_budget();
+    m_acceleration->frame(m_resolution, m_settings.blocker_samples, m_settings.filter_samples, model_budget.blockers, model_budget.filters,
+                          m_settings.use_depth_bounds);
     if (m_resolution != m_settings.resolution &&
         !pcss::fit_projection(input.casters, input.receivers, input.to_light, m_settings.max_radius_mm, m_resolution, next)) {
         invalidate();
         return false;
     }
-    if (m_ready && input.revision == m_revision && next.matrix == m_projection.matrix &&
+    const GLint clip_uniform = glGetUniformLocation(depth_program, "pcss_vertex_clipping");
+    if (m_ready && depth_program == m_depth_program && input.revision == m_revision && next.matrix == m_projection.matrix &&
         next.min_caster_depth == m_projection.min_caster_depth) {
-        // Bounds can change without changing the fitted domain. Receiver culling must not use stale bounds.
         m_projection.caster_uv_bounds = next.caster_uv_bounds;
+        m_acceleration->record_update(pcss::CACHE_HIT, clip_uniform >= 0);
         update_depth_bounds();
         return true;
     }
+    unsigned reasons = 0;
+    if (!m_ready)
+        reasons |= pcss::INVALID_MAP;
+    else {
+        if (input.revision != m_revision)
+            reasons |= pcss::SCENE_REVISION;
+        if (input.to_light != m_to_light)
+            reasons |= pcss::LIGHT_DIRECTION;
+        if (next.matrix != m_projection.matrix || next.min_caster_depth != m_projection.min_caster_depth)
+            reasons |= pcss::FITTED_PROJECTION;
+        if (depth_program != m_depth_program)
+            reasons |= pcss::DEPTH_PROGRAM;
+    }
+    m_acceleration->record_update(reasons, clip_uniform >= 0);
 
     ShadowGLState state;
-    m_ready = false; // Also invalid if the host draw callback throws.
+    m_ready = false;
     {
         ShadowTimingScope timing(m_acceleration.get(), PCSSShadowAcceleration::Stage::Depth);
         glBindFramebuffer(GL_FRAMEBUFFER, m_framebuffer);
@@ -274,12 +330,13 @@ bool PCSSShadowRenderer::update(const PCSSFrameInput& input, unsigned depth_prog
         glDisable(GL_SCISSOR_TEST);
         glDisable(GL_STENCIL_TEST);
         glDisable(GL_BLEND);
-        glDisable(GL_CULL_FACE); // Thin/open meshes and mirrored instances must still cast shadows.
+        glDisable(GL_CULL_FACE); // Preserve thin/open meshes and mirrored instances.
         glDisable(GL_POLYGON_OFFSET_FILL);
         glDisable(GL_RASTERIZER_DISCARD);
         glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
         if (GLEW_VERSION_3_2 || GLEW_ARB_depth_clamp)
             glDisable(GL_DEPTH_CLAMP);
+        set_clip_distances(clip_uniform >= 0 ? 3 : 0);
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LESS);
@@ -289,14 +346,18 @@ bool PCSSShadowRenderer::update(const PCSSFrameInput& input, unsigned depth_prog
         glClearDepth(1.0);
         glClear(GL_DEPTH_BUFFER_BIT);
         glUseProgram(depth_program);
+        if (clip_uniform >= 0)
+            glUniform1i(clip_uniform, 1);
         glUniformMatrix4fv(glGetUniformLocation(depth_program, "pcss_matrix"), 1, GL_FALSE, next.matrix.data());
         draw_depth();
     }
-    m_projection = next;
-    m_revision   = input.revision;
+    m_projection    = next;
+    m_revision      = input.revision;
+    m_depth_program = depth_program;
+    m_to_light      = input.to_light;
     ++m_depth_generation;
     m_ready = true;
-    update_depth_bounds(false); // The surrounding guard already owns the caller's GL state.
+    update_depth_bounds(false);
     return true;
 }
 
@@ -307,6 +368,7 @@ void PCSSShadowRenderer::update_depth_bounds(bool restore_state)
         return;
     const auto build = [&]() {
         glBindVertexArray(m_vertex_array);
+        set_clip_distances(0); // The reduction triangle has no user-clip outputs.
         ShadowTimingScope timing(m_acceleration.get(), PCSSShadowAcceleration::Stage::Bounds);
         m_acceleration->update_bounds(m_depth_texture, m_resolution, m_depth_generation);
     };
@@ -317,17 +379,21 @@ void PCSSShadowRenderer::update_depth_bounds(bool restore_state)
         build();
 }
 
-void PCSSShadowRenderer::set_receiver_uniforms(unsigned program) const
+void PCSSShadowRenderer::set_receiver_uniforms(unsigned program, bool model_receiver) const
 {
+    const bool reduced = model_receiver && !(m_acceleration && m_acceleration->reference_model_quality());
+    const auto budget  = reduced ? model_sample_budget() : pcss::SampleBudget{m_settings.blocker_samples, m_settings.filter_samples};
     uniform_int(program, "pcss_enabled", 1);
     uniform_int(program, "pcss_depth", SHADOW_TEXTURE_UNIT);
     uniform_int(program, "pcss_depth_ranges", PCSSShadowAcceleration::TEXTURE_UNIT);
     uniform_int(program, "pcss_ranges_enabled", m_settings.use_depth_bounds && m_acceleration && m_acceleration->bounds_ready());
     uniform_int(program, "pcss_range_max_level", m_acceleration ? m_acceleration->levels() : 0);
-    uniform_int(program, "pcss_blocker_samples", m_settings.blocker_samples);
-    uniform_int(program, "pcss_filter_samples", m_settings.filter_samples);
-    glUniform2fv(glGetUniformLocation(program, "pcss_blocker_disk[0]"), m_settings.blocker_samples, m_blocker_disk.data());
-    glUniform2fv(glGetUniformLocation(program, "pcss_filter_disk[0]"), m_settings.filter_samples, m_filter_disk.data());
+    uniform_int(program, "pcss_blocker_samples", budget.blockers);
+    uniform_int(program, "pcss_filter_samples", budget.filters);
+    glUniform2fv(glGetUniformLocation(program, "pcss_blocker_disk[0]"), budget.blockers,
+                 reduced ? m_model_blocker_disk.data() : m_blocker_disk.data());
+    glUniform2fv(glGetUniformLocation(program, "pcss_filter_disk[0]"), budget.filters,
+                 reduced ? m_model_filter_disk.data() : m_filter_disk.data());
     glUniform4fv(glGetUniformLocation(program, "pcss_caster_uv_bounds"), 1, m_projection.caster_uv_bounds.data());
     glUniformMatrix4fv(glGetUniformLocation(program, "pcss_matrix"), 1, GL_FALSE, m_projection.matrix.data());
     glUniform2fv(glGetUniformLocation(program, "pcss_extent"), 1, m_projection.extent.data());
@@ -354,7 +420,7 @@ PCSSReceiverScope::PCSSReceiverScope(const PCSSShadowRenderer* shadow, unsigned 
     m_has_samplers = GLEW_VERSION_3_3 || GLEW_ARB_sampler_objects;
     if (m_has_samplers) {
         glGetIntegerv(GL_SAMPLER_BINDING, &m_previous_sampler);
-        glBindSampler(SHADOW_TEXTURE_UNIT, 0); // Raw depth; an inherited comparison sampler would be incorrect.
+        glBindSampler(SHADOW_TEXTURE_UNIT, 0);
     }
     glBindTexture(GL_TEXTURE_2D, shadow->m_depth_texture);
     glActiveTexture(GL_TEXTURE0 + PCSSShadowAcceleration::TEXTURE_UNIT);
@@ -364,8 +430,13 @@ PCSSReceiverScope::PCSSReceiverScope(const PCSSShadowRenderer* shadow, unsigned 
         glBindSampler(PCSSShadowAcceleration::TEXTURE_UNIT, 0);
     }
     glBindTexture(GL_TEXTURE_2D, m_acceleration ? m_acceleration->texture() : 0);
-    glActiveTexture(m_active_texture); // Existing material textures keep using their original active unit.
-    shadow->set_receiver_uniforms(program);
+    glActiveTexture(m_active_texture);
+    // Only gouraud_pcss exposes this active print-volume uniform. G-code, plate and generic test receivers
+    // retain the base budget. Unknown material variants fail safely to full quality rather than losing shadows.
+    const bool model_receiver = !plate_receiver && glGetUniformLocation(program, "print_volume.type") >= 0;
+    if (m_acceleration)
+        m_acceleration->record_model_budget(model_receiver && m_acceleration->receives(plate_receiver));
+    shadow->set_receiver_uniforms(program, model_receiver);
     if (m_acceleration && !m_acceleration->receives(plate_receiver))
         uniform_int(program, "pcss_enabled", 0);
 }
@@ -401,12 +472,13 @@ void PCSSShadowRenderer::render_plate(unsigned                     program,
         return;
     ShadowGLState state;
     glBindVertexArray(m_vertex_array);
+    set_clip_distances(0);
     glUseProgram(program);
     glUniformMatrix4fv(glGetUniformLocation(program, "view_projection_matrix"), 1, GL_FALSE, view_projection.data());
     uniform_float(program, "plate_surface_z", surface_z);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
-    glDepthMask(GL_FALSE); // Preserve geometry depth for subsequent picking/unprojection.
+    glDepthMask(GL_FALSE);
     glDisable(GL_CULL_FACE);
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_POLYGON_OFFSET_FILL);

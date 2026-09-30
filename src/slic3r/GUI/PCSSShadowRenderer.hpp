@@ -2,6 +2,7 @@
 #define slic3r_PCSSShadowRenderer_hpp_
 
 #include "PCSSShadowMath.hpp"
+#include "PCSSShadowPolicy.hpp"
 
 #include <functional>
 #include <memory>
@@ -19,8 +20,10 @@ struct PCSSSettings
     float    angular_diameter_deg{4.0f}; // Full angular diameter, not angular radius.
     float    bias_mm{0.02f};
     float    max_radius_mm{12.0f};
-    float    plate_strength{0.55f};  // Presentation alpha, not light transmission.
-    bool     use_depth_bounds{true}; // Conservative early-outs; false selects full PCSS sampling.
+    float    plate_strength{0.55f};                          // Presentation alpha, not light transmission.
+    bool     use_depth_bounds{pcss::default_depth_bounds()}; // Default off; ORCA_PCSS_BOUNDS=1 opts in.
+    unsigned model_blocker_samples{8};                       // Mesh receivers only. Plate/G-code retain the base budget above.
+    unsigned model_filter_samples{16};                       // Capped at the base budget; the reference mode uses the base budget.
 };
 
 struct PCSSFrameInput
@@ -45,18 +48,23 @@ class PCSSShadowRenderer
     bool                   m_failed{false};
     std::uint64_t          m_revision{0};
     std::uint64_t          m_depth_generation{0};
+    unsigned               m_depth_program{0};
+    pcss::Vec3             m_to_light{};
     PCSSSettings           m_settings;
-    std::array<float, 128> m_blocker_disk = pcss::make_disk_samples(16);
-    std::array<float, 128> m_filter_disk  = pcss::make_disk_samples(32);
+    std::array<float, 128> m_blocker_disk       = pcss::make_disk_samples(16);
+    std::array<float, 128> m_filter_disk        = pcss::make_disk_samples(32);
+    std::array<float, 128> m_model_blocker_disk = pcss::make_disk_samples(8);
+    std::array<float, 128> m_model_filter_disk  = pcss::make_disk_samples(16);
     pcss::Projection       m_projection;
     std::string            m_error;
 
     std::unique_ptr<PCSSShadowAcceleration> m_acceleration;
 
-    bool initialize_gl();
-    void update_depth_bounds(bool restore_state = true);
+    bool               initialize_gl();
+    void               update_depth_bounds(bool restore_state = true);
+    pcss::SampleBudget model_sample_budget() const;
     friend class PCSSReceiverScope;
-    void set_receiver_uniforms(unsigned program) const;
+    void set_receiver_uniforms(unsigned program, bool model_receiver) const;
 
 public:
     PCSSShadowRenderer();

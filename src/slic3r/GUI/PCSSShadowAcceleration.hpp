@@ -3,6 +3,7 @@
 
 // Private implementation, included only by PCSSShadowRenderer.cpp. No host geometry or shader ownership changes.
 #include <GL/glew.h>
+#include "PCSSShadowPolicy.hpp"
 
 #include <array>
 #include <chrono>
@@ -28,6 +29,8 @@ private:
     struct Ticket
     {
         GLuint            queries[2]{};
+        GLuint            primitives{0};
+        bool              owns_primitives{false};
         Stage             stage{Stage::Depth};
         Clock::time_point start;
         unsigned          state{0}; // 0 free, 1 active, 2 pending. Pending query IDs are never reused.
@@ -43,6 +46,7 @@ private:
     std::uint64_t          m_generation{0};
     bool                   m_valid{false}, m_failed{false};
     bool                   m_disable_bounds{false}, m_hard{false}, m_plate_only{false}, m_no_receivers{false};
+    bool                   m_reference_model{false}, m_profile_geometry{false};
     bool                   m_profile{false}, m_timer_checked{false}, m_timer_supported{false};
     std::array<Ticket, 32> m_tickets{};
     std::array<Statistics, static_cast<unsigned>(Stage::Count)> m_statistics{};
@@ -50,13 +54,15 @@ private:
     unsigned                                                    m_dropped{0}, m_accelerated_calls{0};
     Clock::time_point                                           m_report_time{Clock::now()};
     unsigned                                                    m_map_size{0}, m_blocker_count{0}, m_filter_count{0};
+    unsigned                                                    m_model_blockers{0}, m_model_filters{0};
+    bool                                                        m_bounds_requested{false}, m_vertex_clip{false};
+    std::array<unsigned, 6>                                     m_update_reasons{};
+    std::uint64_t                                               m_depth_primitives{0};
+    unsigned                                                    m_primitive_samples{0};
+    unsigned                                                    m_model_budget_calls{0};
     std::ofstream                                               m_log;
 
-    static bool option_is(const char* name, const char* value)
-    {
-        const char* setting = std::getenv(name);
-        return setting != nullptr && std::strcmp(setting, value) == 0;
-    }
+    static bool option_is(const char* name, const char* value) { return pcss::environment_is(name, value); }
 
     void message(const std::string& text)
     {
@@ -73,10 +79,12 @@ private:
             return;
         static constexpr const char* NAMES[]{"depth", "bounds", "model", "gcode", "plate"};
         std::ostringstream           out;
-        out << std::fixed << std::setprecision(3) << "[PCSS] revision=depth-bounds-v2 instance=" << this << " frames=" << m_interval_frames
-            << " map=" << m_map_size << " samples=" << m_blocker_count << "/" << m_filter_count << " filter=" << (m_hard ? "hard" : "pcss")
+        out << std::fixed << std::setprecision(3) << "[PCSS] revision=receiver-budget-v3 instance=" << this
+            << " frames=" << m_interval_frames << " map=" << m_map_size << " samples=" << m_blocker_count << "/" << m_filter_count
+            << " model_samples=" << m_model_blockers << "/" << m_model_filters << " filter=" << (m_hard ? "hard" : "pcss")
             << " receivers=" << (m_no_receivers ? "none" : (m_plate_only ? "plate" : "all"))
-            << " bounds=" << (m_valid && !m_disable_bounds && !m_hard ? "on" : "off");
+            << " bounds=" << (m_bounds_requested && bounds_ready() ? "on" : "off")
+            << " depth_clip=" << (m_vertex_clip ? "vertex" : "fragment_or_custom");
         for (unsigned i = 0; i < m_statistics.size(); ++i) {
             const Statistics& s = m_statistics[i];
             out << " | " << NAMES[i] << " calls=" << s.cpu_count << " cpu_ms=" << (s.cpu_count ? s.cpu_ms / s.cpu_count : 0.0);
@@ -85,21 +93,32 @@ private:
             else
                 out << " gpu_ms=NA gpu_samples=0";
         }
-        out << " bounds_receiver_calls=" << m_accelerated_calls << " dropped=" << m_dropped;
+        out << " bounds_receiver_calls=" << m_accelerated_calls << " dropped=" << m_dropped << " | cache_hits=" << m_update_reasons[0]
+            << " redraw_invalid=" << m_update_reasons[1] << " redraw_revision=" << m_update_reasons[2]
+            << " redraw_light=" << m_update_reasons[3] << " redraw_projection=" << m_update_reasons[4]
+            << " redraw_program=" << m_update_reasons[5];
+        if (m_primitive_samples)
+            out << " depth_primitives=" << static_cast<double>(m_depth_primitives) / m_primitive_samples;
+        else
+            out << " depth_primitives=NA";
+        out << " primitive_samples=" << m_primitive_samples << " model_budget_calls=" << m_model_budget_calls;
         message(out.str());
-        m_statistics        = {};
-        m_interval_frames   = 0;
-        m_dropped           = 0;
-        m_accelerated_calls = 0;
-        m_report_time       = Clock::now();
+        m_model_budget_calls = 0;
+        m_statistics         = {};
+        m_update_reasons     = {};
+        m_depth_primitives   = 0;
+        m_primitive_samples  = 0;
+        m_interval_frames    = 0;
+        m_dropped            = 0;
+        m_accelerated_calls  = 0;
+        m_report_time        = Clock::now();
     }
 
     bool create_program()
     {
         if (m_program != 0)
             return true;
-        // The reduction pass draws an attribute-free triangle, never GLModel. Its program is owned here,
-        // so it does not require a host shader-manager entry or a new resource-loader dependency.
+        // Attribute-free reduction triangle; this program does not draw host GLModel geometry.
         static const char* VERTEX   = R"(#version 140
 void main() {
     gl_Position = vec4(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0, 0.0, 1.0);
@@ -144,7 +163,6 @@ void main() {
             error = max(error, child[i].w + center_error + slope_error);
         }
     }
-    // Round outward at every level. This is an error bound, not an averaged visibility or blurred depth.
     depth_plane = vec4(plane, error + 4e-7);
 })";
         GLuint             shaders[2]{glCreateShader(GL_VERTEX_SHADER), glCreateShader(GL_FRAGMENT_SHADER)};
@@ -195,6 +213,8 @@ public:
         , m_hard(option_is("ORCA_PCSS_FILTER", "hard"))
         , m_plate_only(option_is("ORCA_PCSS_RECEIVERS", "plate"))
         , m_no_receivers(option_is("ORCA_PCSS_RECEIVERS", "none"))
+        , m_reference_model(option_is("ORCA_PCSS_MODEL_QUALITY", "reference"))
+        , m_profile_geometry(option_is("ORCA_PCSS_PROFILE_GEOMETRY", "1"))
         , m_profile(option_is("ORCA_PCSS_PROFILE", "1"))
     {
         if (m_profile) {
@@ -210,11 +230,30 @@ public:
     PCSSShadowAcceleration(const PCSSShadowAcceleration&)            = delete;
     PCSSShadowAcceleration& operator=(const PCSSShadowAcceleration&) = delete;
 
+    bool     reference_model_quality() const { return m_reference_model; }
     bool     hard_shadows() const { return m_hard; }
     bool     receives(bool plate) const { return !m_no_receivers && (!m_plate_only || plate); }
     bool     bounds_ready() const { return m_valid && !m_disable_bounds && !m_hard; }
     unsigned texture() const { return m_texture; }
     unsigned levels() const { return m_levels; }
+
+    void record_model_budget(bool applied)
+    {
+        if (m_profile && applied)
+            ++m_model_budget_calls;
+    }
+
+    void record_update(unsigned reason, bool vertex_clip)
+    {
+        if (!m_profile)
+            return;
+        m_vertex_clip = vertex_clip;
+        if (reason == pcss::CACHE_HIT)
+            ++m_update_reasons[0];
+        for (unsigned i = 0; i < 5; ++i)
+            if ((reason & (1u << i)) != 0)
+                ++m_update_reasons[i + 1];
+    }
 
     bool needs_bounds(unsigned resolution, std::uint64_t generation) const
     {
@@ -316,13 +355,21 @@ public:
         m_valid      = !m_failed;
     }
 
-    void frame(unsigned resolution, unsigned blockers, unsigned filters)
+    void frame(unsigned resolution,
+               unsigned blockers,
+               unsigned filters,
+               unsigned model_blockers   = 0,
+               unsigned model_filters    = 0,
+               bool     bounds_requested = true)
     {
         if (!m_profile)
             return;
-        m_map_size      = resolution;
-        m_blocker_count = blockers;
-        m_filter_count  = filters;
+        m_map_size         = resolution;
+        m_blocker_count    = blockers;
+        m_filter_count     = filters;
+        m_model_blockers   = model_blockers;
+        m_model_filters    = model_filters;
+        m_bounds_requested = bounds_requested;
         ++m_frame;
         ++m_interval_frames;
         for (Ticket& ticket : m_tickets) {
@@ -331,7 +378,12 @@ public:
             GLint ready = GL_FALSE;
             glGetQueryObjectiv(ticket.queries[1], GL_QUERY_RESULT_AVAILABLE, &ready);
             if (ready != GL_TRUE)
-                continue; // Never wait, spin, or overwrite a query still in flight.
+                continue;
+            if (ticket.owns_primitives) {
+                glGetQueryObjectiv(ticket.primitives, GL_QUERY_RESULT_AVAILABLE, &ready);
+                if (ready != GL_TRUE)
+                    continue;
+            }
             GLuint64 start = 0, end = 0;
             glGetQueryObjectui64v(ticket.queries[0], GL_QUERY_RESULT, &start);
             glGetQueryObjectui64v(ticket.queries[1], GL_QUERY_RESULT, &end);
@@ -340,7 +392,14 @@ public:
                 s.gpu_ms += static_cast<double>(end - start) * 1e-6;
                 ++s.gpu_count;
             }
-            ticket.state = 0;
+            if (ticket.owns_primitives) {
+                GLuint64 count = 0;
+                glGetQueryObjectui64v(ticket.primitives, GL_QUERY_RESULT, &count);
+                m_depth_primitives += count;
+                ++m_primitive_samples;
+            }
+            ticket.state           = 0;
+            ticket.owns_primitives = false;
         }
         if (Clock::now() - m_report_time >= std::chrono::seconds(2))
             report();
@@ -366,14 +425,25 @@ public:
             Ticket& ticket = m_tickets[i];
             if (ticket.state != 0)
                 continue;
-            ticket.stage = stage;
-            ticket.state = 1;
-            ticket.frame = m_frame;
-            ticket.start = Clock::now();
+            ticket.stage           = stage;
+            ticket.state           = 1;
+            ticket.frame           = m_frame;
+            ticket.start           = Clock::now();
+            ticket.owns_primitives = false;
             if (m_timer_supported) {
                 if (ticket.queries[0] == 0)
                     glGenQueries(2, ticket.queries);
                 glQueryCounter(ticket.queries[0], GL_TIMESTAMP);
+                if (m_profile_geometry && stage == Stage::Depth) {
+                    GLint current = 0;
+                    glGetQueryiv(GL_PRIMITIVES_GENERATED, GL_CURRENT_QUERY, &current);
+                    if (current == 0) { // Never interrupt a query owned by the host or another scope.
+                        if (ticket.primitives == 0)
+                            glGenQueries(1, &ticket.primitives);
+                        glBeginQuery(GL_PRIMITIVES_GENERATED, ticket.primitives);
+                        ticket.owns_primitives = true;
+                    }
+                }
             }
             return static_cast<int>(i);
         }
@@ -396,6 +466,8 @@ public:
             return;
         Ticket&     ticket = m_tickets[static_cast<unsigned>(index)];
         Statistics& s      = m_statistics[static_cast<unsigned>(ticket.stage)];
+        if (ticket.owns_primitives)
+            glEndQuery(GL_PRIMITIVES_GENERATED);
         if (m_timer_supported)
             glQueryCounter(ticket.queries[1], GL_TIMESTAMP);
         s.cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - ticket.start).count();
@@ -412,9 +484,12 @@ public:
             glDeleteFramebuffers(1, &m_framebuffer);
         if (m_program != 0)
             glDeleteProgram(m_program);
-        for (Ticket& ticket : m_tickets)
+        for (Ticket& ticket : m_tickets) {
             if (ticket.queries[0] != 0)
                 glDeleteQueries(2, ticket.queries);
+            if (ticket.primitives != 0)
+                glDeleteQueries(1, &ticket.primitives);
+        }
         m_texture = m_framebuffer = m_program = 0;
         m_tickets                             = {};
         m_valid                               = false;

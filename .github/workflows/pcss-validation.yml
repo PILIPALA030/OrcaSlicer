@@ -61,6 +61,8 @@ jobs:
           MESA_GL_VERSION_OVERRIDE=3.3 MESA_GLSL_VERSION_OVERRIDE=330 xvfb-run -a ./build-pcss-gl/pcss_gl_tests --core 2>&1 | tee pcss-results/opengl33-core.log
           MESA_GL_VERSION_OVERRIDE=3.3 MESA_GLSL_VERSION_OVERRIDE=330 xvfb-run -a ./build-pcss-gl/pcss_depth_bounds_tests --core --profile 2>&1 | tee pcss-results/depth-bounds33.log
           cp pcss-test-profile.log pcss-results/
+          MESA_GL_VERSION_OVERRIDE=3.3 MESA_GLSL_VERSION_OVERRIDE=330 xvfb-run -a ./build-pcss-gl/pcss_receiver_budget_tests --core 2>&1 | tee pcss-results/receiver-budget33.log
+          cp pcss-budget-profile.log pcss-results/
       - name: Check address and undefined behavior sanitizers
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
