@@ -97,6 +97,37 @@ class IntegrationContracts(unittest.TestCase):
         self.assertLess(common.index('dFdx'), common.index('if (!pcss_enabled'))
         self.assertIn('if (blockers == 0)', common)
 
+    def test_shadow_and_color_share_lod(self):
+        canvas = function(read('GLCanvas3D.cpp'), 'void GLCanvas3D::_prepare_pcss_shadow_map()')
+        self.assertLess(canvas.index('prepare_pcss_lod(camera)'), canvas.index('render_model(!painted)'))
+        self.assertIn('caster.geometry->render(caster.range)', canvas)
+        self.assertIn('geometry.get_bounding_box().transformed(world)', canvas)
+        self.assertIn('m_modelSmall.get() ? 1', canvas)
+        selector = function(read('3DScene.cpp'), 'GUI::GLModel& GLVolume::render_model(')
+        for token in ('allow_lod', 'picking', 'tverts_range', 'is_render_disabled()', 'is_initialized()'):
+            self.assertIn(token, selector)
+        color = function(read('3DScene.cpp'), 'void GLVolume::simple_render(')
+        self.assertIn('render_model()', color)
+        self.assertNotIn('shader->get_name() != "gouraud_pcss"', color)
+        render = function(read('3DScene.cpp'), 'void GLVolumeCollection::render(')
+        self.assertIn('if (shader->get_name() != "gouraud_pcss")', render)
+        self.assertIn('prepare_volume_lod(to_render, camera)', render)
+
+    def test_receiver_hot_loop_avoids_transcendentals(self):
+        common = (ROOT / 'resources/shaders/140/pcss.glsl').read_text(encoding='utf-8')
+        self.assertIn('pcss_blocker_disk[i]', common)
+        self.assertIn('pcss_filter_disk[i]', common)
+        for operation in ('sin(', 'cos(', 'sqrt('):
+            self.assertNotIn(operation, common)
+        self.assertIn('pcss_caster_uv_bounds.xy - guard', common)
+        self.assertIn('pcss_caster_uv_bounds.zw + guard', common)
+        model = (ROOT / 'resources/shaders/140/gouraud.fs').read_text(encoding='utf-8')
+        self.assertLess(model.index('pcss_prepare_receiver('), model.index('discard;'))
+        self.assertLess(model.index('discard;'), model.index('pcss_visibility_prepared('))
+        settings = read('PCSSShadowRenderer.hpp')
+        for token in ('resolution{2048}', 'blocker_samples{16}', 'filter_samples{32}'):
+            self.assertIn(token, settings)
+
     def test_chinese_translation(self):
         source = (ROOT / 'localization/i18n/zh_CN/Snapmaker_Orca_zh_CN.po').read_text(encoding="utf-8")
         self.assertIn('msgid "Enable soft shadows (PCSS)"', source)

@@ -14,7 +14,10 @@ out vec4 pcss_out_color;
 void main()
 {
 #ifdef ENABLE_PCSS
-    float visibility = pcss_visibility(pcss_world_position);
+    PCSSReceiver receiver = pcss_prepare_receiver(pcss_world_position);
+    float visibility = 1.0;
+    if (pcss_main_diffuse > 0.0 || intensity.y > 0.0)
+        visibility = pcss_visibility_prepared(receiver);
     float diffuse = intensity.x - pcss_main_diffuse * (1.0 - visibility);
     pcss_out_color = vec4(vec3(intensity.y * visibility) + uniform_color.rgb * (diffuse + emission_factor), uniform_color.a);
 #else

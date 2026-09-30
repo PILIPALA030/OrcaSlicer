@@ -46,6 +46,7 @@ struct Projection
     std::array<float, 2>  extent{};
     float                 depth_span{0.0f};
     float                 min_caster_depth{0.0f};
+    std::array<float, 4>  caster_uv_bounds{}; // min U/V, max U/V before the rasterization guard band.
 };
 
 inline double dot(const Vec3& a, const Vec3& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
@@ -72,6 +73,22 @@ inline float penumbra_radius_mm(float receiver, float blocker, float depth_span,
     return std::min(std::max(0.0f, (receiver - blocker) * depth_span) * tangent, limit);
 }
 
+// The same Vogel distribution as the shader reference, evaluated only when the sample count changes.
+// Flat storage is intentional: glUniform2fv consumes tightly packed scalar pairs.
+inline std::array<float, 128> make_disk_samples(unsigned count)
+{
+    std::array<float, 128> samples{};
+    if (count == 0 || count > 64)
+        return samples;
+    for (unsigned i = 0; i < count; ++i) {
+        const float radius = std::sqrt((static_cast<float>(i) + 0.5f) / static_cast<float>(count));
+        const float angle  = static_cast<float>(i) * 2.399963229728653f;
+        samples[2 * i]     = radius * std::cos(angle);
+        samples[2 * i + 1] = radius * std::sin(angle);
+    }
+    return samples;
+}
+
 // Fit both domains, not the main camera frustum: offscreen geometry can cast a visible shadow.
 inline bool fit_projection(
     const Bounds& casters, const Bounds& receivers, Vec3 to_light, float max_radius_mm, unsigned resolution, Projection& result)
@@ -85,6 +102,7 @@ inline bool fit_projection(
     const Vec3 up = cross(to_light, right);
     const Vec3 forward{-to_light[0], -to_light[1], -to_light[2]};
     Bounds     light_bounds;
+    Bounds     caster_light_bounds;
     double     caster_near = std::numeric_limits<double>::infinity();
     for (const Bounds* box : {&casters, &receivers}) {
         for (unsigned corner = 0; corner < 8; ++corner) {
@@ -93,8 +111,10 @@ inline bool fit_projection(
                 p[axis] = (corner & (1u << axis)) ? box->max[axis] : box->min[axis];
             const Vec3 light{dot(right, p), dot(up, p), dot(forward, p)};
             light_bounds.merge(light);
-            if (box == &casters)
+            if (box == &casters) {
                 caster_near = std::min(caster_near, light[2]);
+                caster_light_bounds.merge(light);
+            }
         }
     }
     if (!light_bounds.valid())
@@ -120,6 +140,11 @@ inline bool fit_projection(
         }
     }
     next.matrix[15] = 1.0f;
+    for (unsigned axis = 0; axis < 2; ++axis) {
+        const double span               = light_bounds.max[axis] - light_bounds.min[axis];
+        next.caster_uv_bounds[axis]     = static_cast<float>((caster_light_bounds.min[axis] - light_bounds.min[axis]) / span);
+        next.caster_uv_bounds[axis + 2] = static_cast<float>((caster_light_bounds.max[axis] - light_bounds.min[axis]) / span);
+    }
     for (float v : next.matrix)
         if (!std::isfinite(v))
             return false;

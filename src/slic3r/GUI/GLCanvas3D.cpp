@@ -8602,19 +8602,43 @@ void GLCanvas3D::_prepare_pcss_shadow_map()
         }
         return;
     }
-    std::vector<GLVolume*> casters;
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    m_volumes.prepare_pcss_lod(camera);
+    struct CasterDraw
+    {
+        GLModel*                  geometry;
+        Transform3d               world;
+        std::pair<size_t, size_t> range;
+    };
+    std::vector<CasterDraw> casters;
+    casters.reserve(m_volumes.volumes.size());
+    const ModelObjectPtrs& objects = wxGetApp().model().objects;
     for (GLVolume* volume : m_volumes.volumes) {
         if (volume == nullptr || !volume->is_active || !volume->visible || volume->is_modifier || volume->is_wipe_tower ||
             volume->is_extrusion_path || volume->volume_idx() < 0 || volume->force_transparent || volume->color.is_transparent() ||
             !volume->model.is_initialized())
             continue;
-        casters.push_back(volume);
+        bool painted = false;
+        if (volume->printable && volume->object_idx() >= 0 && static_cast<size_t>(volume->object_idx()) < objects.size()) {
+            const auto& object_volumes = objects[volume->object_idx()]->volumes;
+            if (static_cast<size_t>(volume->volume_idx()) < object_volumes.size())
+                painted = !object_volumes[volume->volume_idx()]->mmu_segmentation_facets.empty();
+        }
+        GLModel&          geometry   = volume->render_model(!painted);
+        const bool        simplified = &geometry != &volume->model;
+        const size_t      count      = geometry.indices_count();
+        const size_t      first      = simplified ? 0 : std::min(count, volume->tverts_range.first);
+        const size_t      last       = simplified ? count : std::min(count, volume->tverts_range.second);
         const Transform3d world = volume->world_matrix();
+        casters.push_back({&geometry, world, {first, last}});
         merge_box(input.casters, volume->bounding_box().transformed(world));
+        // Simplification permits a small bounds tolerance; include the actual chosen geometry too.
+        merge_box(input.casters, geometry.get_bounding_box().transformed(world));
         signature.add(volume->geometry_id.first);
         signature.add(volume->geometry_id.second);
-        signature.add(volume->model.vertices_count());
-        signature.add(volume->model.indices_count());
+        signature.add(&geometry == volume->m_modelSmall.get() ? 1 : (&geometry == volume->m_modelMiddle.get() ? 2 : 0));
+        signature.add(geometry.vertices_count());
+        signature.add(geometry.indices_count());
         signature.add(volume->tverts_range.first);
         signature.add(volume->tverts_range.second);
         for (int i = 0; i < 16; ++i)
@@ -8624,7 +8648,6 @@ void GLCanvas3D::_prepare_pcss_shadow_map()
     input.receivers = input.casters;
     merge_box(input.receivers, wxGetApp().plater()->get_partplate_list().get_bounding_box());
 
-    const Camera& camera = wxGetApp().plater()->get_camera();
     // Gouraud's main diffuse light is defined in eye space. Translation must not affect its direction.
     const Matrix3d rotation             = camera.get_view_matrix().matrix().block<3, 3>(0, 0);
     const Vec3d    to_light             = rotation.transpose() * Vec3d(-0.4574957, 0.4574957, 0.7624929);
@@ -8645,13 +8668,10 @@ void GLCanvas3D::_prepare_pcss_shadow_map()
     m_pcss_frame_active = m_pcss_shadows.update(input, depth_shader->get_id(), [&]() {
         depth_shader->set_uniform("clipping_plane", clip);
         depth_shader->set_uniform("z_range", z_range);
-        for (GLVolume* volume : casters) {
-            depth_shader->set_uniform("volume_world_matrix", volume->world_matrix());
-            const size_t count = volume->model.indices_count();
-            const size_t first = std::min(count, volume->tverts_range.first);
-            const size_t last  = std::min(count, volume->tverts_range.second);
-            if (first < last)
-                volume->model.render({first, last});
+        for (const CasterDraw& caster : casters) {
+            depth_shader->set_uniform("volume_world_matrix", caster.world);
+            if (caster.range.first < caster.range.second)
+                caster.geometry->render(caster.range);
         }
     });
     if (!m_pcss_frame_active && !m_pcss_shadows.error().empty() && !m_pcss_error_reported) {

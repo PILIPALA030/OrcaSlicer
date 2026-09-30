@@ -113,6 +113,10 @@ bool PCSSShadowRenderer::set_settings(const PCSSSettings& settings)
         return false;
     if (settings.resolution != m_settings.resolution || settings.max_radius_mm != m_settings.max_radius_mm)
         invalidate();
+    if (settings.blocker_samples != m_settings.blocker_samples)
+        m_blocker_disk = pcss::make_disk_samples(settings.blocker_samples);
+    if (settings.filter_samples != m_settings.filter_samples)
+        m_filter_disk = pcss::make_disk_samples(settings.filter_samples);
     m_settings = settings;
     return true;
 }
@@ -127,10 +131,18 @@ bool PCSSShadowRenderer::initialize_gl()
         m_failed = true;
         return false;
     }
-    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_size);
-    glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);
-    const unsigned resolution = std::min(m_settings.resolution, static_cast<unsigned>(std::max(0, max_size)));
-    if (resolution < 256 || units <= static_cast<int>(SHADOW_TEXTURE_UNIT)) {
+    if (m_max_texture_size == 0) {
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_size);
+        glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);
+        if (max_size < 256 || units <= static_cast<int>(SHADOW_TEXTURE_UNIT)) {
+            m_error  = "PCSS depth texture or texture-unit limit is insufficient";
+            m_failed = true;
+            return false;
+        }
+        m_max_texture_size = static_cast<unsigned>(max_size);
+    }
+    const unsigned resolution = std::min(m_settings.resolution, m_max_texture_size);
+    if (resolution < 256) {
         m_error  = "PCSS depth texture or texture-unit limit is insufficient";
         m_failed = true;
         return false;
@@ -194,7 +206,7 @@ void PCSSShadowRenderer::shutdown_gl()
 
 void PCSSShadowRenderer::abandon_lost_context()
 {
-    m_depth_texture = m_framebuffer = m_vertex_array = m_resolution = 0;
+    m_depth_texture = m_framebuffer = m_vertex_array = m_resolution = m_max_texture_size = 0;
     m_ready = m_failed = false;
     m_error.clear();
 }
@@ -217,8 +229,11 @@ bool PCSSShadowRenderer::update(const PCSSFrameInput& input, unsigned depth_prog
         return false;
     }
     if (m_ready && input.revision == m_revision && next.matrix == m_projection.matrix &&
-        next.min_caster_depth == m_projection.min_caster_depth)
+        next.min_caster_depth == m_projection.min_caster_depth) {
+        // Bounds can change without changing the fitted domain. Receiver culling must not use stale bounds.
+        m_projection.caster_uv_bounds = next.caster_uv_bounds;
         return true;
+    }
 
     ShadowGLState state;
     m_ready = false; // Also invalid if the host draw callback throws.
@@ -258,6 +273,9 @@ void PCSSShadowRenderer::set_receiver_uniforms(unsigned program) const
     uniform_int(program, "pcss_depth", SHADOW_TEXTURE_UNIT);
     uniform_int(program, "pcss_blocker_samples", m_settings.blocker_samples);
     uniform_int(program, "pcss_filter_samples", m_settings.filter_samples);
+    glUniform2fv(glGetUniformLocation(program, "pcss_blocker_disk[0]"), m_settings.blocker_samples, m_blocker_disk.data());
+    glUniform2fv(glGetUniformLocation(program, "pcss_filter_disk[0]"), m_settings.filter_samples, m_filter_disk.data());
+    glUniform4fv(glGetUniformLocation(program, "pcss_caster_uv_bounds"), 1, m_projection.caster_uv_bounds.data());
     glUniformMatrix4fv(glGetUniformLocation(program, "pcss_matrix"), 1, GL_FALSE, m_projection.matrix.data());
     glUniform2fv(glGetUniformLocation(program, "pcss_extent"), 1, m_projection.extent.data());
     uniform_float(program, "pcss_depth_span", m_projection.depth_span);

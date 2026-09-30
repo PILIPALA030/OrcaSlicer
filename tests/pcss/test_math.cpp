@@ -43,6 +43,13 @@ int main()
                         v[axis] = (corner & (1u << axis)) ? bounds->max[axis] : bounds->min[axis];
                     const Vec3 clip = project(p, v);
                     check(std::abs(clip[0]) < 1 && std::abs(clip[1]) < 1 && std::abs(clip[2]) < 1, "Corner clipped");
+                    if (bounds == &casters) {
+                        for (unsigned axis = 0; axis < 2; ++axis) {
+                            const double uv = clip[axis] * 0.5 + 0.5;
+                            check(uv >= p.caster_uv_bounds[axis] - 1.0e-6 && uv <= p.caster_uv_bounds[axis + 2] + 1.0e-6,
+                                  "Caster UV bounds conservatively enclose every transformed caster corner");
+                        }
+                    }
                 }
             }
             normalize(light);
@@ -51,6 +58,16 @@ int main()
             check(std::abs((project(p, {0, 0, 0})[2] - project(p, closer)[2]) * 0.5 * p.depth_span - 10) < 1e-4,
                   "Encoded depth difference must restore millimeters");
         }
+        for (unsigned count = 1; count <= 64; ++count) {
+            const auto disk = make_disk_samples(count);
+            for (unsigned i = 0; i < count; ++i) {
+                const float radius2 = disk[2 * i] * disk[2 * i] + disk[2 * i + 1] * disk[2 * i + 1];
+                check(std::abs(radius2 - (static_cast<float>(i) + 0.5f) / count) < 1.0e-5f,
+                      "CPU sample table preserves the Vogel radial distribution");
+            }
+        }
+        check(make_disk_samples(0) == std::array<float, 128>{}, "Empty kernel is safe");
+        check(make_disk_samples(65) == std::array<float, 128>{}, "Oversized kernel is safe");
         Bounds invalid_bounds = casters;
         invalid_bounds.merge({NAN, 0, 0});
         check(!invalid_bounds.valid(), "Nonfinite source points cannot be silently ignored");

@@ -60,13 +60,18 @@ void main()
 {
     vec2 shaded_intensity = intensity;
 #ifdef ENABLE_PCSS
-    // Evaluate derivatives before clipping discards; only shadow this light's direct contribution.
-    float visibility = pcss_visibility(world_pos.xyz);
-    shaded_intensity.x -= pcss_main_diffuse * (1.0 - visibility);
-    shaded_intensity.y *= visibility;
+    PCSSReceiver receiver = pcss_prepare_receiver(world_pos.xyz);
 #endif
     if (any(lessThan(clipping_planes_dots, ZERO)))
         discard;
+#ifdef ENABLE_PCSS
+    // Sampling cannot affect a surface with neither main-light diffuse nor specular contribution.
+    if (pcss_main_diffuse > 0.0 || intensity.y > 0.0) {
+        float visibility = pcss_visibility_prepared(receiver);
+        shaded_intensity.x -= pcss_main_diffuse * (1.0 - visibility);
+        shaded_intensity.y *= visibility;
+    }
+#endif
 
     vec4 color;
 	if (use_color_clip_plane) {

@@ -4,6 +4,7 @@
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -38,6 +39,13 @@ std::string read(const std::string& name)
     std::ifstream file(std::string(PCSS_SHADER_DIRECTORY) + "/" + name);
     if (!file)
         throw std::runtime_error("Cannot read shipping shader " + name);
+    return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+}
+std::string read_reference()
+{
+    std::ifstream file(std::string(PCSS_REFERENCE_DIRECTORY) + "/pcss_before_performance.glsl");
+    if (!file)
+        throw std::runtime_error("Cannot read the fixed pre-optimization test shader");
     return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
 }
 std::string add_common(std::string source, bool fragment, bool environment = false)
@@ -150,14 +158,35 @@ void main() {
 in vec2 uv;
 uniform float receiver_z;
 uniform float receiver_slope;
+uniform vec2 receiver_extent;
 out vec4 color;
 void main() {
-    vec2 world_xy = (uv - 0.5) * vec2(40.0, 4.0);
+    vec2 world_xy = (uv - 0.5) * receiver_extent;
     float visibility = pcss_visibility(vec3(world_xy, receiver_z + world_xy.x * receiver_slope));
     color = vec4(visibility, visibility, visibility, 1.0);
 })",
                                                 true));
         programs.push_back(probe);
+        const GLuint reference = program(R"(#version 140
+out vec2 uv;
+void main() {
+    vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0, (gl_VertexID == 2) ? 3.0 : -1.0);
+    uv = p * 0.5 + 0.5;
+    gl_Position = vec4(p, 0.0, 1.0);
+})",
+                                         std::string("#version 140\n") + read_reference() + R"(
+in vec2 uv;
+uniform float receiver_z;
+uniform float receiver_slope;
+uniform vec2 receiver_extent;
+out vec4 color;
+void main() {
+    vec2 world_xy = (uv - 0.5) * receiver_extent;
+    float visibility = pcss_visibility(vec3(world_xy, receiver_z + world_xy.x * receiver_slope));
+    color = vec4(visibility, visibility, visibility, 1.0);
+})");
+        programs.push_back(reference);
+        GLuint query_probe = probe;
 
         GLuint vao, vbo, ebo, output_fbo, output_texture;
         glGenVertexArrays(1, &vao);
@@ -251,11 +280,12 @@ void main() {
             glDisable(GL_CULL_FACE);
             glDisable(GL_DEPTH_TEST);
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-            glUseProgram(probe);
-            glUniform1f(glGetUniformLocation(probe, "receiver_z"), receiver_z);
-            glUniform1f(glGetUniformLocation(probe, "receiver_slope"), slope);
+            glUseProgram(query_probe);
+            glUniform1f(glGetUniformLocation(query_probe, "receiver_z"), receiver_z);
+            glUniform1f(glGetUniformLocation(query_probe, "receiver_slope"), slope);
+            glUniform2f(glGetUniformLocation(query_probe, "receiver_extent"), 40.0f, 4.0f);
             {
-                PCSSReceiverScope scope(enabled ? &shadow : nullptr, probe);
+                PCSSReceiverScope scope(enabled ? &shadow : nullptr, query_probe);
                 glDrawArrays(GL_TRIANGLES, 0, 3);
             }
             std::vector<float> values(512 * 4);
@@ -271,6 +301,22 @@ void main() {
         auto fractional = [](const std::vector<float>& row) {
             return std::count_if(row.begin(), row.end(), [](float v) { return v > 0.001f && v < 0.999f; });
         };
+        auto compare_reference = [&](const char* message, float height = 0.0f, float slope = 0.0f) {
+            query_probe         = reference;
+            const auto expected = visibility(height, true, slope);
+            query_probe         = probe;
+            const auto actual   = visibility(height, true, slope);
+            double     sum      = 0.0;
+            float      maximum  = 0.0f;
+            for (size_t i = 0; i < actual.size(); ++i) {
+                const float difference = std::abs(actual[i] - expected[i]);
+                sum += difference;
+                maximum = std::max(maximum, difference);
+            }
+            std::cout << "A/B " << message << ": mean=" << sum / actual.size() << " max=" << maximum << '\n';
+            check(sum / actual.size() < 0.005 && maximum <= 2.0f / settings.filter_samples + 1.0e-6f, message);
+        };
+        compare_reference("Wide-kernel receiver matches the pre-optimization shader");
         const auto low = visibility();
         check(low[256] < 0.01f && low.front() > 0.99f, "Blocker center is shadowed and outside is lit");
         check(fractional(low) > 4, "PCSS creates a real partially visible transition");
@@ -280,6 +326,17 @@ void main() {
         upload_plane(40);
         ++input.revision;
         check(shadow.update(input, depth, draw), "Moving geometry updates depth map");
+        compare_reference("Distant blocker and conservative bounds preserve the penumbra");
+        for (const auto counts : {std::array<unsigned, 2>{16, 32}, std::array<unsigned, 2>{13, 27}}) {
+            settings.blocker_samples = counts[0];
+            settings.filter_samples  = counts[1];
+            check(shadow.set_settings(settings), "Kernel size change accepted without a depth redraw");
+            const auto depth_generation = shadow.depth_generation();
+            compare_reference("Changed sample counts use the corresponding CPU disk");
+            check(shadow.depth_generation() == depth_generation, "Receiver sample changes preserve the depth cache");
+        }
+        settings.blocker_samples = settings.filter_samples = 64;
+        check(shadow.set_settings(settings), "Restore quality for existing metric regression tests");
         const auto high = visibility();
         std::cout << "Penumbra fractional pixels, heights 10/40: " << fractional(low) << '/' << fractional(high) << '\n';
         check(fractional(high) > 2 * fractional(low), "Larger blocker-receiver gap increases penumbra");
@@ -323,6 +380,7 @@ void main() {
         check(shadow.set_settings(settings), "Tilted receiver settings");
         ++input.revision;
         check(shadow.update(input, depth, draw), "Tilted surface depth update");
+        compare_reference("Sloped coplanar receiver preserves plane correction", 3.0f, 0.2f);
         const auto coplanar = visibility(3.0f, true, 0.2f);
         check(*std::min_element(coplanar.begin(), coplanar.end()) > 0.95f,
               "Receiver plane correction avoids self-shadowing a sloped plane");
@@ -391,6 +449,55 @@ void main() {
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &binding);
         check(binding == static_cast<GLint>(sentinel), "Receiver scope restores borrowed texture binding");
         glDeleteTextures(1, &sentinel);
+
+        // Optional controlled receiver benchmark, not a GUI FPS claim. Synchronization is test-only.
+        if (std::getenv("ORCA_PCSS_BENCHMARK") != nullptr) {
+            settings = PCSSSettings{}; // Unchanged production resolution and 16/32 sample counts.
+            shadow.set_settings(settings);
+            model_matrix = IDENTITY;
+            upload_plane(40);
+            input.casters   = {{-5, -5, 0}, {5, 5, 40}};
+            input.receivers = {{-150, -150, 0}, {150, 150, 0}};
+            ++input.revision;
+            check(shadow.update(input, depth, draw), "Prepare default-quality benchmark depth map");
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            glBindTexture(GL_TEXTURE_2D, output_texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, 1024, 768, 0, GL_RGBA, GL_FLOAT, nullptr);
+            glBindFramebuffer(GL_FRAMEBUFFER, output_fbo);
+            glViewport(0, 0, 1024, 768);
+            glBindVertexArray(vao);
+            glDisable(GL_SCISSOR_TEST);
+            glDisable(GL_BLEND);
+            glDisable(GL_DEPTH_TEST);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            auto measure = [&](GLuint id, float span_x, float span_y) {
+                glUseProgram(id);
+                glUniform1f(glGetUniformLocation(id, "receiver_z"), 0.0f);
+                glUniform1f(glGetUniformLocation(id, "receiver_slope"), 0.0f);
+                glUniform2f(glGetUniformLocation(id, "receiver_extent"), span_x, span_y);
+                PCSSReceiverScope scope(&shadow, id);
+                for (unsigned i = 0; i < 3; ++i)
+                    glDrawArrays(GL_TRIANGLES, 0, 3);
+                glFinish(); // Intentional only in this opt-in benchmark, never in the shipping renderer.
+                std::array<double, 5> samples{};
+                for (double& sample : samples) {
+                    const auto begin = std::chrono::steady_clock::now();
+                    for (unsigned i = 0; i < 3; ++i)
+                        glDrawArrays(GL_TRIANGLES, 0, 3);
+                    glFinish();
+                    sample = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count() / 3.0;
+                }
+                std::sort(samples.begin(), samples.end());
+                return samples[samples.size() / 2];
+            };
+            for (const auto span : {std::array<float, 2>{300, 220}, std::array<float, 2>{10, 4}}) {
+                const double old_ms = measure(reference, span[0], span[1]);
+                const double new_ms = measure(probe, span[0], span[1]);
+                std::cout << "PCSS benchmark 1024x768 span=" << span[0] << 'x' << span[1] << " old_ms=" << old_ms << " new_ms=" << new_ms
+                          << " ratio=" << old_ms / new_ms << '\n';
+            }
+            no_errors("Receiver benchmark produces no GL errors");
+        }
         shadow.shutdown_gl();
         check(!shadow.is_ready(), "Explicit GL shutdown clears readiness");
         check(shadow.update(input, depth, draw), "Reenable recreates depth resources");

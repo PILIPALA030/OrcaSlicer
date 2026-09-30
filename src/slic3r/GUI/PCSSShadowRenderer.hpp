@@ -31,17 +31,20 @@ struct PCSSFrameInput
 // All methods touching GL require that owner's context current on the UI rendering thread.
 class PCSSShadowRenderer
 {
-    unsigned         m_framebuffer{0};
-    unsigned         m_depth_texture{0};
-    unsigned         m_vertex_array{0};
-    unsigned         m_resolution{0};
-    bool             m_ready{false};
-    bool             m_failed{false};
-    std::uint64_t    m_revision{0};
-    std::uint64_t    m_depth_generation{0};
-    PCSSSettings     m_settings;
-    pcss::Projection m_projection;
-    std::string      m_error;
+    unsigned               m_framebuffer{0};
+    unsigned               m_depth_texture{0};
+    unsigned               m_vertex_array{0};
+    unsigned               m_resolution{0};
+    unsigned               m_max_texture_size{0}; // Capability cache belongs to this GL context.
+    bool                   m_ready{false};
+    bool                   m_failed{false};
+    std::uint64_t          m_revision{0};
+    std::uint64_t          m_depth_generation{0};
+    PCSSSettings           m_settings;
+    std::array<float, 128> m_blocker_disk = pcss::make_disk_samples(16);
+    std::array<float, 128> m_filter_disk  = pcss::make_disk_samples(32);
+    pcss::Projection       m_projection;
+    std::string            m_error;
 
     bool initialize_gl();
     friend class PCSSReceiverScope;

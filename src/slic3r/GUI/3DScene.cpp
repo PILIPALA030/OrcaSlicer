@@ -633,6 +633,17 @@ void GLVolume::set_range(double min_z, double max_z)
     }
 }
 
+GUI::GLModel& GLVolume::render_model(bool allow_lod)
+{
+    if (!allow_lod || picking || tverts_range != std::make_pair<size_t, size_t>(0, size_t(-1)))
+        return model;
+    if (m_curLodLevel == LODLevel::Small && m_modelSmall && !m_modelSmall->is_render_disabled() && m_modelSmall->is_initialized())
+        return *m_modelSmall;
+    if (m_curLodLevel == LODLevel::Middle && m_modelMiddle && !m_modelMiddle->is_render_disabled() && m_modelMiddle->is_initialized())
+        return *m_modelMiddle;
+    return model;
+}
+
 void GLVolume::render()
 {
     if (!is_active)
@@ -741,17 +752,18 @@ void GLVolume::simple_render(GLShaderProgram*        shader,
         // Select LOD model based on current LOD level
         static int lodRenderLogCounter = 0;
         lodRenderLogCounter++;
-        // Shadow receivers must match the depth mesh; camera-dependent LOD would cause false self-occlusion.
-        if (!picking && (shader == nullptr || shader->get_name() != "gouraud_pcss")) {
+        // PCSS depth and color now use the same LOD decision, prepared before either pass.
+        GUI::GLModel& geometry = render_model();
+        if (!picking) {
             // DEBUG: color-code LOD levels for visual verification
             // GREEN = HIGH (original), BLUE = MIDDLE, RED = SMALL
-            if (m_curLodLevel == LODLevel::Small && m_modelSmall && !m_modelSmall->is_render_disabled() && m_modelSmall->is_initialized()) {
+            if (&geometry == m_modelSmall.get()) {
                 if (lodRenderLogCounter % 180 == 0)
                     BOOST_LOG_TRIVIAL(debug) << "LOD: SMALL '" << name << "'";
                 m_modelSmall->set_color(render_color);
                 //m_modelSmall->set_color(ColorRGBA::GREEN());
                 m_modelSmall->render();
-            } else if (m_curLodLevel == LODLevel::Middle && m_modelMiddle && !m_modelMiddle->is_render_disabled() && m_modelMiddle->is_initialized()) {
+            } else if (&geometry == m_modelMiddle.get()) {
                 if (lodRenderLogCounter % 180 == 0)
                     BOOST_LOG_TRIVIAL(debug) << "LOD: MID '" << name << "'";
                 m_modelMiddle->set_color(render_color);
@@ -1125,6 +1137,46 @@ int GLVolumeCollection::get_selection_support_threshold_angle(bool& enable_suppo
     return support_threshold_angle;
 }
 
+namespace {
+
+void prepare_volume_lod(const GLVolumeWithIdAndZList& to_render, const GUI::Camera& camera)
+{
+    GLVolume::s_curZoom           = camera.get_zoom();
+    GLVolume::s_curViewProjMatrix = (camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix()).eval();
+    GLVolume::s_curViewport       = camera.get_viewport();
+    const float cur_zoom          = GLVolume::s_curZoom;
+    const bool  should_evaluate   = std::abs(cur_zoom - GLVolume::s_lastCameraZoomValue) > ZOOM_THRESHOLD;
+    if (should_evaluate)
+        GLVolume::s_lastCameraZoomValue = cur_zoom;
+    for (const GLVolumeWithIdAndZ& entry : to_render) {
+        GLVolume* volume = entry.first;
+        if (volume == nullptr)
+            continue;
+        // Main-thread handoff must happen before the depth snapshot, never between depth and color.
+        volume->promote_ready_lod_models();
+        if (!volume->picking && (should_evaluate || ++volume->m_lodUpdateIndex >= LOD_UPDATE_FREQUENCY)) {
+            volume->m_lodUpdateIndex    = 0;
+            const LODLevel previous_lod = volume->m_curLodLevel;
+            volume->m_curLodLevel       = CalcVolumeBoxInScreenBiggerThanThreshold(volume->transformed_bounding_box(),
+                                                                                   GLVolume::s_curViewProjMatrix, GLVolume::s_curViewport[2],
+                                                                                   GLVolume::s_curViewport[3]);
+            if (previous_lod != volume->m_curLodLevel) {
+                BOOST_LOG_TRIVIAL(debug) << "LOD level changed: " << static_cast<int>(previous_lod) << " -> "
+                                         << static_cast<int>(volume->m_curLodLevel) << " (zoom=" << cur_zoom << ", name=" << volume->name
+                                         << ")";
+            }
+        }
+    }
+}
+
+} // namespace
+
+void GLVolumeCollection::prepare_pcss_lod(const GUI::Camera& camera) const
+{
+    // Include offscreen casters: they can cast visible shadows even when the color pass culls them.
+    prepare_volume_lod(volumes_to_render(volumes, ERenderType::All, camera.get_view_matrix(), {}), camera);
+}
+
 void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
                                 bool                                 disable_cullface,
                                 const GUI::Camera&                   camera,
@@ -1153,38 +1205,9 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
     if (disable_cullface)
         glsafe(::glDisable(GL_CULL_FACE));
 
-    // Set static camera state for LOD evaluation in GLVolume rendering
-    GLVolume::s_curZoom = camera.get_zoom();
-    GLVolume::s_curViewProjMatrix = (projection_matrix.matrix() * view_matrix.matrix()).eval();
-    GLVolume::s_curViewport = camera.get_viewport();
-
-    // Evaluate LOD level for each volume once per frame
-    float curZoom = GLVolume::s_curZoom;
-    bool  shouldEvaluate = (std::abs(curZoom - GLVolume::s_lastCameraZoomValue) > ZOOM_THRESHOLD);
-    if (shouldEvaluate) 
-    {
-        GLVolume::s_lastCameraZoomValue = curZoom;
-    }
-    for (GLVolumeWithIdAndZ& volume : to_render)
-    {
-        GLVolume* v = volume.first;
-        // Hand over LOD models whose background initialization finished.
-        // Must run every frame, on the main thread only.
-        v->promote_ready_lod_models();
-        if (!v->picking && (shouldEvaluate || ++v->m_lodUpdateIndex >= LOD_UPDATE_FREQUENCY))
-        {
-            v->m_lodUpdateIndex = 0;
-            LODLevel prevLod = v->m_curLodLevel;
-            v->m_curLodLevel = CalcVolumeBoxInScreenBiggerThanThreshold(
-                v->transformed_bounding_box(), GLVolume::s_curViewProjMatrix,
-                GLVolume::s_curViewport[2], GLVolume::s_curViewport[3]);
-            if (prevLod != v->m_curLodLevel) {
-                BOOST_LOG_TRIVIAL(debug) << "LOD level changed: " << static_cast<int>(prevLod)
-                                           << " -> " << static_cast<int>(v->m_curLodLevel)
-                                           << " (zoom=" << curZoom << ", name=" << v->name << ")";
-            }
-        }
-    }
+    // The PCSS host already froze and promoted these meshes before drawing its depth map.
+    if (shader->get_name() != "gouraud_pcss")
+        prepare_volume_lod(to_render, camera);
 
     for (GLVolumeWithIdAndZ& volume : to_render) {
         //CPU Frustum culling

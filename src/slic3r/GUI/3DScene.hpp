@@ -367,6 +367,10 @@ public:
     // initialization has completed (see SimplifyMesh). Call once per frame.
     void promote_ready_lod_models();
 
+    // Does not promote or evaluate LOD. Partial index ranges and picking always use the base mesh.
+    // Callers that draw painted facets pass allow_lod=false for the matching depth mesh.
+    GUI::GLModel& render_model(bool allow_lod = true);
+
     void                set_bounding_boxes_as_dirty();
 
     bool                is_sla_support() const;
@@ -502,6 +506,9 @@ public:
     GLVolume* new_nontoolpath_volume(const ColorRGBA& rgba);
 
     int get_selection_support_threshold_angle(bool&) const;
+    // Freeze geometry selection before the PCSS depth pass. Its subsequent color pass must not reevaluate LOD.
+    void prepare_pcss_lod(const GUI::Camera& camera) const;
+
     // Render the volumes by OpenGL.
     void render(ERenderType                           type,
                  bool                                  disable_cullface,
