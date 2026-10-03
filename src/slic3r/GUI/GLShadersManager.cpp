@@ -82,6 +82,14 @@ std::pair<bool, std::string> GLShadersManager::init()
         , { "ENABLE_ENVIRONMENT_MAP"sv }
 #endif // ENABLE_ENVIRONMENT_MAP
         );
+    // used to render the low-resolution depth map for PCSS shadows
+    {
+        const size_t errorLength = error.size();
+        if (!append_shader("shadow_depth", { prefix + "shadow_depth.vs", prefix + "shadow_depth.fs" })) {
+            error.erase(errorLength);
+            BOOST_LOG_TRIVIAL(warning) << "PCSS shadow shader unavailable";
+        }
+    }
     // used to render variable layers heights in 3d editor
     valid &= append_shader("variable_layer_height", { prefix + "variable_layer_height.vs", prefix + "variable_layer_height.fs" });
     // used to render highlight contour around selected triangles inside the multi-material gizmo

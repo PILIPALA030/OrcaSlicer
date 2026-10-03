@@ -467,7 +467,7 @@ void Bed3D::render_axes()
 void Bed3D::render_system(GLCanvas3D& canvas, const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom)
 {
     if (!bottom)
-        render_model(view_matrix, projection_matrix);
+        render_model(canvas, view_matrix, projection_matrix);
 
     /*if (show_texture)
         render_texture(bottom, canvas);*/
@@ -662,7 +662,7 @@ void Bed3D::update_bed_triangles()
     const_cast<BoundingBoxf3&>(m_extended_bounding_box) = calc_extended_bounding_box();
 }
 
-void Bed3D::render_model(const Transform3d& view_matrix, const Transform3d& projection_matrix)
+void Bed3D::render_model(GLCanvas3D& canvas, const Transform3d& view_matrix, const Transform3d& projection_matrix)
 {
     if (m_model_filename.empty())
         return;
@@ -686,7 +686,10 @@ void Bed3D::render_model(const Transform3d& view_matrix, const Transform3d& proj
             shader->set_uniform("projection_matrix", projection_matrix);
             const Matrix3d view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) * model_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
             shader->set_uniform("view_normal_matrix", view_normal_matrix);
+            canvas.BindShadowUniforms(shader);
+            shader->set_uniform("shadow_world_matrix", model_matrix);
             m_model.render();
+            shader->set_uniform("shadow_enabled", false);
             shader->stop_using();
         }
     }
@@ -695,18 +698,18 @@ void Bed3D::render_model(const Transform3d& view_matrix, const Transform3d& proj
 void Bed3D::render_custom(GLCanvas3D& canvas, const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom)
 {
     if (m_model_filename.empty()) {
-        render_default(bottom, view_matrix, projection_matrix);
+        render_default(canvas, bottom, view_matrix, projection_matrix);
         return;
     }
 
     if (!bottom)
-        render_model(view_matrix, projection_matrix);
+        render_model(canvas, view_matrix, projection_matrix);
 
     /*if (show_texture)
         render_texture(bottom, canvas);*/
 }
 
-void Bed3D::render_default(bool bottom, const Transform3d& view_matrix, const Transform3d& projection_matrix)
+void Bed3D::render_default(GLCanvas3D& canvas, bool bottom, const Transform3d& view_matrix, const Transform3d& projection_matrix)
 {
     // m_texture.reset();
 
@@ -718,6 +721,8 @@ void Bed3D::render_default(bool bottom, const Transform3d& view_matrix, const Tr
 
         shader->set_uniform("view_model_matrix", view_matrix);
         shader->set_uniform("projection_matrix", projection_matrix);
+        canvas.BindShadowUniforms(shader);
+        shader->set_uniform("shadow_world_matrix", Transform3d::Identity());
 
         glsafe(::glEnable(GL_DEPTH_TEST));
         glsafe(::glEnable(GL_BLEND));
@@ -741,6 +746,8 @@ void Bed3D::render_default(bool bottom, const Transform3d& view_matrix, const Tr
         }*/
 
         glsafe(::glDisable(GL_BLEND));
+
+        shader->set_uniform("shadow_enabled", false);
 
         shader->stop_using();
     }

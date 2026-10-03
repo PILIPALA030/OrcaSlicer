@@ -754,6 +754,18 @@ public:
     CameraTarget m_camera_target;
 #endif // ENABLE_SHOW_CAMERA_TARGET
     GLModel m_background;
+
+    struct ShadowMapResources
+    {
+        unsigned int framebuffer{ 0 };
+        unsigned int depthTexture{ 0 };
+        unsigned int colorTexture{ 0 };
+        unsigned int size{ 0 };
+        Transform3d lightViewProjection{ Transform3d::Identity() };
+        bool valid{ false };
+    };
+
+    ShadowMapResources m_shadowMap;
 public:
     explicit GLCanvas3D(wxGLCanvas* canvas, Bed3D &bed);
     ~GLCanvas3D();
@@ -1204,6 +1216,9 @@ public:
 
     bool make_current_for_postinit();
 
+    /** @brief Binds the current PCSS shadow map parameters to a shader. */
+    void BindShadowUniforms(GLShaderProgram* shader) const;
+
 private:
     bool _is_shown_on_screen() const;
 
@@ -1255,6 +1270,13 @@ private:
 
     /** @brief Releases all selection highlight framebuffer resources. */
     void ReleaseSelectionHighlightResources();
+
+    /** @brief Ensures that the fixed-size PCSS framebuffer and textures exist. */
+    bool EnsureShadowMapResources(unsigned int size);
+    /** @brief Releases PCSS framebuffer and texture resources. */
+    void ReleaseShadowMapResources();
+    /** @brief Renders opaque model geometry into the current light-space depth map. */
+    bool RenderShadowMap(const Camera& camera);
 
     void _switch_toolbars_icon_filename();
     bool _init_toolbars();

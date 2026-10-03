@@ -29,6 +29,7 @@ uniform mat4 view_model_matrix;
 uniform mat4 projection_matrix;
 uniform mat3 view_normal_matrix;
 uniform mat4 volume_world_matrix;
+uniform mat4 shadow_matrix;
 uniform SlopeDetection slope;
 
 // Clipping plane, x = min z, y = max z. Used by the FFF and SLA previews to clip with a top / bottom plane.
@@ -50,6 +51,8 @@ varying float color_clip_plane_dot;
 varying vec4 world_pos;
 varying float world_normal_z;
 varying vec3 eye_normal;
+varying vec4 shadow_position;
+varying float top_diffuse;
 
 void main()
 {
@@ -60,7 +63,8 @@ void main()
 	// Since these two are normalized the cosine is the dot product. We also need to clamp the result to the [0,1] range.
 	float NdotL = max(dot(eye_normal, LIGHT_TOP_DIR), 0.0);
 
-	intensity.x = INTENSITY_AMBIENT + NdotL * LIGHT_TOP_DIFFUSE;
+	top_diffuse = NdotL * LIGHT_TOP_DIFFUSE;
+	intensity.x = INTENSITY_AMBIENT + top_diffuse;
     vec4 position = view_model_matrix * vec4(v_position, 1.0);
     intensity.y = LIGHT_TOP_SPECULAR * pow(max(dot(-normalize(position.xyz), reflect(-LIGHT_TOP_DIR, eye_normal)), 0.0), LIGHT_TOP_SHININESS);
 
@@ -70,6 +74,7 @@ void main()
 
     // Point in homogenous coordinates.
     world_pos = volume_world_matrix * vec4(v_position, 1.0);
+    shadow_position = shadow_matrix * world_pos;
 
     // z component of normal vector in world coordinate used for slope shading
     world_normal_z = slope.actived ? (normalize(slope.volume_world_normal_matrix * v_normal)).z : 0.0;

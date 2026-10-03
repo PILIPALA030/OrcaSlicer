@@ -17,12 +17,16 @@ const vec3 LIGHT_FRONT_DIR = vec3(0.6985074, 0.1397015, 0.6985074);
 uniform mat4 view_model_matrix;
 uniform mat4 projection_matrix;
 uniform mat3 view_normal_matrix;
+uniform mat4 shadow_matrix;
+uniform mat4 shadow_world_matrix;
 
 attribute vec3 v_position;
 attribute vec3 v_normal;
 
 // x = tainted, y = specular;
 varying vec2 intensity;
+varying vec4 shadow_position;
+varying float top_diffuse;
 
 void main()
 {
@@ -33,8 +37,10 @@ void main()
     // Since these two are normalized the cosine is the dot product. We also need to clamp the result to the [0,1] range.
     float NdotL = max(dot(normal, LIGHT_TOP_DIR), 0.0);
 
-    intensity.x = INTENSITY_AMBIENT + NdotL * LIGHT_TOP_DIFFUSE;
+    top_diffuse = NdotL * LIGHT_TOP_DIFFUSE;
+    intensity.x = INTENSITY_AMBIENT + top_diffuse;
     vec4 position = view_model_matrix * vec4(v_position, 1.0);
+    shadow_position = shadow_matrix * shadow_world_matrix * vec4(v_position, 1.0);
     intensity.y = LIGHT_TOP_SPECULAR * pow(max(dot(-normalize(position.xyz), reflect(-LIGHT_TOP_DIR, normal)), 0.0), LIGHT_TOP_SHININESS);
 
     // Perform the same lighting calculation for the 2nd light source (no specular applied).

@@ -33,6 +33,12 @@ uniform bool use_color_clip_plane;
 uniform vec4 uniform_color_clip_plane_1;
 uniform vec4 uniform_color_clip_plane_2;
 uniform SlopeDetection slope;
+uniform sampler2D shadow_map;
+uniform mat4 shadow_matrix;
+uniform bool shadow_enabled;
+uniform vec2 shadow_map_texel_size;
+uniform float shadow_light_size;
+uniform float shadow_bias;
 
 #ifdef ENABLE_ENVIRONMENT_MAP
     uniform sampler2D environment_tex;
@@ -50,8 +56,57 @@ in vec2 intensity;
 in vec4 world_pos;
 in float world_normal_z;
 in vec3 eye_normal;
+in vec4 shadow_position;
+in float top_diffuse;
 
 out vec4 out_color;
+
+vec2 shadow_poisson_offset(int index)
+{
+    if (index == 0) return vec2(-0.94201624, -0.39906216);
+    if (index == 1) return vec2(0.94558609, -0.76890725);
+    if (index == 2) return vec2(-0.09418410, -0.92938870);
+    if (index == 3) return vec2(0.34495938, 0.29387760);
+    if (index == 4) return vec2(-0.91588581, 0.45771432);
+    if (index == 5) return vec2(-0.81544232, -0.87912464);
+    if (index == 6) return vec2(-0.38277543, 0.27676845);
+    return vec2(0.97484398, 0.75648379);
+}
+
+float pcss_shadow_factor()
+{
+    if (shadow_position.w <= 0.0)
+        return 1.0;
+    vec3 projected = shadow_position.xyz / shadow_position.w;
+    vec2 uv = projected.xy * 0.5 + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))
+        return 1.0;
+
+    float receiverDepth = projected.z * 0.5 + 0.5;
+    float searchRadius = shadow_light_size * (1.0 + receiverDepth * 2.0) * 32.0;
+    float blockerDepth = 0.0;
+    float blockerCount = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        vec2 sampleUv = uv + shadow_poisson_offset(i) * shadow_map_texel_size * searchRadius;
+        float sampleDepth = texture(shadow_map, sampleUv).r;
+        if (sampleDepth + shadow_bias < receiverDepth) {
+            blockerDepth += sampleDepth;
+            blockerCount += 1.0;
+        }
+    }
+    if (blockerCount < 0.5)
+        return 1.0;
+
+    blockerDepth /= blockerCount;
+    float penumbra = (receiverDepth - blockerDepth) / max(blockerDepth, 0.05);
+    float filterRadius = clamp(penumbra * shadow_light_size * 32.0, 1.0, 6.0);
+    float lit = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        vec2 sampleUv = uv + shadow_poisson_offset(i) * shadow_map_texel_size * filterRadius;
+        lit += texture(shadow_map, sampleUv).r + shadow_bias >= receiverDepth ? 1.0 : 0.0;
+    }
+    return lit / 4.0;
+}
 
 void main()
 {
@@ -94,10 +149,14 @@ void main()
 	}
 	color.rgb = (any(lessThan(pv_check_min, ZERO)) || any(greaterThan(pv_check_max, ZERO))) ? mix(color.rgb, ZERO, 0.3333) : color.rgb;
 
+    float shadowFactor = (shadow_enabled && top_diffuse > 0.0) ? pcss_shadow_factor() : 1.0;
+    float lighting = intensity.x - top_diffuse * (1.0 - shadowFactor);
+
 #ifdef ENABLE_ENVIRONMENT_MAP
     if (use_environment_tex)
-        out_color = vec4(0.45 * texture(environment_tex, normalize(eye_normal).xy * 0.5 + 0.5).xyz + 0.8 * color.rgb * intensity.x, color.a);
+        out_color = vec4(0.45 * texture(environment_tex, normalize(eye_normal).xy * 0.5 + 0.5).xyz +
+                         0.8 * color.rgb * lighting, color.a);
     else
 #endif
-        out_color = vec4(vec3(intensity.y) + color.rgb * intensity.x, color.a);
+        out_color = vec4(vec3(intensity.y) + color.rgb * lighting, color.a);
 }

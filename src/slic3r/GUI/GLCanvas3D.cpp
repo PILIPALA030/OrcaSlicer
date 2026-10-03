@@ -114,6 +114,9 @@ constexpr float SELECTION_GLOW_BLUR_RADIUS = 4.0f;
 constexpr int GAUSSIAN_LOGICAL_TAP_COUNT = 4;
 constexpr float GAUSSIAN_MAX_RADIUS = 4.0f; // Larger radii use the original nine-fetch kernel.
 constexpr float GAUSSIAN_EPSILON = 1.0e-6f;
+constexpr unsigned int SHADOW_MAP_SIZE = 512;
+constexpr float SHADOW_LIGHT_SIZE = 0.035f;
+constexpr float SHADOW_BIAS = 0.0015f;
 // Normalized weights for offset_i = radius * i / 4 and sigma = radius * 0.5.
 constexpr std::array<float, GAUSSIAN_LOGICAL_TAP_COUNT + 1> GAUSSIAN_LOGICAL_WEIGHTS{
     0.20416369f,
@@ -1574,6 +1577,10 @@ GLCanvas3D::~GLCanvas3D()
     if (hasSelectionHighlightResources && m_canvas != nullptr && _set_current())
         ReleaseSelectionHighlightResources();
 
+    if ((m_shadowMap.framebuffer != 0 || m_shadowMap.depthTexture != 0 || m_shadowMap.colorTexture != 0) &&
+        m_canvas != nullptr && _set_current())
+        ReleaseShadowMapResources();
+
     reset_volumes(ResetVolumesMode::CanvasDestruction);
 
     m_sel_plate_toolbar.del_all_item();
@@ -1657,6 +1664,268 @@ bool GLCanvas3D::init()
     //    wxGetApp().plater()->enable_wireframe(false);
     m_initialized = true;
 
+    return true;
+}
+
+void GLCanvas3D::BindShadowUniforms(GLShaderProgram* shader) const
+{
+    if (shader == nullptr)
+        return;
+
+    shader->set_uniform("shadow_enabled", m_shadowMap.valid);
+    shader->set_uniform("shadow_map", 1);
+    if (!m_shadowMap.valid)
+        return;
+
+    shader->set_uniform("shadow_matrix", m_shadowMap.lightViewProjection);
+    const std::array<float, 2> texelSize{ 1.0f / static_cast<float>(m_shadowMap.size),
+                                          1.0f / static_cast<float>(m_shadowMap.size) };
+    shader->set_uniform("shadow_map_texel_size", texelSize);
+    shader->set_uniform("shadow_light_size", SHADOW_LIGHT_SIZE);
+    shader->set_uniform("shadow_bias", SHADOW_BIAS);
+}
+
+bool GLCanvas3D::EnsureShadowMapResources(unsigned int size)
+{
+    if (size == 0 || !OpenGLManager::are_framebuffers_supported())
+        return false;
+
+    if (m_shadowMap.framebuffer != 0 && m_shadowMap.depthTexture != 0 &&
+        m_shadowMap.colorTexture != 0 && m_shadowMap.size == size)
+        return true;
+
+    ReleaseShadowMapResources();
+
+    const OpenGLManager::EFramebufferType framebufferType = OpenGLManager::get_framebuffers_type();
+    if (framebufferType == OpenGLManager::EFramebufferType::Arb)
+    {
+        glsafe(::glGenFramebuffers(1, &m_shadowMap.framebuffer));
+        glsafe(::glBindFramebuffer(GL_FRAMEBUFFER, m_shadowMap.framebuffer));
+    }
+    else if (framebufferType == OpenGLManager::EFramebufferType::Ext)
+    {
+        glsafe(::glGenFramebuffersEXT(1, &m_shadowMap.framebuffer));
+        glsafe(::glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, m_shadowMap.framebuffer));
+    }
+    else
+    {
+        return false;
+    }
+
+    glsafe(::glGenTextures(1, &m_shadowMap.depthTexture));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, m_shadowMap.depthTexture));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+    glsafe(::glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, static_cast<GLsizei>(size),
+                          static_cast<GLsizei>(size), 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr));
+
+    glsafe(::glGenTextures(1, &m_shadowMap.colorTexture));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, m_shadowMap.colorTexture));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST));
+    glsafe(::glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(size),
+                          static_cast<GLsizei>(size), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr));
+
+    if (framebufferType == OpenGLManager::EFramebufferType::Arb)
+    {
+        glsafe(::glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D,
+                                        m_shadowMap.depthTexture, 0));
+        glsafe(::glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                        m_shadowMap.colorTexture, 0));
+    }
+    else
+    {
+        glsafe(::glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT, GL_TEXTURE_2D,
+                                           m_shadowMap.depthTexture, 0));
+        glsafe(::glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D,
+                                           m_shadowMap.colorTexture, 0));
+    }
+
+    const bool complete = framebufferType == OpenGLManager::EFramebufferType::Arb ?
+        ::glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE :
+        ::glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT) == GL_FRAMEBUFFER_COMPLETE_EXT;
+    glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+    if (!complete)
+    {
+        static bool warningLogged = false;
+        if (!warningLogged)
+        {
+            BOOST_LOG_TRIVIAL(warning) << "PCSS shadow framebuffer is incomplete";
+            warningLogged = true;
+        }
+        ReleaseShadowMapResources();
+        return false;
+    }
+
+    m_shadowMap.size = size;
+    return true;
+}
+
+void GLCanvas3D::ReleaseShadowMapResources()
+{
+    const OpenGLManager::EFramebufferType framebufferType = OpenGLManager::get_framebuffers_type();
+    if (m_shadowMap.framebuffer != 0)
+    {
+        if (framebufferType == OpenGLManager::EFramebufferType::Arb)
+            glsafe(::glDeleteFramebuffers(1, &m_shadowMap.framebuffer));
+        else if (framebufferType == OpenGLManager::EFramebufferType::Ext)
+            glsafe(::glDeleteFramebuffersEXT(1, &m_shadowMap.framebuffer));
+    }
+    if (m_shadowMap.depthTexture != 0)
+        glsafe(::glDeleteTextures(1, &m_shadowMap.depthTexture));
+    if (m_shadowMap.colorTexture != 0)
+        glsafe(::glDeleteTextures(1, &m_shadowMap.colorTexture));
+
+    m_shadowMap = ShadowMapResources{};
+}
+
+bool GLCanvas3D::RenderShadowMap(const Camera& camera)
+{
+    m_shadowMap.valid = false;
+    if (wxGetApp().app_config == nullptr || !wxGetApp().app_config->get_bool("show_model_shadow"))
+        return false;
+
+    GLShaderProgram* const shader = wxGetApp().get_shader("shadow_depth");
+    const BoundingBoxf3 bounds = _max_bounding_box(false, true, true);
+    if (shader == nullptr || !bounds.defined || bounds.max_size() <= 0.0f)
+        return false;
+
+    GLint previousFramebuffer = 0;
+    GLint previousReadFramebuffer = 0;
+    GLint previousActiveTexture = GL_TEXTURE0;
+    GLint previousTextureBinding = 0;
+    glsafe(::glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveTexture));
+    glsafe(::glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTextureBinding));
+    if (OpenGLManager::get_framebuffers_type() == OpenGLManager::EFramebufferType::Arb)
+    {
+        glsafe(::glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previousFramebuffer));
+        glsafe(::glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFramebuffer));
+    }
+    else if (OpenGLManager::get_framebuffers_type() == OpenGLManager::EFramebufferType::Ext)
+        glsafe(::glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &previousFramebuffer));
+    else
+        return false;
+
+    if (!EnsureShadowMapResources(SHADOW_MAP_SIZE))
+    {
+        if (OpenGLManager::get_framebuffers_type() == OpenGLManager::EFramebufferType::Arb)
+        {
+            glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer)));
+            glsafe(::glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previousReadFramebuffer)));
+        }
+        else
+            glsafe(::glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, static_cast<GLuint>(previousFramebuffer)));
+        glsafe(::glActiveTexture(static_cast<GLenum>(previousActiveTexture)));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTextureBinding)));
+        return false;
+    }
+
+    const Vec3d eyeLightDirection(-0.4574957, 0.4574957, 0.7624929);
+    const Matrix3d viewRotation = camera.get_view_matrix().matrix().block(0, 0, 3, 3);
+    Vec3d lightDirection = viewRotation.transpose() * eyeLightDirection;
+    lightDirection.normalize();
+
+    const Vec3d target = bounds.center();
+    const double radius = std::max(1.0, 0.5 * bounds.size().norm());
+    const double lightDistance = radius * 2.0;
+    Vec3d up = Vec3d::UnitZ();
+    if (std::abs(lightDirection.dot(up)) > 0.95)
+        up = Vec3d::UnitY();
+
+    Camera shadowCamera;
+    shadowCamera.set_type(Camera::EType::Ortho);
+    shadowCamera.set_viewport(0, 0, SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+    shadowCamera.look_at(target + lightDirection * lightDistance, target, up);
+    const double extent = radius * 1.15;
+    const double nearPlane = std::max(0.01, lightDistance - radius * 1.2);
+    const double farPlane = lightDistance + radius * 1.5;
+    shadowCamera.apply_projection(-extent, extent, -extent, extent, nearPlane, farPlane);
+    shadowCamera.UpdateFrustum();
+
+    m_shadowMap.lightViewProjection = shadowCamera.get_projection_matrix() * shadowCamera.get_view_matrix();
+
+    GLint previousProgram = 0;
+    std::array<GLint, 4> previousViewport{ 0, 0, 0, 0 };
+    std::array<GLboolean, 4> previousColorMask{ GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
+    const GLboolean previousDepthTest = glIsEnabled(GL_DEPTH_TEST);
+    const GLboolean previousBlend = glIsEnabled(GL_BLEND);
+    const GLboolean previousCullFace = glIsEnabled(GL_CULL_FACE);
+    const GLboolean previousScissorTest = glIsEnabled(GL_SCISSOR_TEST);
+    GLint previousFrontFace = GL_CCW;
+    GLint previousCullFaceMode = GL_BACK;
+    GLboolean previousDepthMask = GL_TRUE;
+    std::array<GLint, 4> previousScissorBox{ 0, 0, 0, 0 };
+    glsafe(::glGetIntegerv(GL_FRONT_FACE, &previousFrontFace));
+    glsafe(::glGetIntegerv(GL_CULL_FACE_MODE, &previousCullFaceMode));
+    glsafe(::glGetBooleanv(GL_DEPTH_WRITEMASK, &previousDepthMask));
+    glsafe(::glGetIntegerv(GL_VIEWPORT, previousViewport.data()));
+    glsafe(::glGetIntegerv(GL_SCISSOR_BOX, previousScissorBox.data()));
+    glsafe(::glGetBooleanv(GL_COLOR_WRITEMASK, previousColorMask.data()));
+    glsafe(::glGetIntegerv(GL_CURRENT_PROGRAM, &previousProgram));
+    if (OpenGLManager::get_framebuffers_type() == OpenGLManager::EFramebufferType::Arb)
+        glsafe(::glBindFramebuffer(GL_FRAMEBUFFER, m_shadowMap.framebuffer));
+    else
+        glsafe(::glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, m_shadowMap.framebuffer));
+    glsafe(::glViewport(0, 0, static_cast<GLsizei>(SHADOW_MAP_SIZE), static_cast<GLsizei>(SHADOW_MAP_SIZE)));
+    glsafe(::glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE));
+    glsafe(::glDepthMask(GL_TRUE));
+    glsafe(::glEnable(GL_DEPTH_TEST));
+    glsafe(::glEnable(GL_CULL_FACE));
+    glsafe(::glDisable(GL_SCISSOR_TEST));
+    glsafe(::glDisable(GL_BLEND));
+    glsafe(::glClear(GL_DEPTH_BUFFER_BIT));
+
+    shader->start_using();
+    for (GLVolume* volume : m_volumes.volumes)
+    {
+        if (volume == nullptr || !volume->is_active || volume->is_modifier || volume->is_wipe_tower)
+            continue;
+        if (!shadowCamera.GetFrustum().Intersects(volume->transformed_bounding_box()))
+            continue;
+
+        volume->promote_ready_lod_models();
+        shader->set_uniform("view_model_matrix", shadowCamera.get_view_matrix() * volume->world_matrix());
+        shader->set_uniform("projection_matrix", shadowCamera.get_projection_matrix());
+        volume->render();
+    }
+    shader->stop_using();
+
+    if (OpenGLManager::get_framebuffers_type() == OpenGLManager::EFramebufferType::Arb)
+    {
+        glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer)));
+        glsafe(::glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previousReadFramebuffer)));
+    }
+    else
+        glsafe(::glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, static_cast<GLuint>(previousFramebuffer)));
+    glsafe(::glViewport(previousViewport[0], previousViewport[1], previousViewport[2], previousViewport[3]));
+    glsafe(::glColorMask(previousColorMask[0], previousColorMask[1], previousColorMask[2], previousColorMask[3]));
+    glsafe(::glDepthMask(previousDepthMask));
+    if (previousDepthTest == GL_TRUE)
+        glsafe(::glEnable(GL_DEPTH_TEST));
+    else
+        glsafe(::glDisable(GL_DEPTH_TEST));
+    if (previousCullFace == GL_TRUE)
+        glsafe(::glEnable(GL_CULL_FACE));
+    else
+        glsafe(::glDisable(GL_CULL_FACE));
+    if (previousBlend == GL_TRUE)
+        glsafe(::glEnable(GL_BLEND));
+    else
+        glsafe(::glDisable(GL_BLEND));
+    if (previousScissorTest == GL_TRUE)
+        glsafe(::glEnable(GL_SCISSOR_TEST));
+    else
+        glsafe(::glDisable(GL_SCISSOR_TEST));
+    glsafe(::glScissor(previousScissorBox[0], previousScissorBox[1], previousScissorBox[2], previousScissorBox[3]));
+    glsafe(::glFrontFace(static_cast<GLenum>(previousFrontFace)));
+    glsafe(::glCullFace(static_cast<GLenum>(previousCullFaceMode)));
+    glsafe(::glUseProgram(static_cast<GLuint>(previousProgram)));
+    glsafe(::glActiveTexture(static_cast<GLenum>(previousActiveTexture)));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTextureBinding)));
+
+    m_shadowMap.valid = true;
     return true;
 }
 
@@ -2981,6 +3250,41 @@ void GLCanvas3D::render(bool only_init)
         }
     }
 
+    bool shadowMapReady = false;
+    if (m_canvas_type == ECanvasType::CanvasView3D ||
+        (m_canvas_type == ECanvasType::CanvasPreview && m_render_preview))
+        shadowMapReady = RenderShadowMap(camera);
+    else
+        m_shadowMap.valid = false;
+
+    const auto setShadowEnabled = [](bool enabled) {
+        GLint currentProgram = 0;
+        glsafe(::glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram));
+        const std::array<const char*, 3> shadowShaderNames{ "gouraud", "gouraud_light", "flat" };
+        for (const char* shadowShaderName : shadowShaderNames)
+        {
+            GLShaderProgram* shader = wxGetApp().get_shader(shadowShaderName);
+            if (shader == nullptr)
+                continue;
+            shader->start_using();
+            shader->set_uniform("shadow_enabled", enabled);
+            shader->stop_using();
+        }
+        glsafe(::glUseProgram(static_cast<GLuint>(currentProgram)));
+    };
+    setShadowEnabled(false);
+
+    GLint previousSceneActiveTexture = GL_TEXTURE0;
+    GLint previousTexture1Binding = 0;
+    if (shadowMapReady)
+    {
+        glsafe(::glGetIntegerv(GL_ACTIVE_TEXTURE, &previousSceneActiveTexture));
+        glsafe(::glActiveTexture(GL_TEXTURE1));
+        glsafe(::glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture1Binding));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, m_shadowMap.depthTexture));
+        glsafe(::glActiveTexture(GL_TEXTURE0));
+    }
+
     const ESelectionHighlightMode highlightMode = ResolveSelectionHighlightMode();
 
     // draw scene
@@ -3021,6 +3325,7 @@ void GLCanvas3D::render(bool only_init)
         _render_bed(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), show_axes);
         _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), only_current, true, hover_id);
         // BBS: GUI refactor: add canvas size as parameters
+        setShadowEnabled(false);
         _render_gcode(cnv_size.get_width(), cnv_size.get_height());
     }
     /* assemble render*/
@@ -3037,6 +3342,14 @@ void GLCanvas3D::render(bool only_init)
         //_render_selection();
         // BBS: add outline logic
         _render_objects(GLVolumeCollection::ERenderType::Transparent, !m_gizmos.is_running());
+    }
+
+    if (shadowMapReady)
+    {
+        setShadowEnabled(false);
+        glsafe(::glActiveTexture(GL_TEXTURE1));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture1Binding)));
+        glsafe(::glActiveTexture(static_cast<GLenum>(previousSceneActiveTexture)));
     }
 
     if (highlightMode == ESelectionHighlightMode::UnifiedFramebuffer)
@@ -8596,6 +8909,7 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
     bool                 partly_inside_enable = canvas_type == ECanvasType::CanvasAssembleView ? false : true;
     if (shader != nullptr) {
         shader->start_using();
+        BindShadowUniforms(shader);
 
         switch (type)
         {
@@ -8682,6 +8996,7 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
             shader->set_uniform("show_wireframe", false);
         }*/
 
+        shader->set_uniform("shadow_enabled", false);
         shader->stop_using();
     }
 
