@@ -731,6 +731,9 @@ endif()
 
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${SLIC3R_GUI_SOURCES})
 
+# Opt-in, generated-source CPU/GPU diagnostics; normal builds are unchanged.
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../tools/render_profile/RenderProfile.cmake")
+
 encoding_check(libslic3r_gui)
 
 find_package(libnoise REQUIRED)
