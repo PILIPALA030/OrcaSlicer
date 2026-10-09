@@ -3,6 +3,9 @@ on:
   push:
     branches: [codex/pcss-v2-validation]
     paths: [.github/workflows/pcss-validation.yml, .pcss-patch.b64]
+  pull_request:
+    branches: [feature_pcss_shadow]
+    paths: [.github/workflows/pcss-validation.yml, .pcss-patch.b64]
 permissions:
   contents: read
 jobs:
