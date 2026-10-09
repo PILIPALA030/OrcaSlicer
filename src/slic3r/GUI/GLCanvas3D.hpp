@@ -60,6 +60,7 @@ class Bed3D;
 class GLSubTextureBindRenderer;
 class GLToolbarBackgroundTextureCache;
 class PartPlateList;
+class SoftShadowRenderer;
 
 #if ENABLE_RETINA_GL
 class RetinaHelper;
@@ -654,6 +655,8 @@ private:
     Slope m_slope;
 
     SelectionHighlightResources m_selectionHighlightResources;
+    // Created lazily on the first frame that shows soft shadows
+    std::unique_ptr<SoftShadowRenderer> _softShadowRenderer;
 
     OrientSettings m_orient_settings_fff, m_orient_settings_sla;
 
@@ -1264,6 +1267,15 @@ private:
 
     /** @brief Releases all selection highlight framebuffer resources. */
     void ReleaseSelectionHighlightResources();
+
+    /**
+     * @brief Returns true when soft shadows should be drawn in the current frame.
+     * @param noPartplate True when plates are hidden by the current gizmo.
+     */
+    bool IsSoftShadowVisible(bool noPartplate) const;
+
+    /** @brief Updates the soft shadow cache, or releases it when soft shadows are turned off. */
+    void UpdateSoftShadows(bool shadowsVisible);
 
     void _switch_toolbars_icon_filename();
     bool _init_toolbars();

@@ -24,6 +24,7 @@
 #include "GUI_Preview.hpp"
 #include "OpenGLManager.hpp"
 #include "Plater.hpp"
+#include "SoftShadowRenderer.hpp"
 #include "MainFrame.hpp"
 #include "GUI_App.hpp"
 #include "GUI_ObjectList.hpp"
@@ -75,6 +76,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 
 #ifndef IMGUI_DEFINE_MATH_OPERATORS
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -1588,6 +1591,9 @@ GLCanvas3D::~GLCanvas3D()
     if (hasSelectionHighlightResources && m_canvas != nullptr && _set_current())
         ReleaseSelectionHighlightResources();
 
+    if (_softShadowRenderer != nullptr && _softShadowRenderer->HasResources() && m_canvas != nullptr && _set_current())
+        _softShadowRenderer->Release();
+
     reset_volumes(ResetVolumesMode::CanvasDestruction);
 
     m_sel_plate_toolbar.del_all_item();
@@ -2244,6 +2250,49 @@ void GLCanvas3D::RenderSelectionStencilFallback()
     }
 
     shader->stop_using();
+}
+
+bool GLCanvas3D::IsSoftShadowVisible(bool noPartplate) const
+{
+    if (m_canvas_type != ECanvasType::CanvasView3D || noPartplate)
+        return false;
+
+    if (!wxGetApp().app_config->get_bool("enable_soft_shadows"))
+        return false;
+
+    // Cut and boolean previews clip or replace geometry, so full-object shadows would be misleading
+    const GLGizmosManager::EType gizmoType = m_gizmos.get_current_type();
+    if (gizmoType == GLGizmosManager::Cut || gizmoType == GLGizmosManager::MeshBoolean)
+        return false;
+
+    if (!wxGetApp().plater()->get_camera().is_looking_downward())
+        return false;
+
+    return SoftShadowRenderer::IsSupported();
+}
+
+void GLCanvas3D::UpdateSoftShadows(bool shadowsVisible)
+{
+    if (!shadowsVisible)
+    {
+        // Keep resources while a gizmo hides shadows temporarily; free them once the option is off
+        const bool optionEnabled = wxGetApp().app_config->get_bool("enable_soft_shadows");
+        if (!optionEnabled && _softShadowRenderer != nullptr && _softShadowRenderer->HasResources())
+            _softShadowRenderer->Release();
+        return;
+    }
+
+    if (_softShadowRenderer == nullptr)
+        _softShadowRenderer = std::make_unique<SoftShadowRenderer>();
+
+    SoftShadowFrameInput input;
+    input.volumes = &m_volumes;
+    input.interactive = is_dragging();
+    input.renderSlaAuxiliaries = m_render_sla_auxiliaries;
+    _softShadowRenderer->Update(input);
+    // One more frame after the interaction ends rebuilds the mask at full quality
+    if (input.interactive)
+        request_extra_frame();
 }
 
 void GLCanvas3D::ReleaseSelectionHighlightResources()
@@ -3021,6 +3070,9 @@ void GLCanvas3D::render(bool only_init)
     else if (gizmo_type == GLGizmosManager::BrimEars && !camera.is_looking_downward())
         show_grid = false;
 
+    const bool softShadowsVisible = IsSoftShadowVisible(no_partplate);
+    UpdateSoftShadows(softShadowsVisible);
+
     /* view3D render*/
     int hover_id = (m_hover_plate_idxs.size() > 0)?m_hover_plate_idxs.front():-1;
     if (m_canvas_type == ECanvasType::CanvasView3D) {
@@ -3032,6 +3084,8 @@ void GLCanvas3D::render(bool only_init)
             _render_bed(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), show_axes);
         if (!no_partplate) //BBS: add outline logic
             _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), only_current, only_body, hover_id, true, show_grid);
+        if (softShadowsVisible && _softShadowRenderer != nullptr)
+            _softShadowRenderer->RenderReceivers(camera, wxGetApp().plater()->get_partplate_list(), m_is_dark);
         _render_objects(GLVolumeCollection::ERenderType::Transparent, !m_gizmos.is_running());
     }
     /* preview render */
@@ -3115,6 +3169,15 @@ void GLCanvas3D::render(bool only_init)
         imgui.text("Max texture size:");
         ImGui::SameLine();
         imgui.text(std::to_string(OpenGLManager::get_gl_info().get_max_tex_size()));
+        if (_softShadowRenderer != nullptr)
+        {
+            std::ostringstream shadowStats;
+            shadowStats << std::fixed << std::setprecision(3) << _softShadowRenderer->GetUpdateGpuTimeMs() << " / "
+                        << _softShadowRenderer->GetReceiverGpuTimeMs();
+            imgui.text("Soft shadow GPU ms (rebuild / receiver):");
+            ImGui::SameLine();
+            imgui.text(shadowStats.str());
+        }
         imgui.end();
     }
 

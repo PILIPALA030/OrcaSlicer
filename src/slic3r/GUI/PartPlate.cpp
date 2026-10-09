@@ -5490,6 +5490,17 @@ void PartPlateList::render(const Transform3d& view_matrix, const Transform3d& pr
 	}
 }
 
+void PartPlateList::RenderShadowReceivers()
+{
+    const std::lock_guard<std::mutex> localLock(m_plates_mutex);
+    for (PartPlate* plate : m_plate_list)
+    {
+        if (plate == nullptr || !plate->m_triangles.model.is_initialized())
+            continue;
+        plate->m_triangles.model.render();
+    }
+}
+
 /*int PartPlateList::select_plate_by_hover_id(int hover_id)
 {
 	int index = hover_id / PartPlate::GRABBER_COUNT;

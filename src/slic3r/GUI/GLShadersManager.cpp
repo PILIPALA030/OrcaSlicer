@@ -76,6 +76,12 @@ std::pair<bool, std::string> GLShadersManager::init()
         valid &= append_shader("gpu_path", { prefix + "gpu_path.vs", prefix + "gpu_path.fs" });
         valid &= append_shader("gpu_path_marker", { prefix + "gpu_path_marker.vs", prefix + "gpu_path_marker.fs" });
     }
+    // used to bake and composite PCSS soft shadows on the build plate (sampler objects need GL 3.3)
+    if (GUI::wxGetApp().is_gl_version_greater_or_equal_to(3, 3))
+    {
+        appendOptionalShader("shadow_ground_mask", { prefix + "shadow_ground_mask.vs", prefix + "shadow_ground_mask.fs" });
+        appendOptionalShader("shadow_receiver", { prefix + "shadow_receiver.vs", prefix + "shadow_receiver.fs" });
+    }
     //used to render thumbnail
     valid &= append_shader("thumbnail", { prefix + "thumbnail.vs", prefix + "thumbnail.fs"});
     // used to render printbed
