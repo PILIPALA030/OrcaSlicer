@@ -1,0 +1,61 @@
+name: PCSS isolated validation
+on:
+  push:
+    branches: [codex/pcss-fix-20261009]
+  pull_request:
+    branches: [feature_pcss_shadow]
+    paths:
+      - '.codex/**'
+      - '.github/workflows/pcss-isolated-validation.yml'
+permissions:
+  contents: write
+jobs:
+  validate:
+    if: github.head_ref == 'codex/pcss-fix-20261009' || github.ref == 'refs/heads/codex/pcss-fix-20261009'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          sparse-checkout: |
+            .codex
+            src/slic3r
+            resources/shaders
+            tests/rendering
+            doc
+      - name: Apply to pinned baseline, without staging helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pcss_overlay" "$RUNNER_TEMP/pcss_apply"
+          cp .codex/apply_pcss.py .codex/kernel.glsl "$RUNNER_TEMP/pcss_apply/"
+          cp --parents src/slic3r/GUI/GLCanvas3DShadow.cpp tests/rendering/test_pcss.py tests/rendering/pcss_smoke_adapter.hpp tests/rendering/pcss_smoke_main.cpp doc/pcss_shadows.md "$RUNNER_TEMP/pcss_overlay/"
+          git fetch --no-tags --depth=1 origin 27a56130dab462685ef3ca8dec364ea887852333
+          git checkout --detach 27a56130dab462685ef3ca8dec364ea887852333
+          test "$(git rev-parse HEAD)" = 27a56130dab462685ef3ca8dec364ea887852333
+          cp -a "$RUNNER_TEMP/pcss_overlay/." .
+          python3 "$RUNNER_TEMP/pcss_apply/apply_pcss.py"
+          git diff --check
+      - name: Install isolated GL test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends glslang-tools g++ libeigen3-dev libglew-dev libglfw3-dev libgl1-mesa-dri libglx-mesa0 xvfb xauth python3-numpy python3-opengl python3-glfw
+      - name: Shader, C++ adapter and offscreen regression checks
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: xvfb-run -a /usr/bin/python3 tests/rendering/test_pcss.py --gpu
+      - name: Publish tested source-only commit on a separate branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add src/slic3r/CMakeLists.txt src/slic3r/GUI/GLCanvas3D.cpp src/slic3r/GUI/GLCanvas3D.hpp src/slic3r/GUI/GLCanvas3DShadow.cpp src/slic3r/GUI/GLModel.cpp src/slic3r/GUI/GLModel.hpp src/slic3r/GUI/GLShadersManager.cpp resources/shaders/110 resources/shaders/140 tests/rendering/test_pcss.py tests/rendering/pcss_smoke_adapter.hpp tests/rendering/pcss_smoke_main.cpp doc/pcss_shadows.md
+          git diff --cached --check
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Fix PCSS banding with bounded filtering and cached shadow passes'
+          test "$(git rev-parse HEAD^)" = 27a56130dab462685ef3ca8dec364ea887852333
+          git push origin "HEAD:refs/heads/codex/pcss-validated-${GITHUB_RUN_ID}"
+          echo "VALIDATED_COMMIT=$(git rev-parse HEAD)"
+          echo "OUTPUT_BRANCH=codex/pcss-validated-${GITHUB_RUN_ID}"
+          git show --stat --oneline HEAD
+          echo 'GLSL and software GL/adapter tests passed. Full slicer build and target-device FPS are NOT validated.' >> "$GITHUB_STEP_SUMMARY"
