@@ -2,15 +2,22 @@ name: PCSS isolated validation
 on:
   push:
     branches: [codex/pcss-fix-20261009]
+  pull_request:
+    branches: [feature_pcss_shadow]
+    paths:
+      - '.codex/**'
+      - '.github/workflows/pcss-isolated-validation.yml'
 permissions:
   contents: write
 jobs:
   validate:
+    if: github.head_ref == 'codex/pcss-fix-20261009' || github.ref == 'refs/heads/codex/pcss-fix-20261009'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
           sparse-checkout: |
             .codex
