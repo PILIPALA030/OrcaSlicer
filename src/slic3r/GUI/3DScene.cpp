@@ -772,6 +772,9 @@ void GLVolume::simple_render(GLShaderProgram*        shader,
                 m_modelMiddle->render();
                 if (picking)
                     m_modelMiddle->set_color(previousColor);
+            } else if (picking && color_volume) {
+                // Painted volume: the main pass never uploads the full mesh, so reuse its segment models.
+                RenderMmuSegmentsForPicking();
             } else {
                 if (lodRenderLogCounter % 180 == 0) {
                     BOOST_LOG_TRIVIAL(debug) << "LOD: HIGH fallback '" << name
@@ -790,6 +793,25 @@ void GLVolume::simple_render(GLShaderProgram*        shader,
     }
     if (this->is_left_handed())
         glFrontFace(GL_CCW);
+}
+
+void GLVolume::RenderMmuSegmentsForPicking()
+{
+    const ColorRGBA pickingColor = model.get_color();
+    const bool fullRange = tverts_range == std::make_pair<size_t, size_t>(0, -1);
+    for (GUI::GLModel& segmentModel : mmuseg_models)
+    {
+        if (!segmentModel.is_initialized())
+            continue;
+
+        const ColorRGBA previousColor = segmentModel.get_color();
+        segmentModel.set_color(pickingColor);
+        if (fullRange)
+            segmentModel.render();
+        else
+            segmentModel.render(tverts_range);
+        segmentModel.set_color(previousColor);
+    }
 }
 
 bool GLVolume::is_sla_support() const { return this->composite_id.volume_id == -int(slaposSupportTree); }

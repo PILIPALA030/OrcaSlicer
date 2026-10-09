@@ -360,6 +360,13 @@ public:
     //BBS: add simple render function for thumbnail
     void simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_objects, std::vector<ColorRGBA>& extruder_colors, bool ban_light =false);
 
+    /**
+     * @brief Renders the painted segment models with the picking color of this volume.
+     *
+     * Used by the picking pass so painted volumes never upload the unpainted full mesh.
+     */
+    void RenderMmuSegmentsForPicking();
+
     // LOD mesh simplification (async, uses quadric edge collapse)
     bool SimplifyMesh(const TriangleMesh& mesh, std::shared_ptr<GUI::GLModel> model, std::shared_ptr<std::atomic<bool>> readyFlag, LODLevel lod) const;
     bool SimplifyMesh(const indexed_triangle_set& its, std::shared_ptr<GUI::GLModel> model, std::shared_ptr<std::atomic<bool>> readyFlag, LODLevel lod) const;
