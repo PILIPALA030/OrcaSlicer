@@ -3,6 +3,7 @@
 #include "GUI_App.hpp"
 #include "MainFrame.hpp"
 #include "Plater.hpp"
+#include "GLCanvas3D.hpp"
 #include "MsgDialog.hpp"
 #include "I18N.hpp"
 #include "libslic3r/AppConfig.hpp"
@@ -767,6 +768,16 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxWindow *pa
         app_config->set_bool(param, checkbox->GetValue());
         app_config->save();
 
+        if (param == "show_model_shadow" && wxGetApp().plater()) {
+            // The render path reads the persisted switch on the next redraw.
+            // Do not reload meshes, rebuild the scene or restart the application.
+            if (auto* canvas = wxGetApp().plater()->get_view3D_canvas3D())
+                canvas->set_as_dirty();
+            if (auto* canvas = wxGetApp().plater()->get_preview_canvas3D())
+                canvas->set_as_dirty();
+            wxWakeUpIdle();
+        }
+
         if (param == "allow_filament_temp_mixing" && wxGetApp().plater())
             wxGetApp().plater()->notify_filament_usage_changed();
 
@@ -1260,6 +1271,9 @@ wxWindow* PreferencesDialog::create_general_page()
             dlg.SetButtonLabel(wxID_CANCEL, _L("Cancel"));
             return dlg.ShowModal() == wxID_OK;
         });
+    auto item_pcss_shadows = create_item_checkbox(_L("Enable PCSS soft shadows"), page,
+        _L("Contact-hardening model shadows. Disable to reduce GPU load. Large models use a simplified shadow mesh; "
+           "their shadow appears after background preparation. Takes effect immediately."), 50, "show_model_shadow");
     auto camera_orbit_mult = create_camera_orbit_mult_input(_L("Orbit speed multiplier"), page, _L("Multiplies the orbit speed for finer or coarser camera movement."));
 
     auto item_show_splash_screen = create_item_checkbox(_L("Show splash screen"), page, _L("Show the splash screen during startup."), 50, "show_splash_screen");
@@ -1366,6 +1380,7 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(reverse_mouse_zoom, 0, wxTOP, FromDIP(3));
     sizer_page->Add(allow_filament_temp_mixing, 0, wxTOP, FromDIP(3));
     sizer_page->Add(camera_orbit_mult, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_pcss_shadows, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_show_splash_screen, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_hints, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_calc_in_long_retract, 0, wxTOP, FromDIP(3));

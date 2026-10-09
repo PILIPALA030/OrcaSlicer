@@ -59,8 +59,10 @@ varying vec3 eye_normal;
 varying vec4 shadow_position;
 varying float top_diffuse;
 
-// Bounded-cost PCSS. Keep this block identical in all six receiver shaders.
-// Nine NEAREST depth reads serve both blocker search and variable-width PCF.
+// PCSS v2: separate blocker search, penumbra estimation and variable-radius PCF.
+// Keep this block identical in all six receivers (apart from texture2D/texture).
+// Maximum: 9 blocker reads + 12 bilinear comparisons (4 reads each) = 57 reads.
+// No blockers: 9 reads. No stochastic frame noise or extra render targets.
 vec2 shadow_receiver_gradient()
 {
     vec3 p = shadow_position.xyz / max(shadow_position.w, 0.000001) * 0.5 + 0.5;
@@ -79,32 +81,71 @@ float shadow_raw_depth(vec2 uv)
     return texture2D(shadow_map, uv).r;
 }
 
-vec3 shadow_depth_row(vec2 uv)
+// Two balanced rings and a center sample. Do not take an unbalanced prefix
+// of a larger Poisson table, and do not omit the center for thin casters.
+vec2 shadow_search_offset(int i)
 {
-    return vec3(shadow_raw_depth(uv - vec2(shadow_map_texel_size.x, 0.0)),
-                shadow_raw_depth(uv),
-                shadow_raw_depth(uv + vec2(shadow_map_texel_size.x, 0.0)));
+    if (i == 0) return vec2(0.0);
+    if (i == 1) return vec2(0.35, 0.0);
+    if (i == 2) return vec2(-0.35, 0.0);
+    if (i == 3) return vec2(0.0, 0.35);
+    if (i == 4) return vec2(0.0, -0.35);
+    if (i == 5) return vec2(0.67, 0.67);
+    if (i == 6) return vec2(-0.67, -0.67);
+    if (i == 7) return vec2(-0.67, 0.67);
+    return vec2(0.67, -0.67);
 }
 
-vec3 shadow_area_weights(float fraction, float radius)
+// Antipodal disk samples: deterministic, zero mean, three radial strata.
+vec2 shadow_filter_offset(int i)
 {
-    // Exact overlap of the filter interval with three adjacent texel cells.
-    // radius=0.5 is bilinear PCF; radius<=1.0 fits entirely in this 3x3 grid.
-    // Interpolate comparison results, NEVER interpolate raw depths first.
-    return max(min(vec3(0.0, 1.0, 2.0), vec3(fraction + radius)) -
-               max(vec3(-1.0, 0.0, 1.0), vec3(fraction - radius)), vec3(0.0)) / (2.0 * radius);
+    if (i == 0) return vec2(0.288675, 0.0);
+    if (i == 1) return vec2(-0.288675, 0.0);
+    if (i == 2) return vec2(0.0, 0.500000);
+    if (i == 3) return vec2(0.0, -0.500000);
+    if (i == 4) return vec2(0.456435, 0.456435);
+    if (i == 5) return vec2(-0.456435, -0.456435);
+    if (i == 6) return vec2(-0.540062, 0.540062);
+    if (i == 7) return vec2(0.540062, -0.540062);
+    if (i == 8) return vec2(0.800103, 0.331414);
+    if (i == 9) return vec2(-0.800103, -0.331414);
+    if (i == 10) return vec2(-0.366391, 0.884558);
+    return vec2(0.366391, -0.884558);
+}
+
+float shadow_compare(vec2 sample_uv, vec3 receiver, vec2 gradient, float bias)
+{
+    // Compare against the receiver plane AT the fetched texel center.
+    float reference = receiver.z + dot(gradient, sample_uv - receiver.xy) - bias;
+    return step(clamp(reference, 0.0, 1.0), shadow_raw_depth(sample_uv));
+}
+
+float shadow_bilinear_pcf(vec2 uv, vec3 receiver, vec2 gradient, float bias)
+{
+    vec2 pixel = uv / shadow_map_texel_size - 0.5;
+    vec2 base = (floor(pixel) + 0.5) * shadow_map_texel_size;
+    vec2 f = fract(pixel);
+    vec2 ex = vec2(shadow_map_texel_size.x, 0.0);
+    vec2 ey = vec2(0.0, shadow_map_texel_size.y);
+    // Interpolate VISIBILITY, not raw depth. Works with the existing NEAREST
+    // sampler on both legacy GL and GL 3.1, without changing texture state.
+    float a = shadow_compare(base, receiver, gradient, bias);
+    float b = shadow_compare(base + ex, receiver, gradient, bias);
+    float c = shadow_compare(base + ey, receiver, gradient, bias);
+    float d = shadow_compare(base + ex + ey, receiver, gradient, bias);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
 float pcss_shadow_factor(vec2 gradient)
 {
     if (shadow_position.w <= 0.0)
         return 1.0;
-    vec3 projected = shadow_position.xyz / shadow_position.w * 0.5 + 0.5;
-    if (any(lessThan(projected, vec3(0.0))) || any(greaterThan(projected, vec3(1.0))))
+    vec3 receiver = shadow_position.xyz / shadow_position.w * 0.5 + 0.5;
+    if (any(lessThan(receiver, vec3(0.0))) || any(greaterThan(receiver, vec3(1.0))))
         return 1.0;
 
-    // Recover orthographic units from the EXISTING light matrix. Its rows
-    // have lengths 2/width, 2/height, 2/(far-near), independent of rotation.
+    // The current light is directional and its projection is ORTHOGRAPHIC.
+    // Rows of P*V have lengths 2/width, 2/height, 2/(far-near).
     vec3 row_x = vec3(shadow_matrix[0][0], shadow_matrix[1][0], shadow_matrix[2][0]);
     vec3 row_y = vec3(shadow_matrix[0][1], shadow_matrix[1][1], shadow_matrix[2][1]);
     vec3 row_z = vec3(shadow_matrix[0][2], shadow_matrix[1][2], shadow_matrix[2][2]);
@@ -112,41 +153,40 @@ float pcss_shadow_factor(vec2 gradient)
     if (depth_scale < 0.00000001)
         return 1.0;
     vec2 penumbra_scale = max(shadow_light_size, 0.0) * vec2(length(row_x), length(row_y)) / depth_scale;
-    // At most the existing bias, with a 0.02 mm base in linear light depth.
     float bias = min(shadow_bias, max(0.000001, 0.01 * depth_scale));
-    vec2 texel_position = projected.xy / shadow_map_texel_size;
-    vec2 center = (floor(texel_position) + 0.5) * shadow_map_texel_size;
-    vec3 depth0 = shadow_depth_row(center - vec2(0.0, shadow_map_texel_size.y));
-    vec3 depth1 = shadow_depth_row(center);
-    vec3 depth2 = shadow_depth_row(center + vec2(0.0, shadow_map_texel_size.y));
+    vec2 max_radius = 8.0 * shadow_map_texel_size;
 
-    // Correct the receiver plane at every fetched texel center, before both
-    // blocker classification and PCF. This avoids slope-dependent acne.
-    float plane_center = dot(gradient, center - projected.xy);
-    vec3 plane1 = vec3(plane_center) + gradient.x * shadow_map_texel_size.x * vec3(-1.0, 0.0, 1.0);
-    vec3 plane0 = plane1 - vec3(gradient.y * shadow_map_texel_size.y);
-    vec3 plane2 = plane1 + vec3(gradient.y * shadow_map_texel_size.y);
-    vec3 lit0 = step(clamp(vec3(projected.z - bias) + plane0, vec3(0.0), vec3(1.0)), depth0);
-    vec3 lit1 = step(clamp(vec3(projected.z - bias) + plane1, vec3(0.0), vec3(1.0)), depth1);
-    vec3 lit2 = step(clamp(vec3(projected.z - bias) + plane2, vec3(0.0), vec3(1.0)), depth2);
-    vec3 blocked0 = vec3(1.0) - lit0;
-    vec3 blocked1 = vec3(1.0) - lit1;
-    vec3 blocked2 = vec3(1.0) - lit2;
-    float count = dot(blocked0 + blocked1 + blocked2, vec3(1.0));
-    if (count < 0.5)
+    // 1. Search independently of the final filter. The light's near plane
+    // bounds potential separation; the eight-texel cap bounds the work/aliasing.
+    vec2 search_radius = clamp(receiver.z * penumbra_scale,
+                               1.5 * shadow_map_texel_size, max_radius);
+    float gap_sum = 0.0;
+    float blocker_count = 0.0;
+    for (int i = 0; i < 9; ++i) {
+        vec2 uv = receiver.xy + shadow_search_offset(i) * search_radius;
+        uv = (floor(uv / shadow_map_texel_size) + 0.5) * shadow_map_texel_size;
+        float depth = shadow_raw_depth(uv);
+        float plane_depth = clamp(receiver.z + dot(gradient, uv - receiver.xy), 0.0, 1.0);
+        if (depth < plane_depth - bias) {
+            gap_sum += plane_depth - depth;
+            blocker_count += 1.0;
+        }
+    }
+    if (blocker_count < 0.5)
         return 1.0;
-    if (count > 8.5)
-        return 0.0;
-    float average_blocker = (dot(depth0 - plane0, blocked0) + dot(depth1 - plane1, blocked1) +
-                             dot(depth2 - plane2, blocked2)) / count;
-    // Directional light: radiusWorld = separationWorld * tan(angularRadius).
-    // Dividing by normalized blocker depth would depend on an arbitrary near plane.
-    float gap = max(projected.z - average_blocker, 0.0);
-    vec2 radius = clamp(gap * penumbra_scale / shadow_map_texel_size, vec2(0.5), vec2(1.0));
-    vec2 fraction = fract(texel_position);
-    vec3 wx = shadow_area_weights(fraction.x, radius.x);
-    vec3 wy = shadow_area_weights(fraction.y, radius.y);
-    return clamp(dot(lit0, wx) * wy.x + dot(lit1, wx) * wy.y + dot(lit2, wx) * wy.z, 0.0, 1.0);
+
+    // 2. Contact hardening: separationWorld * tan(angularRadius) / frustumSize.
+    // Never divide by normalized blocker depth (its origin is arbitrary).
+    vec2 radius = min((gap_sum / blocker_count) * penumbra_scale, max_radius);
+    if (max(radius.x / shadow_map_texel_size.x, radius.y / shadow_map_texel_size.y) < 0.05)
+        return shadow_bilinear_pcf(receiver.xy, receiver, gradient, bias);
+
+    // 3. Resample across the computed footprint, not the old fixed 3x3 grid.
+    // All blocker-search samples being blocked is NOT a safe umbra early-out.
+    float visibility = 0.0;
+    for (int i = 0; i < 12; ++i)
+        visibility += shadow_bilinear_pcf(receiver.xy + shadow_filter_offset(i) * radius, receiver, gradient, bias);
+    return visibility / 12.0;
 }
 
 void main()

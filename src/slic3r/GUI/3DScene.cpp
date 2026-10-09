@@ -2,6 +2,9 @@
 
 #include "3DScene.hpp"
 #include "GLShader.hpp"
+#include "GLCanvas3D.hpp"
+#include "ShadowMeshProxy.hpp"
+#include <wx/weakref.h>
 #include "GUI_App.hpp"
 #include "GUI_Colors.hpp"
 #include "Plater.hpp"
@@ -22,7 +25,6 @@
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Tesselate.hpp"
 #include "libslic3r/PrintConfig.hpp"
-#include "libslic3r/QuadricEdgeCollapse.hpp"
 #include <thread>
 #include <algorithm>
 
@@ -117,6 +119,7 @@ namespace Slic3r {
 struct MeshLodEntry {
     std::shared_ptr<const TriangleMesh> mesh; // keeps the key mesh alive
     std::set<GLVolume*>                  volumes;
+    std::unique_ptr<GUI::ShadowMeshProxy> shadow_proxy;
 };
 static std::map<const TriangleMesh*, MeshLodEntry> g_meshVolumesMap;
 
@@ -350,7 +353,7 @@ void GLVolume::set_render_color()
         if (hover == HS_Select)
             set_render_color(HOVER_SELECT_COLOR);
         else if (hover == HS_Deselect)
-            set_render_color(HOVER_DESELECT_COLOR);
+            set_render_color(outside ? SELECTED_OUTSIDE_COLOR : SELECTED_COLOR);
         else if (selected)
             set_render_color(outside ? SELECTED_OUTSIDE_COLOR : SELECTED_COLOR);
         else if (disabled)
@@ -641,6 +644,68 @@ void GLVolume::render()
     GLShaderProgram* shader = GUI::wxGetApp().get_current_shader();
     if (shader == nullptr)
         return;
+
+    if (shader->get_name() == "shadow_depth") {
+        // Do not run material splitting or viewer-LOD selection in a depth pass.
+        // The same source mesh shares one bounded proxy across all instances.
+        GUI::GLModel* shadow_model = nullptr;
+        const size_t budget = 3 * GUI::ShadowMeshProxy::TRIANGLE_BUDGET;
+        const bool full_range = tverts_range.first == 0 &&
+            (tverts_range.second == size_t(-1) || tverts_range.second == model.indices_count());
+        if (model.indices_count() <= budget || !full_range || m_oriMesh == nullptr) {
+            shadow_model = &model;
+        } else if (m_modelSmall && !m_modelSmall->is_render_disabled() &&
+                   m_modelSmall->is_initialized() && m_modelSmall->indices_count() <= budget) {
+            shadow_model = m_modelSmall.get();
+        } else if (m_modelMiddle && !m_modelMiddle->is_render_disabled() &&
+                   m_modelMiddle->is_initialized() && m_modelMiddle->indices_count() <= budget) {
+            shadow_model = m_modelMiddle.get();
+        } else {
+            auto entry = g_meshVolumesMap.find(m_oriMesh);
+            if (entry != g_meshVolumesMap.end()) {
+                auto& proxy = entry->second.shadow_proxy;
+                if (!proxy) {
+                    // Weak GUI ownership: the timer is main-thread only and the
+                    // worker owns only immutable mesh input and CPU output.
+                    wxWeakRef<GUI::Plater> plater(GUI::wxGetApp().plater());
+                    const auto small_ready = m_lodSmallReady;
+                    const auto middle_ready = m_lodMiddleReady;
+                    proxy = std::make_unique<GUI::ShadowMeshProxy>(
+                        [plater] {
+                            return plater && GUI::wxGetApp().app_config &&
+                                GUI::wxGetApp().app_config->get_bool("show_model_shadow");
+                        },
+                        [small_ready, middle_ready] {
+                            // Avoid a third concurrent copy/QEM job during import.
+                            return (!small_ready || small_ready->load(std::memory_order_acquire)) &&
+                                (!middle_ready || middle_ready->load(std::memory_order_acquire));
+                        },
+                        [plater] {
+                            if (!plater)
+                                return;
+                            if (auto* canvas = plater->get_view3D_canvas3D())
+                                canvas->set_as_dirty();
+                            if (auto* canvas = plater->get_preview_canvas3D())
+                                canvas->set_as_dirty();
+                            wxWakeUpIdle();
+                        });
+                }
+                shadow_model = proxy->get(entry->second.mesh);
+            }
+            // Pending/failed proxy: omit this caster instead of silently
+            // restoring the full-resolution, multi-million-triangle path.
+        }
+        if (shadow_model) {
+            glsafe(::glFrontFace(is_left_handed() ? GL_CW : GL_CCW));
+            glsafe(::glCullFace(GL_BACK));
+            if (shadow_model == &model && !full_range)
+                shadow_model->render(tverts_range);
+            else
+                shadow_model->render();
+            glsafe(::glFrontFace(GL_CCW));
+        }
+        return;
+    }
 
     ModelObjectPtrs&       model_objects = GUI::wxGetApp().model().objects;
     std::vector<ColorRGBA> colors        = get_extruders_colors();

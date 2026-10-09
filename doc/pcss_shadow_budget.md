@@ -1,83 +1,86 @@
-# Performance-bounded PCSS shadow filtering
+# PCSS v2: contact hardening, bounded shadow geometry, and a live preference
 
-Baseline: `27a56130dab462685ef3ca8dec364ea887852333` on `feature_pcss_shadow`.
+Baseline: `8f2be2697663b8ba59138090b146733536c9684c` on `feature_pcss_shadow`.
 
-## Diagnosis
+## Why the previous change was insufficient
 
-The original receivers in `resources/shaders/{110,140}/{flat,gouraud,gouraud_light}.fs` used four fixed Poisson offsets for blocker search and four binary depth comparisons for PCF. Although eight offsets were declared, each loop only visited the first four. Thus PCF could produce only 0, 0.25, 0.5, 0.75 or 1.0. Averaging a few displaced hard-shadow silhouettes explains layered or apparently separated edges rather than a continuous soft edge. The first four offsets also form an unbalanced subset and do not include the center, making thin blockers easier to miss.
+The previous shared 3x3 filter capped its half-width at 0.5-1.0 shadow texels. It removed the original four-tap layering but saturated almost immediately, so distant shadows still looked like narrow PCF. It also left `GLCanvas3D::RenderShadowMap()` calling the ordinary `GLVolume::render()` path every frame. That path could select the full-resolution viewer mesh, run color/material splitting, and submit a multi-million-triangle mesh a second time. A small 512x512 depth texture does not bound vertex processing or triangle setup.
 
-`GLCanvas3D::RenderShadowMap()` fits an orthographic light camera to scene bounds and uses a 512x512 map with NEAREST depth sampling. When the camera zooms in, a shadow texel can cover many screen pixels; this magnifies the quantization. A wider sparse filter is not a substitute for reconstruction.
+These are code-level causes consistent with the report. The user's original 3-million-triangle asset and target graphics hardware are not available in this validation environment.
 
-The original `(receiverDepth - blockerDepth) / blockerDepth` expression divides normalized orthographic depth by a value whose origin depends on the arbitrary near plane. Together with the ad-hoc `*32` scale, it is not a consistent directional-light penumbra calculation. A fixed normalized bias is also scene-scale dependent, and offset samples need receiver-plane correction on sloping receivers. Finally, only UV bounds were checked, not the receiver's light-space Z bounds.
+## Actual PCSS receiver stages
 
-These are code-level findings consistent with the reported screenshots. The exact application scene and target GPU have not been replayed here.
+All six GLSL 110/140 receivers now use the same implementation, retaining the existing uniforms and lighting/clipping/print-volume behavior:
 
-## Implemented fix
+1. Nine independent raw-depth blocker samples, including the center and balanced rings. The search footprint follows the directional light's possible separation and is bounded separately from the final filter.
+2. Average blocker separation in orthographic light space. `radiusWorld = separationWorld * tan(angularRadius)`, converted to UV units using the existing light matrix. The implementation does not divide by normalized blocker depth.
+3. Twelve disk-distributed PCF locations across the computed radius. Each location reconstructs bilinear visibility using four NEAREST depth comparisons, with receiver-plane correction at the actual fetched texel centers. It does not interpolate raw depths before comparison.
 
-All six fragment shaders now use the same bounded-cost kernel, with `texture2D` for GLSL 110 and `texture` for GLSL 140. The regression test checks that the kernels remain identical.
+The half-width can now grow to **8 shadow texels**, rather than stopping at 1. Near-zero radii take a single bilinear-PCF contact path. This remains finite-sample PCSS, with a practical wide-kernel cap, not an exact area-light integrator. Nine blocker samples can still miss thin geometry between samples; increasing the cap alone is not a free quality improvement. No temporal randomness, history/denoising pass, new texture state requirement, or extra framebuffer is introduced.
 
-A complete, texel-aligned 3x3 neighborhood is loaded once: at most nine NEAREST raw-depth reads. Those depths are reused for blocker classification, average blocker depth, and the final PCF. The center is included. There is no second texture-sampling loop.
+Derivatives are evaluated before discard or non-uniform lighting branches. UV/Z bounds, lit samples outside the map, and a small world-scale receiver bias are retained. Sparse blocker results are not used as an unsafe all-shadow early-out. Although the separation-to-radius conversion is independent of the depth origin, changing the fitted near plane can change the search footprint and therefore the blockers selected in non-uniform scenes.
 
-The filter integrates a square footprint over the neighboring texel cells. The final result weights the **depth-comparison results**, not interpolated raw depths. Weights vary continuously with the receiver's fractional texel position, removing the old restriction to five visibility levels. Full-light and full-shadow neighborhoods return before the remaining penumbra arithmetic; these exits happen AFTER the nine reads and do not reduce that sampling budget.
+### Fragment cost, explicitly
 
-For the current directional light and orthographic projection:
+| Path | Maximum raw-depth texture reads |
+| --- | ---: |
+| Shadow disabled / outside light volume | 0 |
+| No blockers found | 9 |
+| Near-zero-radius contact filter | 9 + 4 = 13 |
+| General PCSS filter | 9 + 12 x 4 = 57 |
 
-```
-gap_world = (receiver_depth - average_blocker_depth) * (far - near)
-radius_world = gap_world * tan(light_angular_radius)
-radius_uv = radius_world / light_frustum_width
-```
+Wide PCSS is **more expensive per receiving fragment** than the old narrow nine-read filter. The performance improvement for large meshes is primarily in the shadow geometry path below, not a claim that 57 reads cost less than 9. Hardware comparison samplers or a lower-resolution shadow resolve are not implemented in this change.
 
-The existing `shadow_light_size` value is interpreted as the angular tangent (currently 0.035). The row lengths of the existing `shadow_matrix` recover `2/width`, `2/height` and `2/(far-near)`, so no new C++ uniforms or additional per-vertex varyings are needed. This formula is specific to the current orthographic directional light; it must not be reused unchanged for a perspective spot light.
+## Independent shadow geometry
 
-Receiver-plane depth derivatives are evaluated before fragment discard and non-uniform lighting branches. Every fetched texel is compared against the receiver plane at that texel center. A small world-scale base bias (0.02 mm before the existing cap and a numerical floor) replaces the larger scene-dependent constant in the receiver. Bounds checks cover XYZ, and samples outside the map are treated as lit without depending on the texture wrap mode.
+`GLVolume::render()` now recognizes the depth-only shader before ordinary color/material rendering. For a full-range imported model, it uses this policy:
 
-The existing print-volume detection, slope coloring, clipping behavior, lighting composition and uniform interfaces are retained. The change does not modify C++ scene rendering, the light direction, geometry selection, LOD policy, framebuffer allocation or the vertex shaders.
+- Original geometry if already at or below **100,000 triangles**.
+- An existing completed Small/Middle LOD if it satisfies the same budget, independently of the camera's visible-LOD choice.
+- Otherwise one cached `ShadowMeshProxy` per shared source mesh. A background QEM job targets at most 100,000 triangles; only the bounded result is expanded into position-only GL geometry on the main thread.
 
-## Explicit quality/performance tradeoff
+For a 3,000,000-triangle imported model, the prepared shadow draw is therefore at most 100,000 triangles (at most 1/30 of the original shadow triangle count). **This is not a 30x FPS claim.** The normal visible mesh, picking mesh, editable mesh, slicing data and visible-LOD selection are not changed. Instances of the same source share the proxy; each instance still needs a shadow draw with its own transform.
 
-This is a **limited-radius, local PCSS approximation**, not an unrestricted wide-area PCSS implementation. Its blocker search is limited to the same local neighborhood, and the filter half-width is clamped to **0.5 to 1.0 shadow-map texels**. At the lower limit it reproduces bilinear PCF reconstruction; at the upper limit the complete footprint still fits the fetched 3x3 neighborhood. Far shadows therefore stop widening once this cap is reached. The square filter is not a circular area-light integration.
+The budget applies to full-range imported model geometry. Partial index ranges and geometry without an original mesh pointer (for example some auxiliary geometry) keep their original path, because substituting unrelated proxy indices would be incorrect. This is a per-caster budget, not a cap on the total scene's triangles or draw calls.
 
-Do not simply raise the radius clamp: that would request a footprint not represented by the nine samples and invalidate the filter. Wider penumbrae require a separate, explicitly budgeted quality path.
+### Background preparation and ownership
 
-| Work per receiving fragment | Original | This change |
-| --- | --- | --- |
-| No blocker found | 4 raw-depth reads | Up to 9 raw-depth reads |
-| Blocker found / partial shadow | 4 search + 4 filter reads | Up to 9 shared raw-depth reads |
-| Shadow-map resolution | 512x512 | 512x512, unchanged |
-| Extra render targets / full-screen passes | None added by this fix | None |
-| Additional model shadow draws | Existing shadow pass | Unchanged |
+The proxy waits for existing visible-LOD jobs to finish before starting an additional mesh-sized copy/QEM job, and first gives rendering a chance to adopt a completed affordable LOD. A shared worker slot limits extra proxy QEM work to one job at a time. Input ownership is shared/immutable; workers own CPU data only, not a canvas or a GLModel. Release/acquire handoff publishes the result, and GPU resource creation/destruction remains on the UI/GL thread. The timer polls completion at 100 ms, requests a redraw, and does not busy-wait at render FPS.
 
-Nine versus eight reads on the old blocker-found path is NOT an FPS estimate. The old no-blocker path used only four reads, and this change adds derivative and weighting arithmetic. Keeping the fetch count bounded and avoiding larger maps, extra passes and random-noise denoising controls cost, but **a small total-frame regression has not been verified on AMD integrated graphics or the user's scene**.
+While a large proxy is pending, that caster's shadow is temporarily omitted instead of falling back to another 3-million-triangle shadow draw. A failed or over-budget result stays omitted and logs a warning. QEM is an approximation and can alter silhouettes or self-shadowing; original-asset image validation remains necessary. Extra CPU work/memory during preparation is finite but not claimed negligible.
 
-The existing depth pass still redraws geometry each frame and calls `volume->render()`. Geometry-heavy scenes may be dominated by that pass rather than PCF. Shadow-map caching or a dedicated shadow LOD path would be separate C++ work and are not claimed as implemented here. Cached depth would need invalidation for geometry/transforms, visibility, clipping, LOD readiness and light direction; the existing light follows camera rotation, so rotation cannot blindly reuse a stale shadow map.
+Disabling shadows cancels pending proxy work cooperatively; removing the last source-mesh holder destroys its proxy and requests cancellation without joining a worker on the UI thread. Workers retain only their safe CPU ownership. Completed proxies remain cached while their mesh is alive and can be reused when shadows are re-enabled.
 
-Likewise, the scene-wide 512x512 coverage remains a resolution limit for extreme zoom and multiple distant plates. This fix improves filtering; it does not claim to recover absent geometric detail. Camera-fitted receiver bounds and conservative off-camera caster selection are separate work.
+This is **mesh-proxy caching**, not shadow-map caching. The existing depth pass still renders each frame, and follows the existing camera-dependent light direction. No stale depth map is reused during orbit or object transformations. Existing depth-pass clipping/coverage limitations are not fixed here, and scene-wide 512x512 shadow-map resolution remains unchanged.
 
-## Automated validation
+## Preferences
 
-From the repository root:
+General preferences now include **Enable PCSS soft shadows**, next to the camera controls. It uses the existing persistent `show_model_shadow` key and preserves the current saved value. The generic checkbox handler saves the config and explicitly dirties the Prepare and Preview canvases, without reloading meshes or restarting the application.
+
+When off, the existing early return in `RenderShadowMap()` skips shadow FBO work and geometry draws; receiver shadow factors are disabled. Cached GPU resources are not necessarily freed on every toggle. The new English label/tooltip use the normal translation macros; translated catalogs may need an update.
+
+## Regression commands and validation scope
 
 ```sh
 python3 tests/rendering/test_pcss_budget.py
 LIBGL_ALWAYS_SOFTWARE=1 python3 tests/rendering/test_pcss_budget.py --gpu
+python3 tests/rendering/test_shadow_proxy.py --sanitize
 ```
 
-The first command uses only Python's standard library. The optional rendering checks need Linux Mesa EGL/OpenGL shared libraries; they do not need PyOpenGL. Run without Python's `-O` option, which removes assertions.
+The first command needs only Python's standard library. The EGL checks additionally need Linux Mesa OpenGL/EGL; the proxy harness needs a C++17 compiler, with ASan/UBSan for `--sanitize`. Run the proxy harness without Python/C++ assertion-disabling options.
 
-Validation performed on 2026-10-09 using Mesa 25.0.7-2, OpenGL 4.5 compatibility, llvmpipe (LLVM 19.1.7):
+Validation on 2026-10-09:
 
-- Five mathematical/source-consistency tests passed: normalized nonnegative area weights, bilinear contact limit, orthographic unit invariance, six-kernel equality, and the nine-read budget.
-- Both GLSL versions compiled and linked with their actual original vertex shaders for flat, gouraud and gouraud_light, including the environment-map variant: eight program combinations.
-- Synthetic fixtures passed for full light, full shadow, disabled shadows, a sloping self-receiver, out-of-range depth/UV, a one-texel blocker and near/far-plane changes.
-- The magnified edge fixture produced 34 quantized visibility levels instead of being restricted to five. In that fixture, the transition widened from 16 to 32 output pixels when separation increased; these are fixture screen pixels, not shadow-map texels.
+- Four mathematical/source tests passed: six-kernel equality, world-unit radius, balanced disk samples and explicit sampling/resampling budget.
+- Eight actual shader program pairs compiled and linked: GLSL 110/140 flat, gouraud, gouraud_light and the gouraud environment-map variants. Local shader contents were checked against the corresponding remote Git blob hashes.
+- On Mesa 25.0.7-2, llvmpipe (LLVM 19.1.7), synthetic fixtures passed for full light/shadow, disabled shadows, receiver-plane correction, out-of-range UV/Z, a thin contact blocker, and depth-range changes for a uniform blocker.
+- At separations 0.3, 15 and 60 world units, the edge's 5%-95% visibility transition grew to **14, 36 and 134 output pixels**, respectively, in both GLSL versions. The fixture uses 16 output pixels per shadow texel. This verifies widening beyond the old local-PCF footprint; it is not a screenshot from the user's asset.
+- The actual `ShadowMeshProxy.hpp` passed a C++17 ASan/UBSan lifecycle harness with controlled wx/GL/QEM stubs: pending LODs, a 3,000,000-indexed-triangle input and 100,000-triangle budget, reuse, serialized workers, disable/re-enable, deletion during work, exception/empty/over-budget results, and thread ownership. **The QEM implementation is stubbed in this harness:** it tests control flow/lifetime, not real simplification quality or speed.
 
-These are shader correctness checks, **not a full application build, screenshot replay, hardware-driver certification, or frame-rate benchmark**.
+A full application C++ build, native Preferences UI interaction, real QEM geometry regression, original screenshot replay, and AMD/NVIDIA/Intel target-device frame-rate validation have **not** been completed here. Do not turn these isolated checks into a hardware performance guarantee.
 
 ## Target-device acceptance
 
-Compare the baseline and this change in Release builds, with the same scene, viewport, VSync setting, shadow setting and completed LOD generation. Repeatedly reproduce the tall thin object and close-up camera angles in the report, then test multiple instances, transforms, mirrored objects, preview clipping, multiple plates and repeated shadow toggles.
+Rebuild the application, not just its shader resources. In Release builds, compare the baseline, v2-on and v2-off using the same 3-million-triangle model, viewport, VSync and completed preparation state. Inspect the log for the actual proxy triangle count. Measure median and p95 frame time separately for initial preparation, stationary redraw, pan/zoom, orbit and object dragging; distinguish shadow-depth time from receiver-shader time.
 
-Record median and p95 total frame time, plus shadow-depth-pass and receiver-shading time where GPU timing tools are available. Test stationary redraws, pan/zoom, orbit and object dragging separately. For a concrete acceptance gate, use a project-agreed limit such as no more than 5% additional median/p95 total frame time relative to the original PCSS branch; that is a proposed gate, NOT an achieved measurement. Compare shadow-disabled rendering separately to identify the cost already introduced by the original shadow-depth pass.
-
-If the gate fails, profile before increasing resolution or sample count. A smaller filtering improvement must not be misreported as a guarantee about the cost of rendering a large mesh twice.
+Check contact versus distant penumbrae, thin details, painted/mirrored/multiple instances, deletion during preparation, rapid toggles, restart persistence and Preview behavior. If the fragment path dominates on the target GPU, optimize or add an explicitly budgeted resolve path instead of claiming geometry reduction alone guarantees a small total-frame regression.
