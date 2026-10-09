@@ -1,0 +1,32 @@
+name: PCSS validation workspace
+on:
+  push:
+    branches: [codex/pcss-v2-validation]
+    paths: [.github/workflows/pcss-validation.yml, .pcss-patch.b64]
+  pull_request:
+    branches: [feature_pcss_shadow]
+    paths: [.github/workflows/pcss-validation.yml, .pcss-patch.b64]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            src
+            resources/shaders
+            tests/rendering
+            cmake
+      - name: Export baseline sources for focused rendering tests
+        run: |
+          git rev-parse HEAD > revision.txt
+          find src resources/shaders tests -name AGENTS.md -print
+          tar -czf pcss-source.tar.gz src resources/shaders tests/rendering cmake AGENTS.md CMakeLists.txt revision.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pcss-source
+          path: pcss-source.tar.gz
+          retention-days: 2
