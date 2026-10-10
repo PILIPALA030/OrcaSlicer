@@ -10,6 +10,7 @@
 
 namespace Slic3r {
 
+class GLShaderProgram;
 class GLVolume;
 class GLVolumeCollection;
 
@@ -24,6 +25,26 @@ struct SoftShadowFrameInput
     GLVolumeCollection* volumes{ nullptr };
     bool interactive{ false };
     bool renderSlaAuxiliaries{ true };
+};
+
+/** @brief Pixel rectangle [x0, x1) x [y0, y1), relative to the viewport or target origin. */
+struct SoftShadowPixelRect
+{
+    int x0{ 0 };
+    int y0{ 0 };
+    int x1{ 0 };
+    int y1{ 0 };
+
+    bool IsEmpty() const { return x1 <= x0 || y1 <= y0; }
+};
+
+/** @brief Diagnostics of the last shadow map rebuild. */
+struct SoftShadowMapStats
+{
+    std::size_t casterCount{ 0 };
+    std::size_t lodCount{ 0 };
+    std::size_t triangles{ 0 };
+    bool interactive{ false };
 };
 
 /** @brief Non-blocking GPU timer built on a ring of GL_TIME_ELAPSED queries. */
@@ -81,17 +102,43 @@ public:
      */
     void RenderReceivers(const Camera& camera, PartPlateList& plates, bool darkMode);
 
+    /**
+     * @brief Darkens visible object pixels lying in shadow, computed once per screen pixel.
+     * Call right after the opaque objects are drawn and before the plates, so the depth holds objects only.
+     * @param camera Camera of the current frame.
+     * @param darkMode Selects the shadow strength for the dark theme.
+     */
+    void RenderObjectShadows(const Camera& camera, bool darkMode);
+
     /** @brief Releases all GL objects; the GL context must be current. */
     void Release();
 
     /** @brief Returns true when GL resources are allocated. */
     bool HasResources() const { return _shadowFramebuffer != 0 || _maskFramebuffer != 0; }
 
-    /** @brief Returns the smoothed GPU time of the last mask rebuild in milliseconds. */
-    float GetUpdateGpuTimeMs() const { return _updateTimer.GetTimeMs(); }
+    /** @brief Returns the smoothed GPU time of the shadow map depth pass in milliseconds. */
+    float GetDepthPassGpuTimeMs() const { return _depthPassTimer.GetTimeMs(); }
+
+    /** @brief Returns the smoothed GPU time of the ground mask pass in milliseconds. */
+    float GetMaskPassGpuTimeMs() const { return _maskPassTimer.GetTimeMs(); }
 
     /** @brief Returns the smoothed GPU time of the receiver pass in milliseconds. */
     float GetReceiverGpuTimeMs() const { return _receiverTimer.GetTimeMs(); }
+
+    /** @brief Returns the smoothed GPU times of the object shadow steps (depth copy / shading / composite) in ms. */
+    float GetSceneDepthCopyGpuTimeMs() const { return _sceneDepthCopyTimer.GetTimeMs(); }
+    float GetObjectShadeGpuTimeMs() const { return _objectShadeTimer.GetTimeMs(); }
+    float GetObjectCompositeGpuTimeMs() const { return _objectCompositeTimer.GetTimeMs(); }
+
+    /** @brief Switch for objects receiving shadows; the ground shadow is unaffected. */
+    void SetObjectReceiveEnabled(bool enabled) { _objectReceiveEnabled = enabled; }
+    bool IsObjectReceiveEnabled() const { return _objectReceiveEnabled; }
+
+    /** @brief Returns how many times the shadow map and mask were rebuilt. */
+    unsigned int GetRebuildCount() const { return _rebuildCount; }
+
+    /** @brief Returns the diagnostics of the last shadow map rebuild. */
+    const SoftShadowMapStats& GetShadowMapStats() const { return _shadowMapStats; }
 
 private:
     bool EnsureResources();
@@ -99,15 +146,31 @@ private:
     bool CreateMaskResources();
     bool CollectCasters(const SoftShadowFrameInput& input);
     std::size_t ComputeSignature(bool interactive) const;
-    void FitLightFrustum();
-    bool RenderShadowMap();
+    void FitLightFrustum(const BoundingBoxf3& fitBox);
+    void UpdateLightFrustum(bool interactive);
+    bool RenderShadowMap(bool interactive);
     void BuildFootprintModel();
     bool RenderGroundMask(bool interactive);
+    void BlurGroundMask();
+    void EnsureFullscreenQuad();
+    bool EnsureSceneDepthResources(int width, int height);
+    void ReleaseSceneDepthResources();
+    bool CopySceneDepth(const std::array<int, 4>& viewport, const SoftShadowPixelRect& copyRect);
+    bool EnsureObjectShadowTarget(int width, int height);
+    void ReleaseObjectShadowTarget();
+    void DrawObjectShadows(GLShaderProgram& shader, const Camera& camera, int resolutionScale,
+                           const SoftShadowPixelRect& shadeRect, bool darkMode);
+    void CompositeObjectShadows(GLShaderProgram& shader, const Camera& camera, const std::array<int, 4>& viewport,
+                                int resolutionScale, const SoftShadowPixelRect& workRect);
+    void DisableObjectShadows(const char* reason);
 
     unsigned int _shadowFramebuffer{ 0 };
     unsigned int _shadowDepthTexture{ 0 };
     unsigned int _maskFramebuffer{ 0 };
     unsigned int _maskTexture{ 0 };
+    // Ping-pong target of the separable mask blur
+    unsigned int _maskBlurFramebuffer{ 0 };
+    unsigned int _maskBlurTexture{ 0 };
     unsigned int _rawDepthSampler{ 0 };
     unsigned int _compareDepthSampler{ 0 };
     unsigned int _shadowMapSize{ 0 };
@@ -128,10 +191,35 @@ private:
 
     std::size_t _lastSignature{ 0 };
     bool _lastWasInteractive{ false };
+    // While dragging the light frustum stays fixed, so other shadows do not swim with a moving texel grid
+    bool _frustumFrozen{ false };
+    BoundingBoxf3 _frozenFitBox;
     bool _maskValid{ false };
 
-    SoftShadowGpuTimer _updateTimer;
+    SoftShadowGpuTimer _depthPassTimer;
+    SoftShadowGpuTimer _maskPassTimer;
     SoftShadowGpuTimer _receiverTimer;
+    SoftShadowGpuTimer _sceneDepthCopyTimer;
+    SoftShadowGpuTimer _objectShadeTimer;
+    SoftShadowGpuTimer _objectCompositeTimer;
+    bool _objectReceiveEnabled{ true };
+
+    // Copy of the scene depth used by the screen-space object shadow pass
+    unsigned int _sceneDepthFramebuffer{ 0 };
+    unsigned int _sceneDepthTexture{ 0 };
+    int _sceneDepthWidth{ 0 };
+    int _sceneDepthHeight{ 0 };
+    bool _sceneDepthVerified{ false };
+    bool _objectShadowsFailed{ false };
+    GLModel _fullscreenQuad;
+
+    // Intermediate object shadow result: R = shadow amount, G = linear view depth, BA = octahedral normal
+    unsigned int _objectShadowFramebuffer{ 0 };
+    unsigned int _objectShadowTexture{ 0 };
+    int _objectShadowWidth{ 0 };
+    int _objectShadowHeight{ 0 };
+    unsigned int _rebuildCount{ 0 };
+    SoftShadowMapStats _shadowMapStats;
 };
 
 } // namespace GUI

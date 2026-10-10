@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <utility>
 
@@ -23,28 +24,49 @@ namespace GUI {
 
 namespace {
 
-// Direction towards the light in world space, tilted so the shadow falls towards the default camera.
-const Vec3d TO_LIGHT_DIR = Vec3d(-0.2, 0.3, 1.0).normalized();
-constexpr float LIGHT_SPREAD = 0.06f;
+// Direction towards the light in world space, tilted ~36 deg so the shadow falls towards the default camera.
+const Vec3d TO_LIGHT_DIR = Vec3d(-0.4, 0.6, 1.0).normalized();
+constexpr float LIGHT_SPREAD = 0.04f;
 constexpr double MAX_SEARCH_MM = 25.0;
 constexpr double MIN_PENUMBRA_TEXELS = 1.5;
 constexpr double DEPTH_BIAS_MM = 0.05;
 constexpr double FRUSTUM_PADDING_MM = 1.0;
+// Room around the casters while dragging, so the frozen light frustum rarely has to be refitted
+constexpr double FROZEN_FRUSTUM_MARGIN_MM = 20.0;
+constexpr double FROZEN_FRUSTUM_MARGIN_RATIO = 0.25;
 constexpr double GROUND_Z = 0.0;
 constexpr unsigned int SHADOW_MAP_SIZE = 2048;
-constexpr unsigned int MASK_SIZE = 2048;
+constexpr unsigned int MASK_SIZE = 1024;
 constexpr double MIN_SHADOW_TEXEL_MM = 0.1;
 constexpr double MIN_MASK_TEXEL_MM = 0.15;
 constexpr double FOOTPRINT_MARGIN_TEXELS = 2.0;
 constexpr int BLOCKER_SAMPLES_HQ = 16;
 constexpr int PCF_SAMPLES_HQ = 32;
+// While dragging the mask keeps full resolution (no blur) and only uses fewer samples
 constexpr int BLOCKER_SAMPLES_LQ = 8;
 constexpr int PCF_SAMPLES_LQ = 16;
-constexpr float INTERACTIVE_MASK_SCALE = 0.5f;
+// Object shadows are shaded at half resolution and upsampled by depth and normal
+constexpr int OBJECT_SHADOW_RESOLUTION_SCALE = 2;
 constexpr float RECEIVER_Z = -0.01f;
-constexpr float STRENGTH_LIGHT = 0.35f;
-constexpr float STRENGTH_DARK = 0.5f;
+constexpr float STRENGTH_LIGHT = 0.55f;
+constexpr float STRENGTH_DARK = 0.75f;
 constexpr float GPU_TIME_SMOOTHING = 0.1f;
+// Object shadows run once per screen pixel every frame, so they use fewer samples and a lighter shadow
+constexpr int OBJECT_BLOCKER_SAMPLES = 8;
+constexpr int OBJECT_PCF_SAMPLES = 16;
+constexpr double OBJECT_NORMAL_OFFSET_TEXELS = 3.0;
+// Pixels added around the projected object bounds; normals read neighbouring depth pixels
+constexpr int OBJECT_RECT_MARGIN = 4;
+constexpr double OBJECT_DEPTH_BIAS_MM = 0.1;
+// Extra normal offset per mm of view depth, covering the error of positions reconstructed from 24-bit depth
+constexpr float OBJECT_RECONSTRUCT_OFFSET = 0.0005f;
+// Relative view depth difference above which a half resolution sample is not blended across a silhouette
+constexpr float UPSAMPLE_DEPTH_TOLERANCE = 0.02f;
+// Steepest receiver slope (world dz per dxy in light space) used by the receiver plane depth bias
+constexpr double OBJECT_MAX_RECEIVER_SLOPE = 5.0;
+constexpr float OBJECT_STRENGTH_LIGHT = 0.45f;
+constexpr float OBJECT_STRENGTH_DARK = 0.45f;
+constexpr int GUARDED_TEXTURE_UNITS = 3;
 
 /** @brief OpenGL states touched by the soft shadow passes, restored on destruction. */
 class ShadowStateGuard
@@ -55,6 +77,8 @@ public:
         _blend = glIsEnabled(GL_BLEND);
         _cullFace = glIsEnabled(GL_CULL_FACE);
         _depthTest = glIsEnabled(GL_DEPTH_TEST);
+        _scissorTest = glIsEnabled(GL_SCISSOR_TEST);
+        glsafe(::glGetIntegerv(GL_SCISSOR_BOX, _scissorBox.data()));
         glsafe(::glGetBooleanv(GL_DEPTH_WRITEMASK, &_depthMask));
         glsafe(::glGetBooleanv(GL_COLOR_WRITEMASK, _colorMask.data()));
         glsafe(::glGetFloatv(GL_COLOR_CLEAR_VALUE, _clearColor.data()));
@@ -67,10 +91,11 @@ public:
         glsafe(::glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &_drawFramebuffer));
         glsafe(::glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &_readFramebuffer));
         glsafe(::glGetIntegerv(GL_ACTIVE_TEXTURE, &_activeTexture));
-        glsafe(::glActiveTexture(GL_TEXTURE0));
-        glsafe(::glGetIntegerv(GL_TEXTURE_BINDING_2D, &_texture0));
-        glsafe(::glActiveTexture(GL_TEXTURE1));
-        glsafe(::glGetIntegerv(GL_TEXTURE_BINDING_2D, &_texture1));
+        for (int unit = 0; unit < GUARDED_TEXTURE_UNITS; ++unit)
+        {
+            glsafe(::glActiveTexture(static_cast<GLenum>(GL_TEXTURE0 + unit)));
+            glsafe(::glGetIntegerv(GL_TEXTURE_BINDING_2D, &_textures[unit]));
+        }
         glsafe(::glActiveTexture(static_cast<GLenum>(_activeTexture)));
     }
 
@@ -79,6 +104,8 @@ public:
         SetEnabled(GL_BLEND, _blend);
         SetEnabled(GL_CULL_FACE, _cullFace);
         SetEnabled(GL_DEPTH_TEST, _depthTest);
+        SetEnabled(GL_SCISSOR_TEST, _scissorTest);
+        glsafe(::glScissor(_scissorBox[0], _scissorBox[1], _scissorBox[2], _scissorBox[3]));
         glsafe(::glDepthMask(_depthMask));
         glsafe(::glColorMask(_colorMask[0], _colorMask[1], _colorMask[2], _colorMask[3]));
         glsafe(::glClearColor(_clearColor[0], _clearColor[1], _clearColor[2], _clearColor[3]));
@@ -89,12 +116,12 @@ public:
         glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(_drawFramebuffer)));
         glsafe(::glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(_readFramebuffer)));
         glsafe(::glViewport(_viewport[0], _viewport[1], _viewport[2], _viewport[3]));
-        glsafe(::glBindSampler(0, 0));
-        glsafe(::glBindSampler(1, 0));
-        glsafe(::glActiveTexture(GL_TEXTURE1));
-        glsafe(::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(_texture1)));
-        glsafe(::glActiveTexture(GL_TEXTURE0));
-        glsafe(::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(_texture0)));
+        for (int unit = 0; unit < GUARDED_TEXTURE_UNITS; ++unit)
+        {
+            glsafe(::glBindSampler(static_cast<GLuint>(unit), 0));
+            glsafe(::glActiveTexture(static_cast<GLenum>(GL_TEXTURE0 + unit)));
+            glsafe(::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(_textures[unit])));
+        }
         glsafe(::glActiveTexture(static_cast<GLenum>(_activeTexture)));
     }
 
@@ -113,6 +140,8 @@ private:
     GLboolean _blend{ GL_FALSE };
     GLboolean _cullFace{ GL_FALSE };
     GLboolean _depthTest{ GL_FALSE };
+    GLboolean _scissorTest{ GL_FALSE };
+    std::array<GLint, 4> _scissorBox{ { 0, 0, 0, 0 } };
     GLboolean _depthMask{ GL_TRUE };
     std::array<GLboolean, 4> _colorMask{ { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE } };
     std::array<GLfloat, 4> _clearColor{ { 0.0f, 0.0f, 0.0f, 0.0f } };
@@ -125,9 +154,125 @@ private:
     GLint _drawFramebuffer{ 0 };
     GLint _readFramebuffer{ 0 };
     GLint _activeTexture{ GL_TEXTURE0 };
-    GLint _texture0{ 0 };
-    GLint _texture1{ 0 };
+    std::array<GLint, GUARDED_TEXTURE_UNITS> _textures{ { 0, 0, 0 } };
 };
+
+/** @brief Texture storage matching the default framebuffer depth, required by glBlitFramebuffer. */
+struct DepthCopyFormat
+{
+    GLint internalFormat{ 0 };
+    GLenum format{ GL_NONE };
+    GLenum type{ GL_NONE };
+    GLenum attachment{ GL_NONE };
+};
+
+/**
+ * @brief Queries the depth/stencil layout of the default framebuffer bound for reading.
+ * @return false when the layout has no matching texture format.
+ */
+bool QueryDefaultDepthFormat(DepthCopyFormat& out)
+{
+    GLint depthType = GL_NONE;
+    glsafe(::glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_DEPTH, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &depthType));
+    if (depthType == GL_NONE)
+        return false;
+
+    GLint depthBits = 0;
+    GLint componentType = GL_NONE;
+    glsafe(::glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_DEPTH, GL_FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE, &depthBits));
+    glsafe(::glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_DEPTH, GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE, &componentType));
+
+    GLint stencilType = GL_NONE;
+    GLint stencilBits = 0;
+    glsafe(::glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_STENCIL, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &stencilType));
+    if (stencilType != GL_NONE)
+        glsafe(::glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_STENCIL, GL_FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE, &stencilBits));
+    if (stencilBits != 0 && stencilBits != 8)
+        return false;
+
+    const bool hasStencil = stencilBits == 8;
+    if (componentType == GL_FLOAT && depthBits == 32)
+    {
+        out.internalFormat = hasStencil ? GL_DEPTH32F_STENCIL8 : GL_DEPTH_COMPONENT32F;
+        out.format = hasStencil ? GL_DEPTH_STENCIL : GL_DEPTH_COMPONENT;
+        out.type = hasStencil ? GL_FLOAT_32_UNSIGNED_INT_24_8_REV : GL_FLOAT;
+    }
+    else if (depthBits == 24)
+    {
+        out.internalFormat = hasStencil ? GL_DEPTH24_STENCIL8 : GL_DEPTH_COMPONENT24;
+        out.format = hasStencil ? GL_DEPTH_STENCIL : GL_DEPTH_COMPONENT;
+        out.type = hasStencil ? GL_UNSIGNED_INT_24_8 : GL_UNSIGNED_INT;
+    }
+    else if ((depthBits == 32 || depthBits == 16) && !hasStencil)
+    {
+        out.internalFormat = depthBits == 32 ? GL_DEPTH_COMPONENT32 : GL_DEPTH_COMPONENT16;
+        out.format = GL_DEPTH_COMPONENT;
+        out.type = GL_UNSIGNED_INT;
+    }
+    else
+    {
+        return false;
+    }
+    out.attachment = hasStencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+    return true;
+}
+
+/** @brief Grows a rectangle by margin pixels and clamps it to [0, width) x [0, height). */
+SoftShadowPixelRect ExpandRect(const SoftShadowPixelRect& rect, int margin, int width, int height)
+{
+    SoftShadowPixelRect result;
+    result.x0 = std::max(0, rect.x0 - margin);
+    result.y0 = std::max(0, rect.y0 - margin);
+    result.x1 = std::min(width, rect.x1 + margin);
+    result.y1 = std::min(height, rect.y1 + margin);
+    return result;
+}
+
+/**
+ * @brief Projects a world box to viewport pixels.
+ * @return The covered rectangle, the whole viewport when a corner is behind the camera, empty when off screen.
+ */
+SoftShadowPixelRect ProjectBoxToScreen(const BoundingBoxf3& box, const Matrix4d& viewProjection, int width, int height)
+{
+    SoftShadowPixelRect full;
+    full.x1 = width;
+    full.y1 = height;
+
+    double minX = std::numeric_limits<double>::max();
+    double minY = std::numeric_limits<double>::max();
+    double maxX = std::numeric_limits<double>::lowest();
+    double maxY = std::numeric_limits<double>::lowest();
+    for (int i = 0; i < 8; ++i)
+    {
+        const Vec4d corner((i & 1) != 0 ? box.max.x() : box.min.x(), (i & 2) != 0 ? box.max.y() : box.min.y(),
+                           (i & 4) != 0 ? box.max.z() : box.min.z(), 1.0);
+        const Vec4d clip = viewProjection * corner;
+        if (clip.w() <= 1.0e-6)
+            return full;
+
+        const double px = (clip.x() / clip.w() * 0.5 + 0.5) * static_cast<double>(width);
+        const double py = (clip.y() / clip.w() * 0.5 + 0.5) * static_cast<double>(height);
+        minX = std::min(minX, px);
+        minY = std::min(minY, py);
+        maxX = std::max(maxX, px);
+        maxY = std::max(maxY, py);
+    }
+
+    SoftShadowPixelRect rect;
+    rect.x0 = static_cast<int>(std::floor(std::max(minX, 0.0)));
+    rect.y0 = static_cast<int>(std::floor(std::max(minY, 0.0)));
+    rect.x1 = static_cast<int>(std::ceil(std::min(maxX, static_cast<double>(width))));
+    rect.y1 = static_cast<int>(std::ceil(std::min(maxY, static_cast<double>(height))));
+    return rect;
+}
+
+/** @brief Returns true when inner lies completely inside outer. */
+bool BoxContains(const BoundingBoxf3& outer, const BoundingBoxf3& inner)
+{
+    return outer.defined && inner.defined && outer.min.x() <= inner.min.x() && outer.min.y() <= inner.min.y() &&
+           outer.min.z() <= inner.min.z() && outer.max.x() >= inner.max.x() && outer.max.y() >= inner.max.y() &&
+           outer.max.z() >= inner.max.z();
+}
 
 /** @brief Returns the 8 corners of a bounding box. */
 std::array<Vec3d, 8> GetBoxCorners(const BoundingBoxf3& box)
@@ -216,6 +361,22 @@ bool IsDrawFramebufferComplete()
 {
     const GLenum status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
     return status == GL_FRAMEBUFFER_COMPLETE;
+}
+
+/** @brief Returns true when a LOD model was generated and handed over for rendering. */
+bool IsLodModelReady(const std::shared_ptr<GLModel>& model)
+{
+    return model != nullptr && !model->is_render_disabled() && model->is_initialized();
+}
+
+/** @brief Returns the coarsest LOD model of a volume that is ready, or nullptr when none is. */
+GLModel* GetReadyLodModel(GLVolume& volume)
+{
+    if (IsLodModelReady(volume.m_modelSmall))
+        return volume.m_modelSmall.get();
+    if (IsLodModelReady(volume.m_modelMiddle))
+        return volume.m_modelMiddle.get();
+    return nullptr;
 }
 
 /** @brief Returns true when the volume should cast a shadow. */
@@ -324,7 +485,16 @@ bool SoftShadowRenderer::CreateMaskResources()
     _maskFramebuffer = static_cast<unsigned int>(framebuffer);
     glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer));
     glsafe(::glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, _maskTexture, 0));
-    return _maskTexture != 0 && IsDrawFramebufferComplete();
+    if (_maskTexture == 0 || !IsDrawFramebufferComplete())
+        return false;
+
+    _maskBlurTexture = CreateTexture2D(GL_R8, GL_RED, GL_UNSIGNED_BYTE, _maskSize);
+    GLuint blurFramebuffer = 0;
+    glsafe(::glGenFramebuffers(1, &blurFramebuffer));
+    _maskBlurFramebuffer = static_cast<unsigned int>(blurFramebuffer);
+    glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, blurFramebuffer));
+    glsafe(::glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, _maskBlurTexture, 0));
+    return _maskBlurTexture != 0 && IsDrawFramebufferComplete();
 }
 
 bool SoftShadowRenderer::EnsureResources()
@@ -419,7 +589,7 @@ std::size_t SoftShadowRenderer::ComputeSignature(bool interactive) const
     return seed;
 }
 
-void SoftShadowRenderer::FitLightFrustum()
+void SoftShadowRenderer::FitLightFrustum(const BoundingBoxf3& fitBox)
 {
     // Light basis: view +Z points towards the light, so the light looks down -Z.
     const Vec3d axisZ = TO_LIGHT_DIR;
@@ -432,12 +602,28 @@ void SoftShadowRenderer::FitLightFrustum()
     _lightView = Transform3d::Identity();
     _lightView.linear() = rotation;
 
+    const BoundingBoxf ground = GetGroundFootprint(fitBox, MAX_SEARCH_MM);
+    const double maskMinExtent = static_cast<double>(_maskSize) * MIN_MASK_TEXEL_MM;
+    const double maskSide = std::max({ ground.size().x(), ground.size().y(), maskMinExtent });
+    const Vec2d maskCenter = ground.center();
+    _maskRect = { { static_cast<float>(maskCenter.x() - 0.5 * maskSide), static_cast<float>(maskCenter.y() - 0.5 * maskSide),
+                    static_cast<float>(maskCenter.x() + 0.5 * maskSide), static_cast<float>(maskCenter.y() + 0.5 * maskSide) } };
+
     BoundingBoxf3 lightBox;
-    const std::array<Vec3d, 8> corners = GetBoxCorners(_casterBox);
+    const std::array<Vec3d, 8> corners = GetBoxCorners(fitBox);
     for (const Vec3d& corner : corners)
     {
         lightBox.merge(Vec3d(_lightView * corner));
         lightBox.merge(Vec3d(_lightView * ProjectToGround(corner)));
+    }
+
+    // Every ground texel of the mask must lie inside the depth range, otherwise it reads as fully occluded
+    for (int i = 0; i < 4; ++i)
+    {
+        const Vec3d groundCorner(_maskRect[(i & 1) != 0 ? 2 : 0], _maskRect[(i & 2) != 0 ? 3 : 1], GROUND_Z);
+        const double lightZ = (_lightView * groundCorner).z();
+        lightBox.min.z() = std::min(lightBox.min.z(), lightZ);
+        lightBox.max.z() = std::max(lightBox.max.z(), lightZ);
     }
 
     const double minExtent = static_cast<double>(_shadowMapSize) * MIN_SHADOW_TEXEL_MM;
@@ -449,16 +635,32 @@ void SoftShadowRenderer::FitLightFrustum()
                                  center.y() - 0.5 * side, center.y() + 0.5 * side, nearZ, farZ);
     _lightExtent = Vec2f(static_cast<float>(side), static_cast<float>(side));
     _depthSpan = static_cast<float>(farZ - nearZ);
-
-    const BoundingBoxf ground = GetGroundFootprint(_casterBox, MAX_SEARCH_MM);
-    const double maskMinExtent = static_cast<double>(_maskSize) * MIN_MASK_TEXEL_MM;
-    const double maskSide = std::max({ ground.size().x(), ground.size().y(), maskMinExtent });
-    const Vec2d maskCenter = ground.center();
-    _maskRect = { { static_cast<float>(maskCenter.x() - 0.5 * maskSide), static_cast<float>(maskCenter.y() - 0.5 * maskSide),
-                    static_cast<float>(maskCenter.x() + 0.5 * maskSide), static_cast<float>(maskCenter.y() + 0.5 * maskSide) } };
 }
 
-bool SoftShadowRenderer::RenderShadowMap()
+void SoftShadowRenderer::UpdateLightFrustum(bool interactive)
+{
+    if (!interactive)
+    {
+        _frustumFrozen = false;
+        FitLightFrustum(_casterBox);
+        return;
+    }
+
+    // Keep the frustum of the drag start while the casters stay inside it
+    if (_frustumFrozen && BoxContains(_frozenFitBox, _casterBox))
+        return;
+
+    const Vec3d size = _casterBox.size();
+    const double margin = std::max(FROZEN_FRUSTUM_MARGIN_MM, FROZEN_FRUSTUM_MARGIN_RATIO * std::max(size.x(), size.y()));
+    _frozenFitBox = _casterBox;
+    _frozenFitBox.min -= Vec3d(margin, margin, margin);
+    _frozenFitBox.max += Vec3d(margin, margin, margin);
+    _frozenFitBox.min.z() = _casterBox.min.z();
+    FitLightFrustum(_frozenFitBox);
+    _frustumFrozen = true;
+}
+
+bool SoftShadowRenderer::RenderShadowMap(bool interactive)
 {
     GLShaderProgram* const shader = wxGetApp().get_shader("flat");
     if (shader == nullptr)
@@ -476,10 +678,25 @@ bool SoftShadowRenderer::RenderShadowMap()
 
     shader->start_using();
     shader->set_uniform("projection_matrix", _lightProjection);
+    _shadowMapStats = SoftShadowMapStats();
+    _shadowMapStats.interactive = interactive;
     for (GLVolume* volume : _casters)
     {
         shader->set_uniform("view_model_matrix", _lightView * volume->world_matrix());
-        volume->render();
+        // While dragging, simplified meshes keep the per-frame rebuild cheap; the settle rebuild uses full meshes
+        GLModel* const lodModel = interactive ? GetReadyLodModel(*volume) : nullptr;
+        if (lodModel != nullptr)
+        {
+            lodModel->render();
+            ++_shadowMapStats.lodCount;
+            _shadowMapStats.triangles += lodModel->indices_count() / 3;
+        }
+        else
+        {
+            volume->render();
+            _shadowMapStats.triangles += volume->model.indices_count() / 3;
+        }
+        ++_shadowMapStats.casterCount;
     }
     shader->stop_using();
 
@@ -524,7 +741,8 @@ bool SoftShadowRenderer::RenderGroundMask(bool interactive)
     glsafe(::glClearColor(1.0f, 1.0f, 1.0f, 1.0f));
     glsafe(::glClear(GL_COLOR_BUFFER_BIT));
 
-    _maskUvScale = interactive ? INTERACTIVE_MASK_SCALE : 1.0f;
+    // A reduced resolution while dragging visibly blurred the shadow, so only the sample count drops
+    _maskUvScale = 1.0f;
     const GLsizei viewportSize = static_cast<GLsizei>(std::lround(static_cast<double>(_maskSize) * _maskUvScale));
     glsafe(::glViewport(0, 0, viewportSize, viewportSize));
     glsafe(::glDisable(GL_DEPTH_TEST));
@@ -558,6 +776,50 @@ bool SoftShadowRenderer::RenderGroundMask(bool interactive)
     return true;
 }
 
+void SoftShadowRenderer::BlurGroundMask()
+{
+    GLShaderProgram* const shader = wxGetApp().get_shader("shadow_mask_blur");
+    if (shader == nullptr || _maskBlurFramebuffer == 0)
+        return;
+
+    EnsureFullscreenQuad();
+    glsafe(::glViewport(0, 0, static_cast<GLsizei>(_maskSize), static_cast<GLsizei>(_maskSize)));
+    glsafe(::glDisable(GL_BLEND));
+    glsafe(::glDisable(GL_DEPTH_TEST));
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+    glsafe(::glBindSampler(0, 0));
+
+    shader->start_using();
+    shader->set_uniform("source_mask", 0);
+    // Horizontal: mask -> blur target, vertical: blur target -> mask
+    glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, _maskBlurFramebuffer));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, _maskTexture));
+    shader->set_uniform("direction", std::array<int, 2>{ { 1, 0 } });
+    _fullscreenQuad.render();
+
+    glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, _maskFramebuffer));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, _maskBlurTexture));
+    shader->set_uniform("direction", std::array<int, 2>{ { 0, 1 } });
+    _fullscreenQuad.render();
+    shader->stop_using();
+}
+
+void SoftShadowRenderer::EnsureFullscreenQuad()
+{
+    if (_fullscreenQuad.is_initialized())
+        return;
+
+    GLModel::Geometry geometry;
+    geometry.format = { GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3 };
+    geometry.add_vertex(Vec3f(-1.0f, -1.0f, 0.0f));
+    geometry.add_vertex(Vec3f(1.0f, -1.0f, 0.0f));
+    geometry.add_vertex(Vec3f(1.0f, 1.0f, 0.0f));
+    geometry.add_vertex(Vec3f(-1.0f, 1.0f, 0.0f));
+    geometry.add_triangle(0, 1, 2);
+    geometry.add_triangle(0, 2, 3);
+    _fullscreenQuad.init_from(std::move(geometry));
+}
+
 bool SoftShadowRenderer::Update(const SoftShadowFrameInput& input)
 {
     if (input.volumes == nullptr || !IsSupported())
@@ -583,14 +845,23 @@ bool SoftShadowRenderer::Update(const SoftShadowFrameInput& input)
     bool rendered = false;
     {
         ShadowStateGuard stateGuard;
-        _updateTimer.Begin();
-        FitLightFrustum();
+        UpdateLightFrustum(input.interactive);
         BuildFootprintModel();
-        rendered = RenderShadowMap() && RenderGroundMask(input.interactive);
-        _updateTimer.End();
+        _depthPassTimer.Begin();
+        rendered = RenderShadowMap(input.interactive);
+        _depthPassTimer.End();
+        if (rendered)
+        {
+            _maskPassTimer.Begin();
+            rendered = RenderGroundMask(input.interactive);
+            if (rendered)
+                BlurGroundMask();
+            _maskPassTimer.End();
+        }
     }
 
     _maskValid = rendered;
+    ++_rebuildCount;
     _lastSignature = signature;
     _lastWasInteractive = input.interactive;
     return _maskValid;
@@ -629,6 +900,308 @@ void SoftShadowRenderer::RenderReceivers(const Camera& camera, PartPlateList& pl
     _receiverTimer.End();
 }
 
+void SoftShadowRenderer::DisableObjectShadows(const char* reason)
+{
+    _objectShadowsFailed = true;
+    ReleaseSceneDepthResources();
+    ReleaseObjectShadowTarget();
+    BOOST_LOG_TRIVIAL(warning) << "Soft shadows on objects disabled: " << (reason != nullptr ? reason : "unknown");
+}
+
+bool SoftShadowRenderer::EnsureSceneDepthResources(int width, int height)
+{
+    if (_sceneDepthFramebuffer != 0 && _sceneDepthWidth == width && _sceneDepthHeight == height)
+        return true;
+
+    // The blit needs the exact depth/stencil format of the default framebuffer
+    glsafe(::glBindFramebuffer(GL_READ_FRAMEBUFFER, 0));
+    DepthCopyFormat format;
+    if (!QueryDefaultDepthFormat(format))
+    {
+        DisableObjectShadows("unsupported default depth format");
+        return false;
+    }
+
+    ReleaseSceneDepthResources();
+    GLuint texture = 0;
+    glsafe(::glGenTextures(1, &texture));
+    _sceneDepthTexture = static_cast<unsigned int>(texture);
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, texture));
+    glsafe(::glTexImage2D(GL_TEXTURE_2D, 0, format.internalFormat, width, height, 0, format.format, format.type, nullptr));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0));
+
+    GLuint framebuffer = 0;
+    glsafe(::glGenFramebuffers(1, &framebuffer));
+    _sceneDepthFramebuffer = static_cast<unsigned int>(framebuffer);
+    glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer));
+    glsafe(::glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, format.attachment, GL_TEXTURE_2D, texture, 0));
+    glsafe(::glDrawBuffer(GL_NONE));
+    glsafe(::glReadBuffer(GL_NONE));
+    if (!IsDrawFramebufferComplete())
+    {
+        DisableObjectShadows("scene depth framebuffer incomplete");
+        return false;
+    }
+
+    _sceneDepthWidth = width;
+    _sceneDepthHeight = height;
+    return true;
+}
+
+void SoftShadowRenderer::ReleaseSceneDepthResources()
+{
+    if (_sceneDepthFramebuffer != 0)
+        glsafe(::glDeleteFramebuffers(1, &_sceneDepthFramebuffer));
+    if (_sceneDepthTexture != 0)
+        glsafe(::glDeleteTextures(1, &_sceneDepthTexture));
+    _sceneDepthFramebuffer = 0;
+    _sceneDepthTexture = 0;
+    _sceneDepthWidth = 0;
+    _sceneDepthHeight = 0;
+}
+
+bool SoftShadowRenderer::CopySceneDepth(const std::array<int, 4>& viewport, const SoftShadowPixelRect& copyRect)
+{
+    if (!EnsureSceneDepthResources(viewport[2], viewport[3]))
+        return false;
+
+    // Only the object region is copied, into the same position of the full size texture
+    const GLint srcX0 = viewport[0] + copyRect.x0;
+    const GLint srcY0 = viewport[1] + copyRect.y0;
+    const GLint srcX1 = viewport[0] + copyRect.x1;
+    const GLint srcY1 = viewport[1] + copyRect.y1;
+    glsafe(::glDisable(GL_SCISSOR_TEST));
+    glsafe(::glBindFramebuffer(GL_READ_FRAMEBUFFER, 0));
+    glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, _sceneDepthFramebuffer));
+    if (_sceneDepthVerified)
+    {
+        glsafe(::glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, copyRect.x0, copyRect.y0, copyRect.x1, copyRect.y1,
+                                   GL_DEPTH_BUFFER_BIT, GL_NEAREST));
+        return true;
+    }
+
+    // First copy: drivers may reject depth blits from multisampled framebuffers, detect it once
+    while (::glGetError() != GL_NO_ERROR)
+    {
+    }
+    ::glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, copyRect.x0, copyRect.y0, copyRect.x1, copyRect.y1,
+                        GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    if (::glGetError() != GL_NO_ERROR)
+    {
+        DisableObjectShadows("depth blit from the default framebuffer failed");
+        return false;
+    }
+    _sceneDepthVerified = true;
+    return true;
+}
+
+void SoftShadowRenderer::DrawObjectShadows(GLShaderProgram& shader, const Camera& camera, int resolutionScale,
+                                           const SoftShadowPixelRect& shadeRect, bool darkMode)
+{
+    EnsureFullscreenQuad();
+    glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, _objectShadowFramebuffer));
+    glsafe(::glViewport(0, 0, _objectShadowWidth, _objectShadowHeight));
+    // The scissor limits both the clear and the shading to the object region
+    glsafe(::glEnable(GL_SCISSOR_TEST));
+    glsafe(::glScissor(shadeRect.x0, shadeRect.y0, shadeRect.x1 - shadeRect.x0, shadeRect.y1 - shadeRect.y0));
+    glsafe(::glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE));
+    glsafe(::glClearColor(0.0f, 0.0f, 0.0f, 0.0f));
+    glsafe(::glClear(GL_COLOR_BUFFER_BIT));
+    glsafe(::glDisable(GL_DEPTH_TEST));
+    glsafe(::glDepthMask(GL_FALSE));
+    glsafe(::glDisable(GL_CULL_FACE));
+    glsafe(::glDisable(GL_BLEND));
+
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, _sceneDepthTexture));
+    glsafe(::glBindSampler(0, 0));
+    glsafe(::glActiveTexture(GL_TEXTURE1));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, _shadowDepthTexture));
+    glsafe(::glBindSampler(1, _rawDepthSampler));
+    glsafe(::glActiveTexture(GL_TEXTURE2));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, _shadowDepthTexture));
+    glsafe(::glBindSampler(2, _compareDepthSampler));
+
+    const Matrix4d viewProjection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
+    const double shadowTexel = static_cast<double>(_lightExtent.x()) / static_cast<double>(_shadowMapSize);
+    shader.start_using();
+    shader.set_uniform("scene_depth", 0);
+    shader.set_uniform("shadow_depth", 1);
+    shader.set_uniform("shadow_depth_cmp", 2);
+    shader.set_uniform("inv_view_projection", Matrix4d(viewProjection.inverse()));
+    shader.set_uniform("inv_projection", Matrix4d(camera.get_projection_matrix().matrix().inverse()));
+    shader.set_uniform("reconstruct_offset", OBJECT_RECONSTRUCT_OFFSET);
+    shader.set_uniform("to_camera", Vec3d(-camera.get_dir_forward()));
+    shader.set_uniform("resolution_scale", resolutionScale);
+    const Matrix4d lightViewProjection = _lightProjection * _lightView.matrix();
+    const Matrix3d lightLinear = lightViewProjection.block<3, 3>(0, 0);
+    shader.set_uniform("light_view_projection", lightViewProjection);
+    shader.set_uniform("light_normal_matrix", Matrix3d(lightLinear.inverse().transpose()));
+    // World slope limit converted to light depth per uv
+    shader.set_uniform("max_receiver_slope",
+                       static_cast<float>(OBJECT_MAX_RECEIVER_SLOPE * static_cast<double>(_lightExtent.x()) / static_cast<double>(_depthSpan)));
+    shader.set_uniform("to_light", TO_LIGHT_DIR);
+    shader.set_uniform("depth_span", _depthSpan);
+    shader.set_uniform("light_extent", _lightExtent);
+    shader.set_uniform("light_spread", LIGHT_SPREAD);
+    shader.set_uniform("min_penumbra", static_cast<float>(MIN_PENUMBRA_TEXELS * shadowTexel));
+    shader.set_uniform("max_search", static_cast<float>(MAX_SEARCH_MM));
+    shader.set_uniform("depth_bias", static_cast<float>(OBJECT_DEPTH_BIAS_MM / static_cast<double>(_depthSpan)));
+    shader.set_uniform("normal_offset", static_cast<float>(OBJECT_NORMAL_OFFSET_TEXELS * shadowTexel));
+    shader.set_uniform("shadow_strength", darkMode ? OBJECT_STRENGTH_DARK : OBJECT_STRENGTH_LIGHT);
+    shader.set_uniform("blocker_samples", OBJECT_BLOCKER_SAMPLES);
+    shader.set_uniform("pcf_samples", OBJECT_PCF_SAMPLES);
+    _fullscreenQuad.render();
+    shader.stop_using();
+}
+
+bool SoftShadowRenderer::EnsureObjectShadowTarget(int width, int height)
+{
+    if (_objectShadowFramebuffer != 0 && _objectShadowWidth == width && _objectShadowHeight == height)
+        return true;
+
+    ReleaseObjectShadowTarget();
+    GLuint texture = 0;
+    glsafe(::glGenTextures(1, &texture));
+    _objectShadowTexture = static_cast<unsigned int>(texture);
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, texture));
+    // R = shadow, G = view depth, BA = octahedral normal; half floats keep the 2% depth tolerance meaningful
+    glsafe(::glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_FLOAT, nullptr));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0));
+
+    GLuint framebuffer = 0;
+    glsafe(::glGenFramebuffers(1, &framebuffer));
+    _objectShadowFramebuffer = static_cast<unsigned int>(framebuffer);
+    glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer));
+    glsafe(::glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0));
+    if (!IsDrawFramebufferComplete())
+    {
+        ReleaseObjectShadowTarget();
+        DisableObjectShadows("object shadow framebuffer incomplete");
+        return false;
+    }
+
+    _objectShadowWidth = width;
+    _objectShadowHeight = height;
+    return true;
+}
+
+void SoftShadowRenderer::ReleaseObjectShadowTarget()
+{
+    if (_objectShadowFramebuffer != 0)
+        glsafe(::glDeleteFramebuffers(1, &_objectShadowFramebuffer));
+    if (_objectShadowTexture != 0)
+        glsafe(::glDeleteTextures(1, &_objectShadowTexture));
+    _objectShadowFramebuffer = 0;
+    _objectShadowTexture = 0;
+    _objectShadowWidth = 0;
+    _objectShadowHeight = 0;
+}
+
+void SoftShadowRenderer::CompositeObjectShadows(GLShaderProgram& shader, const Camera& camera, const std::array<int, 4>& viewport,
+                                                int resolutionScale, const SoftShadowPixelRect& workRect)
+{
+    glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0));
+    glsafe(::glViewport(viewport[0], viewport[1], viewport[2], viewport[3]));
+    glsafe(::glEnable(GL_SCISSOR_TEST));
+    glsafe(::glScissor(viewport[0] + workRect.x0, viewport[1] + workRect.y0, workRect.x1 - workRect.x0,
+                       workRect.y1 - workRect.y0));
+    glsafe(::glEnable(GL_BLEND));
+    glsafe(::glBlendFunc(GL_DST_COLOR, GL_ZERO));
+
+    // Units 1 and 2 still carry the depth samplers of the shadow pass
+    glsafe(::glBindSampler(1, 0));
+    glsafe(::glBindSampler(2, 0));
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, _sceneDepthTexture));
+    glsafe(::glActiveTexture(GL_TEXTURE1));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, _objectShadowTexture));
+
+    shader.start_using();
+    shader.set_uniform("scene_depth", 0);
+    shader.set_uniform("object_shadow", 1);
+    shader.set_uniform("resolution_scale", resolutionScale);
+    shader.set_uniform("inv_projection", Matrix4d(camera.get_projection_matrix().matrix().inverse()));
+    shader.set_uniform("depth_tolerance", UPSAMPLE_DEPTH_TOLERANCE);
+    // Full resolution normals let the filter keep samples of one face apart from the adjacent face
+    const Matrix4d viewProjection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
+    shader.set_uniform("inv_view_projection", Matrix4d(viewProjection.inverse()));
+    shader.set_uniform("to_camera", Vec3d(-camera.get_dir_forward()));
+    _fullscreenQuad.render();
+    shader.stop_using();
+}
+
+void SoftShadowRenderer::RenderObjectShadows(const Camera& camera, bool darkMode)
+{
+    if (!_objectReceiveEnabled || _objectShadowsFailed || !_maskValid || _shadowDepthTexture == 0)
+        return;
+
+    GLShaderProgram* const shader = wxGetApp().get_shader("shadow_screen");
+    GLShaderProgram* const compositeShader = wxGetApp().get_shader("shadow_screen_composite");
+    if (shader == nullptr || compositeShader == nullptr)
+        return;
+
+    GLint drawFramebuffer = 0;
+    glsafe(::glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer));
+    if (drawFramebuffer != 0)
+    {
+        DisableObjectShadows("scene is not rendered into the default framebuffer");
+        return;
+    }
+
+    std::array<int, 4> viewport{ { 0, 0, 0, 0 } };
+    glsafe(::glGetIntegerv(GL_VIEWPORT, viewport.data()));
+    if (viewport[2] <= 0 || viewport[3] <= 0)
+        return;
+
+    const int scale = OBJECT_SHADOW_RESOLUTION_SCALE;
+    const int targetWidth = std::max(1, (viewport[2] + scale - 1) / scale);
+    const int targetHeight = std::max(1, (viewport[3] + scale - 1) / scale);
+
+    // All work is limited to the screen projection of the casters, which covers every receiving object
+    const Matrix4d viewProjection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
+    const SoftShadowPixelRect objectRect = ProjectBoxToScreen(_casterBox, viewProjection, viewport[2], viewport[3]);
+    if (objectRect.IsEmpty())
+        return;
+
+    const SoftShadowPixelRect workRect = ExpandRect(objectRect, OBJECT_RECT_MARGIN, viewport[2], viewport[3]);
+    SoftShadowPixelRect shadeRect;
+    shadeRect.x0 = workRect.x0 / scale;
+    shadeRect.y0 = workRect.y0 / scale;
+    shadeRect.x1 = (workRect.x1 + scale - 1) / scale;
+    shadeRect.y1 = (workRect.y1 + scale - 1) / scale;
+    // Extra shading pixels for the 3x3 composite filter, plus neighbours read for normals
+    shadeRect = ExpandRect(shadeRect, 2, targetWidth, targetHeight);
+    const SoftShadowPixelRect copyRect = ExpandRect(workRect, 2 * scale + 2, viewport[2], viewport[3]);
+
+    ShadowStateGuard stateGuard;
+    // Timed in three separate segments (GL_TIME_ELAPSED queries cannot nest)
+    _sceneDepthCopyTimer.Begin();
+    const bool copied = CopySceneDepth(viewport, copyRect);
+    _sceneDepthCopyTimer.End();
+    if (!copied || !EnsureObjectShadowTarget(targetWidth, targetHeight))
+        return;
+
+    _objectShadeTimer.Begin();
+    DrawObjectShadows(*shader, camera, scale, shadeRect, darkMode);
+    _objectShadeTimer.End();
+
+    _objectCompositeTimer.Begin();
+    CompositeObjectShadows(*compositeShader, camera, viewport, scale, workRect);
+    _objectCompositeTimer.End();
+}
+
 void SoftShadowRenderer::Release()
 {
     if (_shadowFramebuffer != 0)
@@ -639,6 +1212,10 @@ void SoftShadowRenderer::Release()
         glsafe(::glDeleteTextures(1, &_shadowDepthTexture));
     if (_maskTexture != 0)
         glsafe(::glDeleteTextures(1, &_maskTexture));
+    if (_maskBlurFramebuffer != 0)
+        glsafe(::glDeleteFramebuffers(1, &_maskBlurFramebuffer));
+    if (_maskBlurTexture != 0)
+        glsafe(::glDeleteTextures(1, &_maskBlurTexture));
     if (_rawDepthSampler != 0)
         glsafe(::glDeleteSamplers(1, &_rawDepthSampler));
     if (_compareDepthSampler != 0)
@@ -648,16 +1225,26 @@ void SoftShadowRenderer::Release()
     _maskFramebuffer = 0;
     _shadowDepthTexture = 0;
     _maskTexture = 0;
+    _maskBlurFramebuffer = 0;
+    _maskBlurTexture = 0;
     _rawDepthSampler = 0;
     _compareDepthSampler = 0;
     _footprintModel.reset();
-    _updateTimer.Release();
+    ReleaseSceneDepthResources();
+    ReleaseObjectShadowTarget();
+    _fullscreenQuad.reset();
+    _depthPassTimer.Release();
+    _maskPassTimer.Release();
     _receiverTimer.Release();
+    _sceneDepthCopyTimer.Release();
+    _objectShadeTimer.Release();
+    _objectCompositeTimer.Release();
     _casters.clear();
     _instanceBoxes.clear();
     _maskValid = false;
     _lastSignature = 0;
     _lastWasInteractive = false;
+    _frustumFrozen = false;
 }
 
 } // namespace GUI
