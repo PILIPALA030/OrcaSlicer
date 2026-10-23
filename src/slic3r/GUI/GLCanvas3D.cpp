@@ -5878,8 +5878,9 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
         else if (evt.LeftUp() && m_picking_enabled && m_rectangle_selection.is_dragging() && m_layers_editing.state != LayersEditing::Editing) {
             //BBS: don't use alt as de-select
             //if (evt.ShiftDown() || evt.AltDown())
-            if (_set_current())
-                _rectangular_selection_picking_pass(true);
+            // A hover change on sinking volumes must refresh the cached scene
+            if (_set_current() && _rectangular_selection_picking_pass(true))
+                m_dirty = true;
             if (evt.ShiftDown())
                 _update_selection_from_hover();
 
@@ -9253,8 +9254,10 @@ bool GLCanvas3D::_rectangular_selection_picking_pass(bool querySelection)
     if (m_picking_enabled) {
         const Camera& camera = wxGetApp().plater()->get_camera();
         const std::array<int, 4>& viewport = camera.get_viewport();
-        if (m_pickingBuffer.IsReady() && m_pickingBuffer.GetWidth() == viewport[2] &&
-            m_pickingBuffer.GetHeight() == viewport[3]) {
+        // A stale buffer or a zero-size rectangle (click without drag) uses the legacy pass below
+        const bool hasRectArea = m_rectangle_selection.get_width() > 0.0f && m_rectangle_selection.get_height() > 0.0f;
+        if (!m_pickingBufferDirty && hasRectArea && m_pickingBuffer.IsReady() &&
+            m_pickingBuffer.GetWidth() == viewport[2] && m_pickingBuffer.GetHeight() == viewport[3]) {
             const int bufferWidth = m_pickingBuffer.GetWidth();
             const int bufferHeight = m_pickingBuffer.GetHeight();
             const int left = std::max(0, static_cast<int>(std::floor(m_rectangle_selection.get_left())));
@@ -12148,7 +12151,7 @@ bool GLCanvas3D::_is_any_volume_near_boundary_for_spiral_lift() const
 
 // Expansion applied to the hovered volume indices before a batch selection commit.
 enum class EHoveredExpansion {
-    AsIs,       // the hovered volumes themselves, as the former per-item Selection::add() in Volume mode
+    AsIs,       // the hovered volumes themselves
     SameVolume, // all the GLVolumes sharing the hovered (object, volume, instance), as the former Selection::add_volume()
     Instance    // all the GLVolumes of the hovered instances, as the former per-item Selection::add() in Instance mode
 };
@@ -12164,7 +12167,7 @@ static std::vector<unsigned int> ExpandHoveredVolumes(const GLVolumePtrs& volume
         for (int i : hover_idxs) {
             if (skip_wipe_tower && volumes[i]->is_wipe_tower)
                 continue;
-            volume_idxs.push_back((unsigned int)i);
+            volume_idxs.push_back(static_cast<unsigned int>(i));
         }
         return volume_idxs;
     }
@@ -12179,7 +12182,7 @@ static std::vector<unsigned int> ExpandHoveredVolumes(const GLVolumePtrs& volume
         }
 
         volume_idxs.reserve(hover_idxs.size());
-        for (unsigned int i = 0; i < (unsigned int)volumes.size(); ++i) {
+        for (unsigned int i = 0; i < static_cast<unsigned int>(volumes.size()); ++i) {
             const GLVolume* v = volumes[i];
             if (hovered_keys.count(std::make_tuple(v->object_idx(), v->volume_idx(), v->instance_idx())) > 0)
                 volume_idxs.push_back(i);
@@ -12196,7 +12199,7 @@ static std::vector<unsigned int> ExpandHoveredVolumes(const GLVolumePtrs& volume
     }
 
     volume_idxs.reserve(hover_idxs.size());
-    for (unsigned int i = 0; i < (unsigned int)volumes.size(); ++i) {
+    for (unsigned int i = 0; i < static_cast<unsigned int>(volumes.size()); ++i) {
         const GLVolume* v = volumes[i];
         if (hovered_instances.count(std::make_pair(v->object_idx(), v->instance_idx())) > 0)
             volume_idxs.push_back(i);
@@ -12268,10 +12271,8 @@ void GLCanvas3D::_update_selection_from_hover()
     if ((state == GLSelectionRectangle::Select) && !ctrl_pressed)
         m_selection.clear();
 
-    // Batch commit: gather the target volumes and apply them through a single
-    // add_volumes()/remove_volumes() call, so that update_type() and the cached
-    // bounding boxes are rebuilt only once instead of once per hovered item
-    // (the former per-item path scaled quadratically with the selection size).
+    // Batch commit through a single add_volumes()/remove_volumes() call, so update_type()
+    // and the cached bounding boxes are rebuilt once instead of once per hovered item.
     if (state == GLSelectionRectangle::Select) {
         // wipe tower merge rule of the former per-item add(): a hovered wipe tower is dropped
         // when regular volumes are hovered as well, or when the current selection is not a wipe tower one
@@ -12296,6 +12297,15 @@ void GLCanvas3D::_update_selection_from_hover()
         else if (ctrl_pressed && !m_selection.is_empty() &&
                  (m_selection.is_wipe_tower() || m_selection.is_any_modifier() || m_selection.is_any_volume())) {
             for (int i : m_hover_volume_idxs) {
+                m_selection.add(static_cast<unsigned int>(i), false);
+            }
+        }
+        else if (m_selection.get_mode() == Selection::EMode::Volume &&
+                 m_selection.get_volume_selection_mode() == Selection::EMode::Volume)
+        {
+            // Volume mode keeps the per-item add() rules: parts of a single instance only
+            for (int i : m_hover_volume_idxs)
+            {
                 m_selection.add(static_cast<unsigned int>(i), false);
             }
         }
