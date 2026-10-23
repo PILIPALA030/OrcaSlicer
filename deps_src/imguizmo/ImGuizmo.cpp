@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <math.h>
 #include <cmath>
+#include <vector>
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h>
@@ -2816,6 +2817,220 @@ namespace IMGUIZMO_NAMESPACE
        m16[15] = 1.0f;
    }
 
+   // ORCA: rounded navigator cube, edge length is 1, bevel radius must stay below the 0.25 panel band
+   static const float NAV_CUBE_ROUND_RADIUS   = 0.12f;
+   static const int   NAV_CUBE_ROUND_SEGMENTS = 4;
+   static const int   NAV_CUBE_SAMPLES        = NAV_CUBE_ROUND_SEGMENTS * 2 + 4;
+
+   /**
+    * @brief Build face-local sample coordinates in [0, 1]: bevel arcs at both ends plus panel borders.
+    * @param samples Output array with NAV_CUBE_SAMPLES ascending values.
+    */
+   static void BuildRoundedCubeSamples(float* samples)
+   {
+       for (int j = 0; j <= NAV_CUBE_ROUND_SEGMENTS; ++j)
+       {
+           // uniform angle steps over the 45 degree half of the bevel owned by this face
+           const float theta = 0.25f * ZPI * static_cast<float>(NAV_CUBE_ROUND_SEGMENTS - j) / static_cast<float>(NAV_CUBE_ROUND_SEGMENTS);
+           const float u     = NAV_CUBE_ROUND_RADIUS - NAV_CUBE_ROUND_RADIUS * tanf(theta);
+           samples[j]                        = u;
+           samples[NAV_CUBE_SAMPLES - 1 - j] = 1.f - u;
+       }
+       samples[NAV_CUBE_ROUND_SEGMENTS + 1] = 0.25f;
+       samples[NAV_CUBE_ROUND_SEGMENTS + 2] = 0.75f;
+   }
+
+   /**
+    * @brief Project a point on the unit cube surface onto the rounded cube.
+    * @param p Point on the cube surface (cube centered at origin).
+    * @param normal Output outward unit normal at the projected point.
+    * @return Point on the rounded cube surface.
+    */
+   static vec_t RoundCubePoint(const vec_t& p, vec_t& normal)
+   {
+       const float h     = 0.5f - NAV_CUBE_ROUND_RADIUS;
+       const vec_t inner = makeVect(ImClamp(p.x, -h, h), ImClamp(p.y, -h, h), ImClamp(p.z, -h, h));
+       normal            = p - inner;
+       normal.Normalize();
+       return inner + normal * NAV_CUBE_ROUND_RADIUS;
+   }
+
+   static float Cross2D(const ImVec2& o, const ImVec2& a, const ImVec2& b)
+   {
+       return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+   }
+
+   /**
+    * @brief Monotone chain convex hull; output is clockwise on screen (y down) as ImGui AA fill expects.
+    * @param points Input points, sorted in place.
+    * @param hull Output hull vertices.
+    */
+   static void ConvexHull2D(std::vector<ImVec2>& points, std::vector<ImVec2>& hull)
+   {
+       hull.clear();
+       if (points.size() < 3)
+       {
+           return;
+       }
+       std::sort(points.begin(), points.end(), [](const ImVec2& a, const ImVec2& b) {
+           return a.x < b.x || (a.x == b.x && a.y < b.y);
+       });
+       hull.resize(points.size() * 2);
+       size_t k = 0;
+       for (size_t i = 0; i < points.size(); ++i)
+       {
+           while (k >= 2 && Cross2D(hull[k - 2], hull[k - 1], points[i]) <= 0.f)
+           {
+               --k;
+           }
+           hull[k++] = points[i];
+       }
+       const size_t lowerSize = k + 1;
+       for (size_t i = points.size() - 1; i > 0; --i)
+       {
+           while (k >= lowerSize && Cross2D(hull[k - 2], hull[k - 1], points[i - 1]) <= 0.f)
+           {
+               --k;
+           }
+           hull[k++] = points[i - 1];
+       }
+       hull.resize(k - 1);
+   }
+
+   // ORCA: navigator cube lighting, shade = ambient + diffuse * max(0, n.l)
+   static const float NAV_CUBE_AMBIENT = 0.6f;
+   static const float NAV_CUBE_DIFFUSE = 0.4f;
+
+   static ImU32 ShadeColor(const ImVec4& color, float shade)
+   {
+       return ImGui::ColorConvertFloat4ToU32(ImVec4(ImMin(color.x * shade, 1.f), ImMin(color.y * shade, 1.f), ImMin(color.z * shade, 1.f), color.w));
+   }
+
+   /**
+    * @brief Draw the navigator cube with rounded edges, lit by a light fixed to the viewer, with hover highlight.
+    * @param drawList Target draw list.
+    * @param res Cube view-projection matrix.
+    * @param cubeView Cube view matrix, used for back-face culling.
+    * @param rect Screen rect of the navigator.
+    * @param boxes Hovered state of the 27 boxes, same indexing as the panel hit test.
+    */
+   static void DrawRoundedCube(ImDrawList* drawList, const matrix_t& res, const matrix_t& cubeView, const ImRect& rect, const bool* boxes)
+   {
+       if (drawList == nullptr || boxes == nullptr)
+       {
+           return;
+       }
+
+       struct CubeQuad
+       {
+           int   baseIndex;
+           ImU32 color;
+       };
+
+       const int    gridSize = NAV_CUBE_SAMPLES;
+       const ImVec2 position = rect.Min;
+       const ImVec2 size     = rect.GetSize();
+       float        samples[NAV_CUBE_SAMPLES];
+       BuildRoundedCubeSamples(samples);
+
+       // hover color: same blend as the former 0x80 orange overlay on the face color
+       const ImVec4 faceColorV = gContext.mStyle.Colors[FACE];
+       const ImVec4 hoverV(0xF0 / 255.f, 0xA0 / 255.f, 0x60 / 255.f, 0x80 / 255.f);
+       const float  outAlpha = hoverV.w + faceColorV.w * (1.f - hoverV.w);
+       const float  faceW    = outAlpha > 0.f ? faceColorV.w * (1.f - hoverV.w) / outAlpha : 0.f;
+       const float  hoverW   = outAlpha > 0.f ? hoverV.w / outAlpha : 0.f;
+       const ImVec4 hoverColorV(faceColorV.x * faceW + hoverV.x * hoverW, faceColorV.y * faceW + hoverV.y * hoverW,
+                                faceColorV.z * faceW + hoverV.z * hoverW, outAlpha);
+
+       vec_t viewCenter = makeVect(0.f, 0.f, 0.f);
+       viewCenter.TransformPoint(cubeView);
+
+       // light in view space: toward the viewer, tilted up-left so faces read with different brightness
+       vec_t lightDir = makeVect(-viewCenter.x, -viewCenter.y, -viewCenter.z);
+       lightDir.Normalize();
+       lightDir = lightDir + makeVect(-0.25f, 0.8f, 0.f);
+       lightDir.Normalize();
+
+       std::vector<ImVec2>   screenPts(static_cast<size_t>(6 * gridSize * gridSize));
+       std::vector<CubeQuad> quads;
+       quads.reserve(static_cast<size_t>(6 * (gridSize - 1) * (gridSize - 1)));
+
+       for (int iFace = 0; iFace < 6; iFace++)
+       {
+           const int   normalIndex  = iFace % 3;
+           const float invert       = (iFace > 2) ? -1.f : 1.f;
+           const vec_t dn           = directionUnary[normalIndex];
+           const vec_t dx           = directionUnary[(normalIndex + 1) % 3];
+           const vec_t dy           = directionUnary[(normalIndex + 2) % 3];
+           const vec_t indexVectorX = dx * invert;
+           const vec_t indexVectorY = dy * invert;
+           const vec_t boxOrigin    = dn * -invert - indexVectorX - indexVectorY;
+           const int   faceBase     = iFace * gridSize * gridSize;
+
+           for (int iy = 0; iy < gridSize; iy++)
+           {
+               for (int ix = 0; ix < gridSize; ix++)
+               {
+                   const vec_t surfacePt = (dn * 0.5f + dx * (samples[ix] - 0.5f) + dy * (samples[iy] - 0.5f)) * invert;
+                   vec_t       normal;
+                   screenPts[static_cast<size_t>(faceBase + iy * gridSize + ix)] = worldToPos(RoundCubePoint(surfacePt, normal), res, position, size);
+               }
+           }
+
+           for (int iy = 0; iy < gridSize - 1; iy++)
+           {
+               for (int ix = 0; ix < gridSize - 1; ix++)
+               {
+                   const float uc        = 0.5f * (samples[ix] + samples[ix + 1]);
+                   const float vc        = 0.5f * (samples[iy] + samples[iy + 1]);
+                   const vec_t surfacePt = (dn * 0.5f + dx * (uc - 0.5f) + dy * (vc - 0.5f)) * invert;
+                   vec_t       normal;
+                   RoundCubePoint(surfacePt, normal);
+                   normal.TransformVector(cubeView);
+                   normal.Normalize();
+                   // back-face culling, same rule as the face plane test in ViewManipulate
+                   if (normal.x * viewCenter.x + normal.y * viewCenter.y + normal.z * viewCenter.z > 0.f)
+                   {
+                       continue;
+                   }
+
+                   // panel column/row as in panelPosition: index 0 is the high end, 2 the low end
+                   const int   col      = uc > 0.75f ? 0 : (uc > 0.25f ? 1 : 2);
+                   const int   row      = vc > 0.75f ? 0 : (vc > 0.25f ? 1 : 2);
+                   const vec_t boxCoord = boxOrigin + indexVectorX * static_cast<float>(col) + indexVectorY * static_cast<float>(row) + makeVect(1.f, 1.f, 1.f);
+                   const int   boxIndex = static_cast<int>(boxCoord.x * 9.f + boxCoord.y * 3.f + boxCoord.z);
+                   const bool  hovered  = boxIndex >= 0 && boxIndex < 27 && boxes[boxIndex];
+                   const float diffuse  = ImMax(normal.x * lightDir.x + normal.y * lightDir.y + normal.z * lightDir.z, 0.f);
+                   const float shade    = NAV_CUBE_AMBIENT + NAV_CUBE_DIFFUSE * diffuse;
+
+                   CubeQuad quad;
+                   quad.baseIndex = faceBase + iy * gridSize + ix;
+                   quad.color     = ShadeColor(hovered ? hoverColorV : faceColorV, shade);
+                   quads.push_back(quad);
+               }
+           }
+       }
+
+       // anti-aliased silhouette underneath in the darkest shade: hides seams and gives a soft outline
+       std::vector<ImVec2> hull;
+       std::vector<ImVec2> hullInput(screenPts);
+       ConvexHull2D(hullInput, hull);
+       if (hull.size() >= 3)
+       {
+           drawList->AddConvexPolyFilled(hull.data(), static_cast<int>(hull.size()), ShadeColor(faceColorV, NAV_CUBE_AMBIENT));
+       }
+
+       const ImDrawListFlags oldFlags = drawList->Flags;
+       drawList->Flags &= ~ImDrawListFlags_AntiAliasedFill;
+       for (const CubeQuad& quad : quads)
+       {
+           const ImVec2 quadPts[4] = { screenPts[static_cast<size_t>(quad.baseIndex)], screenPts[static_cast<size_t>(quad.baseIndex + 1)],
+                                       screenPts[static_cast<size_t>(quad.baseIndex + gridSize + 1)], screenPts[static_cast<size_t>(quad.baseIndex + gridSize)] };
+           drawList->AddConvexPolyFilled(quadPts, 4, quad.color);
+       }
+       drawList->Flags = oldFlags;
+   }
+
    ViewManipulateResult ViewManipulate(float* view, float length, ImVec2 position, ImVec2 size, ImU32 backgroundColor)
    {
       static bool isDraging = false;
@@ -2869,6 +3084,12 @@ namespace IMGUIZMO_NAMESPACE
       static int overBox = -1;
       for (int iPass = 0; iPass < 2; iPass++)
       {
+         // ORCA: hover state is resolved by pass 0, draw the rounded cube before face labels
+         if (iPass == 1)
+         {
+            DrawRoundedCube(gContext.mDrawList, res, cubeView, ImRect(position, position + size), boxes);
+         }
+
          for (int iFace = 0; iFace < 6; iFace++)
          {
             const int normalIndex = (iFace % 3);
@@ -2906,37 +3127,20 @@ namespace IMGUIZMO_NAMESPACE
             const vec_t dx = directionUnary[perpXIndex];
             const vec_t dy = directionUnary[perpYIndex];
             const vec_t origin = directionUnary[normalIndex] - dx - dy;
-            ImU32 faceColor = GetColorU32(FACE);
             for (int iPanel = 0; iPanel < 9; iPanel++)
             {
                vec_t boxCoord = boxOrigin + indexVectorX * float(iPanel % 3) + indexVectorY * float(iPanel / 3) + makeVect(1.f, 1.f, 1.f);
-               const ImVec2 p = panelPosition[iPanel] * 2.f;
-               const ImVec2 s = panelSize[iPanel] * 2.f;
-               ImVec2 faceCoordsScreen[4];
-               vec_t panelPos[4] = { dx * p.x + dy * p.y,
-                                     dx * p.x + dy * (p.y + s.y),
-                                     dx * (p.x + s.x) + dy * (p.y + s.y),
-                                     dx * (p.x + s.x) + dy * p.y };
-
-               for (unsigned int iCoord = 0; iCoord < 4; iCoord++)
-               {
-                  faceCoordsScreen[iCoord] = worldToPos((panelPos[iCoord] + origin) * 0.5f * invert, res, position, size);
-               }
-
                const ImVec2 panelCorners[2] = { panelPosition[iPanel], panelPosition[iPanel] + panelSize[iPanel] };
                bool insidePanel = localx > panelCorners[0].x && localx < panelCorners[1].x && localy > panelCorners[0].y && localy < panelCorners[1].y;
                int boxCoordInt = int(boxCoord.x * 9.f + boxCoord.y * 3.f + boxCoord.z);
                IM_ASSERT(boxCoordInt < 27);
                boxes[boxCoordInt] |= insidePanel && (!isDraging) && gContext.mbMouseOver;
 
-               // draw face with lighter color
+               // ORCA: faces and hover highlight are drawn by DrawRoundedCube
                if (iPass)
                {
-                  gContext.mDrawList->AddConvexPolyFilled(faceCoordsScreen, 4, faceColor);
                   if (boxes[boxCoordInt])
                   {
-                     gContext.mDrawList->AddConvexPolyFilled(faceCoordsScreen, 4, IM_COL32(0xF0, 0xA0, 0x60, 0x80));
-
 #if IMGUI_VERSION_NUM >= 18723
                      ImGui::SetNextFrameWantCaptureMouse(true);
 #else
@@ -3005,10 +3209,13 @@ namespace IMGUIZMO_NAMESPACE
       {
          ImDrawList* drawList = gContext.mDrawList;
          const vec_t origin = makeVect(-0.5f, -0.5f, -0.5f);
+         // ORCA: start axes on the rounded corner surface so they hug the cube edges
+         const float axisCorner = 0.5f - NAV_CUBE_ROUND_RADIUS + NAV_CUBE_ROUND_RADIUS / sqrtf(3.f);
+         const vec_t axisOrigin = makeVect(-axisCorner, -axisCorner, -axisCorner);
          for (int i = 0; i < 3; ++i) {
             vec_t  dirAxis        = directionUnary[i];
-            ImVec2 baseSSpace     = worldToPos(origin, res, position, size);
-            ImVec2 worldDirSSpace = worldToPos(origin + dirAxis, res, position, size);
+            ImVec2 baseSSpace     = worldToPos(axisOrigin, res, position, size);
+            ImVec2 worldDirSSpace = worldToPos(axisOrigin + dirAxis, res, position, size);
 
             bool visible = false;
             {
@@ -3032,24 +3239,28 @@ namespace IMGUIZMO_NAMESPACE
                 directionColorV.w *= 0.35f;
             }
             ImU32 directionColor = ImGui::ColorConvertFloat4ToU32(directionColorV); // | IM_COL32(0x80, 0x80, 0x80, 0x00);
-            drawList->AddLine(baseSSpace, worldDirSSpace, directionColor, gContext.mStyle.TranslationLineThickness);
-            
-            /* ORCA Dont draw arrow heads
-            // Arrow head begin
-            ImVec2 dir(baseSSpace - worldDirSSpace);
-            
-            float d = sqrtf(ImLengthSqr(dir));
-            dir /= d; // Normalize
-            dir *= gContext.mStyle.TranslationLineArrowSize;
-            
-            ImVec2 ortogonalDir(dir.y, -dir.x); // Perpendicular vector
-            ImVec2 a(worldDirSSpace + dir);
-            drawList->AddTriangleFilled(worldDirSSpace - dir, a + ortogonalDir, a - ortogonalDir, directionColor);
-            // Arrow head end
-            */
+
+            // ORCA: arrow head at axis end; skipped when the axis points almost straight at the viewer
+            const float arrowSize = gContext.mStyle.TranslationLineArrowSize;
+            ImVec2 axisDirSSpace = worldDirSSpace - baseSSpace;
+            const float axisLenSSpace = sqrtf(ImLengthSqr(axisDirSSpace));
+            ImVec2 lineEndSSpace = worldDirSSpace;
+            ImVec2 labelOffset(0.f, 0.f);
+            if (axisLenSSpace > arrowSize)
+            {
+               axisDirSSpace /= axisLenSSpace;
+               const ImVec2 orthoDir(axisDirSSpace.y, -axisDirSSpace.x);
+               const ImVec2 arrowTip = worldDirSSpace + axisDirSSpace * arrowSize;
+               const ImVec2 arrowBase = worldDirSSpace - axisDirSSpace * arrowSize;
+               // clockwise order on screen, required by ImGui anti-aliased fill
+               drawList->AddTriangleFilled(arrowTip, arrowBase - orthoDir * arrowSize, arrowBase + orthoDir * arrowSize, directionColor);
+               lineEndSSpace = arrowBase;
+               labelOffset = axisDirSSpace * arrowSize;
+            }
+            drawList->AddLine(baseSSpace, lineEndSSpace, directionColor, gContext.mStyle.TranslationLineThickness);
 
             // Axis text
-            ImVec2 labelSSpace = worldToPos(origin + dirAxis * 1.2f, res, position, size);
+            ImVec2 labelSSpace = worldToPos(axisOrigin + dirAxis * 1.2f, res, position, size) + labelOffset;
             ImVec2 labelSize   = ImGui::CalcTextSize(gContext.mStyle.AxisLabels[i]);
             drawList->AddText(labelSSpace - labelSize * 0.5, directionColor, gContext.mStyle.AxisLabels[i]);
          }
