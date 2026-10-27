@@ -23,6 +23,7 @@
 #include "libslic3r/Tesselate.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/QuadricEdgeCollapse.hpp"
+#include "libslic3r/FilamentColorLibrary.hpp"
 #include <thread>
 #include <algorithm>
 
@@ -87,6 +88,66 @@ std::vector<Slic3r::ColorRGBA> get_extruders_colors()
     return colors_out;
 }
 
+/// @brief Get material by 0-based filament index, default material if out of range.
+static const Slic3r::GUI::PbrMaterialParams& PickPbrMaterial(const std::vector<Slic3r::GUI::PbrMaterialMatch>& materials,
+                                                              const int filamentIdx)
+{
+    if (filamentIdx < 0 || filamentIdx >= static_cast<int>(materials.size()))
+        return Slic3r::GUI::PbrMaterialTable::Instance().GetDefault();
+    return materials[static_cast<size_t>(filamentIdx)].params;
+}
+
+/// @brief Match the PBR material of one selected filament preset.
+/// User presets follow inherits to the system base, whose name is used without printer / nozzle suffix.
+static Slic3r::GUI::PbrMaterialMatch MatchPbrMaterial(const Slic3r::PresetBundle& bundle, const std::string& presetName)
+{
+    std::string baseName = presetName;
+    std::string filamentType;
+    const Slic3r::Preset* preset = presetName.empty() ? nullptr : bundle.filaments.find_preset(presetName, false);
+    if (preset != nullptr)
+    {
+        const Slic3r::Preset* basePreset = bundle.filaments.get_preset_base(*preset);
+        if (basePreset != nullptr)
+            baseName = basePreset->name;
+        const Slic3r::ConfigOptionStrings* types = preset->config.option<Slic3r::ConfigOptionStrings>("filament_type");
+        if (types != nullptr && !types->values.empty())
+            filamentType = types->values.front();
+    }
+    return Slic3r::GUI::PbrMaterialTable::Instance().Find(Slic3r::GetFilamentMatchName(baseName), filamentType);
+}
+
+namespace Slic3r {
+
+float GetVolumeNormalCreaseAngle()
+{
+    const AppConfig* config = GUI::wxGetApp().app_config;
+    if (config == nullptr || !config->get_bool("pbr_smooth_normals"))
+        return 0.0f;
+    const std::string text = config->get("pbr_smooth_normals_angle");
+    const float angle = text.empty() ? 30.0f : std::strtof(text.c_str(), nullptr);
+    return std::min(std::max(angle, 1.0f), 180.0f);
+}
+
+} // namespace Slic3r
+
+/// @brief Upload a volume mesh with face normals, or angle-split smooth normals when creaseAngle > 0.
+static void InitVolumeModel(Slic3r::GUI::GLModel& model, const indexed_triangle_set& its, const float creaseAngle)
+{
+    if (creaseAngle > 0.0f)
+        model.InitFromSmooth(its, creaseAngle);
+    else
+        model.init_from(its);
+}
+
+/// @brief Upload material uniforms, ignored by shaders without them.
+static void SetPbrMaterialUniforms(Slic3r::GLShaderProgram* shader, const Slic3r::GUI::PbrMaterialParams& material)
+{
+    if (shader == nullptr)
+        return;
+    shader->set_uniform("pbr_metallic", material.metallic);
+    shader->set_uniform("pbr_roughness", material.roughness);
+}
+
 float FullyTransparentMaterialThreshold  = 0.1f;
 float FullTransparentModdifiedToFixAlpha = 0.3f;
 // Be careful changing this value because it could break thumbnail color due to rounding error!
@@ -149,6 +210,7 @@ float                 GLVolume::s_lastCameraZoomValue = 0.0f;
 float                 GLVolume::s_curZoom             = 1.0f;
 Matrix4d              GLVolume::s_curViewProjMatrix   = Matrix4d::Identity();
 std::array<int, 4>    GLVolume::s_curViewport         = {0, 0, 0, 0};
+const std::vector<GUI::PbrMaterialMatch>* GLVolume::s_pbrMaterials = nullptr;
 
 // Project a 3D point to 2D screen coordinates using the view-projection matrix
 static Vec2f CalcPtInScreen(const Vec3d& pt, const Matrix4d& viewProjMat, int windowWidth, int windowHeight)
@@ -446,11 +508,13 @@ bool GLVolume::SimplifyMesh(const indexed_triangle_set& its, std::shared_ptr<GUI
     }
 
     TriangleMesh originMesh(*itsCopy);
+    // Read on the calling (main) thread, the worker must not touch app config.
+    const float creaseAngle = GetVolumeNormalCreaseAngle();
 
     // Run simplification in background thread (async, detached)
     // Ref: https://people.eecs.berkeley.edu/~jrs/meshpapers/GarlandHeckbert2.pdf
     std::thread worker = std::thread(
-        [model, readyFlag, maxError, originMesh](std::unique_ptr<indexed_triangle_set> itsPtr) {
+        [model, readyFlag, maxError, originMesh, creaseAngle](std::unique_ptr<indexed_triangle_set> itsPtr) {
             int      initFaceCount  = itsPtr->indices.size();
             uint32_t triangleCount  = 0;
             float    maxErrCopy     = maxError;
@@ -480,7 +544,7 @@ bool GLVolume::SimplifyMesh(const indexed_triangle_set& its, std::shared_ptr<GUI
                     // The model is render-disabled until the main thread sees
                     // readyFlag (GLModel.hpp threading contract), so this
                     // write is exclusive to this thread.
-                    model->init_from(simplifiedMesh);
+                    InitVolumeModel(*model, simplifiedMesh.its, creaseAngle);
                     BOOST_LOG_TRIVIAL(info) << "LOD simplify: completed successfully, faces=" << initFaceCount
                                             << " -> " << endFaceCount
                                             << " (use_count=" << model.use_count() << ")";
@@ -678,7 +742,7 @@ void GLVolume::simple_render(GLShaderProgram*        shader,
             model_volume->mmu_segmentation_facets.get_facets(*model_volume, its_per_color);
             mmuseg_models.resize(its_per_color.size());
             for (int idx = 0; idx < its_per_color.size(); idx++) {
-                mmuseg_models[idx].init_from(its_per_color[idx]);
+                InitVolumeModel(mmuseg_models[idx], its_per_color[idx], GetVolumeNormalCreaseAngle());
             }
 
             mmuseg_ts = model_volume->mmu_segmentation_facets.timestamp();
@@ -701,6 +765,16 @@ void GLVolume::simple_render(GLShaderProgram*        shader,
                 continue;
 
             if (shader) {
+                if (s_pbrMaterials != nullptr)
+                {
+                    // Same filament mapping as the colors below.
+                    int filamentIdx = 0;
+                    if (idx == 0)
+                        filamentIdx = std::max(model_volume->extruder_id(), 1) - 1;
+                    else if (idx <= static_cast<int>(extruder_colors.size()))
+                        filamentIdx = idx - 1;
+                    SetPbrMaterialUniforms(shader, PickPbrMaterial(*s_pbrMaterials, filamentIdx));
+                }
                 if (idx == 0) {
                     int extruder_id = model_volume->extruder_id();
                     if (extruder_id <= 0)
@@ -907,7 +981,7 @@ int GLVolumeCollection::load_object_volume(const ModelObject* model_object,
 #if ENABLE_SMOOTH_NORMALS
     v.model.init_from(mesh, true);
 #else
-    v.model.init_from(mesh);
+    InitVolumeModel(v.model, mesh.its, GetVolumeNormalCreaseAngle());
 #endif // ENABLE_SMOOTH_NORMALS
 
     // Generate LOD simplified models only once (shared via shared_ptr)
@@ -1187,6 +1261,11 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
     GLShaderProgram* sink_shader  = GUI::wxGetApp().get_shader("flat");
     const bool canRenderSinkingContours = m_show_sinking_contours && sink_shader != nullptr;
 
+    // Uniforms persist on the program, so these flags are reset at the end of this function.
+    shader->set_uniform("use_pbr", _usePbr);
+    shader->set_uniform("debug_normal_color", _debugNormalColor);
+    GLVolume::s_pbrMaterials = _usePbr ? &_extruderMaterials : nullptr;
+
     if (type == ERenderType::Transparent) {
         glsafe(::glEnable(GL_BLEND));
         glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
@@ -1297,6 +1376,15 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
                                 volume.first->world_matrix().matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>()));
         shader->set_uniform("slope.normal_z", normal_z);
 
+        if (_usePbr)
+        {
+            const GLVolume* pbrVolume = volume.first;
+            int filamentIdx = -1;
+            if (!pbrVolume->is_modifier && !pbrVolume->is_wipe_tower)
+                filamentIdx = std::max(pbrVolume->extruder_id, 1) - 1;
+            SetPbrMaterialUniforms(shader, PickPbrMaterial(_extruderMaterials, filamentIdx));
+        }
+
 #if ENABLE_ENVIRONMENT_MAP
         unsigned int environment_texture_id  = GUI::wxGetApp().plater()->get_environment_texture_id();
         bool         use_environment_texture = environment_texture_id > 0 && GUI::wxGetApp().app_config->get("use_environment_map") == "1";
@@ -1348,6 +1436,10 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
         if (sinkShaderUsing)
             shader->start_using();
     }
+
+    shader->set_uniform("use_pbr", false);
+    shader->set_uniform("debug_normal_color", false);
+    GLVolume::s_pbrMaterials = nullptr;
 
     if (disable_cullface)
         glsafe(::glEnable(GL_CULL_FACE));
@@ -1534,6 +1626,17 @@ void GLVolumeCollection::update_colors_by_extruder(const DynamicPrintConfig* con
 {
     using ColorItem = std::pair<std::string, ColorRGBA>;
     std::vector<ColorItem> colors;
+
+    // Read the selected presets from the bundle: a filament tab config only holds one filament.
+    // Mixed (virtual) filaments have no preset and fall back to the default material.
+    _extruderMaterials.clear();
+    const PresetBundle* presetBundle = GUI::wxGetApp().preset_bundle;
+    if (presetBundle != nullptr)
+    {
+        _extruderMaterials.reserve(presetBundle->filament_presets.size());
+        for (const std::string& presetName : presetBundle->filament_presets)
+            _extruderMaterials.push_back(MatchPbrMaterial(*presetBundle, presetName));
+    }
 
     if (static_cast<PrinterTechnology>(config->opt_int("printer_technology")) == ptSLA) {
         const std::string& txt_color = config->opt_string("material_colour").empty() ?

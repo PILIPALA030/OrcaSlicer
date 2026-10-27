@@ -50,6 +50,10 @@ out float color_clip_plane_dot;
 out vec4 world_pos;
 out float world_normal_z;
 out vec3 eye_normal;
+// Eye space position, used by per-pixel PBR shading.
+out vec3 eye_position;
+// World space normal, used by the normal color debug view.
+out vec3 world_normal;
 
 void main()
 {
@@ -62,6 +66,8 @@ void main()
 
 	intensity.x = INTENSITY_AMBIENT + NdotL * LIGHT_TOP_DIFFUSE;
     vec4 position = view_model_matrix * vec4(v_position, 1.0);
+    eye_position = position.xyz;
+    world_normal = slope.volume_world_normal_matrix * v_normal;
     intensity.y = LIGHT_TOP_SPECULAR * pow(max(dot(-normalize(position.xyz), reflect(-LIGHT_TOP_DIR, eye_normal)), 0.0), LIGHT_TOP_SHININESS);
 
 	// Perform the same lighting calculation for the 2nd light source (no specular applied).

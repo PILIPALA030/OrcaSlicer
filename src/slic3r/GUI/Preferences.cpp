@@ -3,6 +3,7 @@
 #include "GUI_App.hpp"
 #include "MainFrame.hpp"
 #include "Plater.hpp"
+#include "GLCanvas3D.hpp"
 #include "MsgDialog.hpp"
 #include "I18N.hpp"
 #include "libslic3r/AppConfig.hpp"
@@ -770,6 +771,15 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxWindow *pa
         if (param == "allow_filament_temp_mixing" && wxGetApp().plater())
             wxGetApp().plater()->notify_filament_usage_changed();
 
+        if (param == "enable_pbr_material" && wxGetApp().plater() != nullptr)
+        {
+            for (GLCanvas3D* canvas : { wxGetApp().plater()->get_view3D_canvas3D(), wxGetApp().plater()->get_assmeble_canvas3D() })
+            {
+                if (canvas != nullptr)
+                    canvas->set_as_dirty();
+            }
+        }
+
         if (param == PRIVACY_POLICY_FLAGS)
             {
             app_config->set("app", PRIVACY_POLICY_FLAGS, checkbox->GetValue());
@@ -1244,6 +1254,12 @@ wxWindow* PreferencesDialog::create_general_page()
     auto item_use_free_camera_settings = create_item_checkbox(_L("Use free camera"), page, _L("If enabled, use free camera. If not enabled, use constrained camera."), 50, "use_free_camera");
     auto swap_pan_rotate = create_item_checkbox(_L("Swap pan and rotate mouse buttons"), page, _L("If enabled, swaps the left and right mouse buttons pan and rotate functions."), 50, "swap_mouse_buttons");
     auto reverse_mouse_zoom = create_item_checkbox(_L("Reverse mouse zoom"), page, _L("If enabled, reverses the direction of zoom with mouse wheel."), 50, "reverse_mouse_wheel_zoom");
+    // PBR shading needs the OpenGL 3.1 shaders, hide the option otherwise.
+    wxBoxSizer* itemPbrMaterial = nullptr;
+    if (wxGetApp().is_gl_version_greater_or_equal_to(3, 1))
+        itemPbrMaterial = create_item_checkbox(_L("Physically based material rendering"), page,
+            _L("If enabled, models in the Prepare and Assemble views are rendered with physically based materials by filament type."),
+            50, "enable_pbr_material");
     auto allow_filament_temp_mixing = create_item_checkbox(_L("Allow high/low temperature filament mixing"), page, _L("If enabled, allows printing with both high-temperature and low-temperature filaments simultaneously."), 50, "allow_filament_temp_mixing",
         [this](bool new_val, bool old_val) -> bool {
             // Only confirm when turning ON; allow turning OFF without dialog.
@@ -1364,6 +1380,8 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_use_free_camera_settings, 0, wxTOP, FromDIP(3));
     sizer_page->Add(swap_pan_rotate, 0, wxTOP, FromDIP(3));
     sizer_page->Add(reverse_mouse_zoom, 0, wxTOP, FromDIP(3));
+    if (itemPbrMaterial != nullptr)
+        sizer_page->Add(itemPbrMaterial, 0, wxTOP, FromDIP(3));
     sizer_page->Add(allow_filament_temp_mixing, 0, wxTOP, FromDIP(3));
     sizer_page->Add(camera_orbit_mult, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_show_splash_screen, 0, wxTOP, FromDIP(3));

@@ -15,6 +15,9 @@
 #include <boost/filesystem/operations.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 
+#include <algorithm>
+#include <cmath>
+
 #if ENABLE_SMOOTH_NORMALS
 #include <igl/per_face_normals.h>
 #include <igl/per_corner_normals.h>
@@ -470,6 +473,169 @@ void GLModel::UpdateTexCoordBounds()
     m_render_data.texCoordMin = minCoord;
     m_render_data.texCoordMax = maxCoord;
     m_render_data.texCoordBoundsValid = true;
+}
+
+namespace {
+
+// Angle-split smooth normals: a corner averages the adjacent faces within the crease angle.
+class SmoothNormalBuilder
+{
+public:
+    SmoothNormalBuilder(const indexed_triangle_set& its, const float creaseAngleDeg)
+        : _its(its)
+        , _cosThreshold(std::cos(std::min(std::max(creaseAngleDeg, 0.0f), 180.0f) * static_cast<float>(PI / 180.0)))
+    {
+        const size_t faceCount = its.indices.size();
+        _faceUnit.resize(faceCount);
+        _faceArea.resize(faceCount);
+        _cornerOffsets.assign(its.vertices.size() + 1, 0);
+        for (size_t f = 0; f < faceCount; ++f)
+        {
+            const stl_triangle_vertex_indices& face = its.indices[f];
+            const Vec3f cross = (its.vertices[face[1]] - its.vertices[face[0]]).cross(its.vertices[face[2]] - its.vertices[face[0]]);
+            const float length = cross.norm();
+            _faceArea[f] = length;
+            _faceUnit[f] = length > 0.0f ? Vec3f(cross / length) : Vec3f(Vec3f::Zero());
+            for (int k = 0; k < 3; ++k)
+                ++_cornerOffsets[static_cast<size_t>(face[k]) + 1];
+        }
+        for (size_t v = 0; v < its.vertices.size(); ++v)
+            _cornerOffsets[v + 1] += _cornerOffsets[v];
+
+        // Vertex -> corner adjacency (CSR), corner id = 3 * face + k.
+        _corners.resize(3 * faceCount);
+        std::vector<uint32_t> fillPos(_cornerOffsets.begin(), _cornerOffsets.end() - 1);
+        for (size_t f = 0; f < faceCount; ++f)
+        {
+            for (int k = 0; k < 3; ++k)
+                _corners[fillPos[static_cast<size_t>(its.indices[f][k])]++] = static_cast<uint32_t>(3 * f + static_cast<size_t>(k));
+        }
+    }
+
+    uint32_t CornerBegin(const size_t vertex) const { return _cornerOffsets[vertex]; }
+    uint32_t CornerEnd(const size_t vertex) const { return _cornerOffsets[vertex + 1]; }
+    uint32_t CornerAt(const uint32_t index) const { return _corners[index]; }
+
+    // Area weighted average of the adjacent faces within the crease angle, normalized.
+    Vec3f CornerNormal(const uint32_t corner) const
+    {
+        const size_t face = corner / 3;
+        const size_t vertex = static_cast<size_t>(_its.indices[face][corner % 3]);
+        const Vec3f& own = _faceUnit[face];
+        Vec3f sum = Vec3f::Zero();
+        for (uint32_t i = _cornerOffsets[vertex]; i < _cornerOffsets[vertex + 1]; ++i)
+        {
+            const size_t other = _corners[i] / 3;
+            if (own.dot(_faceUnit[other]) >= _cosThreshold)
+                sum += _faceUnit[other] * _faceArea[other];
+        }
+        const float length = sum.norm();
+        if (length > 0.0f)
+            return sum / length;
+        return own.squaredNorm() > 0.0f ? own : Vec3f(Vec3f::UnitZ());
+    }
+
+private:
+    const indexed_triangle_set& _its;
+    float _cosThreshold;
+    std::vector<Vec3f> _faceUnit;
+    std::vector<float> _faceArea;
+    std::vector<uint32_t> _cornerOffsets;
+    std::vector<uint32_t> _corners;
+};
+
+} // namespace
+
+void GLModel::InitFromSmooth(const indexed_triangle_set& its, const float creaseAngleDeg)
+{
+    if (is_initialized()) {
+        // call reset() if you want to reuse this model
+        assert(false);
+        return;
+    }
+
+    if (its.vertices.empty() || its.indices.empty()) {
+        assert(false);
+        return;
+    }
+
+    const SmoothNormalBuilder builder(its, creaseAngleDeg);
+    std::vector<unsigned int> cornerVertex(3 * its.indices.size(), 0);
+
+    Geometry& data = m_render_data.geometry;
+    data.format = { Geometry::EPrimitiveType::Triangles, Geometry::EVertexLayout::P3N3 };
+    data.reserve_vertices(its.vertices.size());
+    data.reserve_indices(3 * its.indices.size());
+
+    // Corners of one vertex with the same normal share an output vertex, hard edges split it.
+    unsigned int vertexCount = 0;
+    std::vector<std::pair<Vec3f, unsigned int>> emitted;
+    for (size_t v = 0; v < its.vertices.size(); ++v)
+    {
+        emitted.clear();
+        for (uint32_t i = builder.CornerBegin(v); i < builder.CornerEnd(v); ++i)
+        {
+            const uint32_t corner = builder.CornerAt(i);
+            const Vec3f normal = builder.CornerNormal(corner);
+            unsigned int outIdx = vertexCount;
+            bool found = false;
+            for (const std::pair<Vec3f, unsigned int>& item : emitted)
+            {
+                if (item.first == normal)
+                {
+                    outIdx = item.second;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+            {
+                data.add_vertex(its.vertices[v], normal);
+                emitted.emplace_back(normal, vertexCount);
+                ++vertexCount;
+            }
+            cornerVertex[corner] = outIdx;
+        }
+    }
+
+    for (size_t f = 0; f < its.indices.size(); ++f)
+        data.add_triangle(cornerVertex[3 * f], cornerVertex[3 * f + 1], cornerVertex[3 * f + 2]);
+
+    // update bounding box
+    for (size_t i = 0; i < vertices_count(); ++i) {
+        m_bounding_box.merge(data.extract_position_3(i).cast<double>());
+    }
+}
+
+void VisitCornerNormals(const indexed_triangle_set& its, const float creaseAngleDeg, const size_t faceStride,
+                        const std::function<void(const Vec3f& position, const Vec3f& normal)>& visitor)
+{
+    if (its.indices.empty() || its.vertices.empty() || !visitor)
+        return;
+
+    const size_t stride = std::max<size_t>(faceStride, 1);
+    if (creaseAngleDeg <= 0.0f)
+    {
+        // Same face normals as init_from(its).
+        for (size_t f = 0; f < its.indices.size(); f += stride)
+        {
+            const stl_triangle_vertex_indices& face = its.indices[f];
+            const Vec3f cross = (its.vertices[face[1]] - its.vertices[face[0]]).cross(its.vertices[face[2]] - its.vertices[face[0]]);
+            if (cross.squaredNorm() <= 0.0f)
+                continue;
+            const Vec3f normal = cross.normalized();
+            for (int k = 0; k < 3; ++k)
+                visitor(its.vertices[face[k]], normal);
+        }
+        return;
+    }
+
+    const SmoothNormalBuilder builder(its, creaseAngleDeg);
+    for (size_t f = 0; f < its.indices.size(); f += stride)
+    {
+        for (int k = 0; k < 3; ++k)
+            visitor(its.vertices[its.indices[f][k]], builder.CornerNormal(static_cast<uint32_t>(3 * f + static_cast<size_t>(k))));
+    }
 }
 
 void GLModel::init_from(const TriangleMesh& mesh)

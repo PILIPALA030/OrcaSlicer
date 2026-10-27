@@ -3069,6 +3069,9 @@ void GLCanvas3D::render(bool only_init)
         RenderSelectionStencilFallback();
     }
 
+    if (_showPbrDebugPanel && _showPbrNormals && (m_canvas_type == CanvasView3D || m_canvas_type == CanvasAssembleView))
+        RenderPbrNormalLines();
+
     _render_sequential_clearance();
 #if ENABLE_RENDER_SELECTION_CENTER
     _render_selection_center();
@@ -3131,6 +3134,9 @@ void GLCanvas3D::render(bool only_init)
     if (wxGetApp().get_mode() == ConfigOptionMode::comDevelop)
         _render_style_editor();
 #endif
+
+    if (_showPbrDebugPanel && (m_canvas_type == CanvasView3D || m_canvas_type == CanvasAssembleView))
+        RenderPbrDebugPanel();
 
 
     std::string tooltip;
@@ -4417,6 +4423,24 @@ void GLCanvas3D::on_char(wxKeyEvent& evt)
         case WXK_BACK: { post_event(SimpleEvent(EVT_GLTOOLBAR_DELETE)); break; }
 #endif
         case WXK_ESCAPE: { deselect_all(); break; }
+        // F8 toggles the PBR material debug panel (Ctrl+letter keys are taken by menus and gizmos).
+        case WXK_F8: {
+            if (m_canvas_type == CanvasView3D || m_canvas_type == CanvasAssembleView)
+            {
+                _showPbrDebugPanel = !_showPbrDebugPanel;
+                if (!_showPbrDebugPanel)
+                {
+                    _pbrNormalLines.reset();
+                    _pbrNormalLinesKey = 0;
+                }
+                m_dirty = true;
+            }
+            else
+            {
+                evt.Skip();
+            }
+            break;
+        }
         case WXK_F5: {
             if (wxGetApp().mainframe->is_printer_view())
                 wxGetApp().mainframe->load_printer_url();
@@ -8626,6 +8650,14 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
     else
         m_volumes.set_show_sinking_contours(!m_gizmos.is_hiding_instances());
 
+    // PBR shading lives only in the 140 gouraud shader.
+    const bool usePbr = (m_canvas_type == CanvasView3D || m_canvas_type == CanvasAssembleView) &&
+                        wxGetApp().is_gl_version_greater_or_equal_to(3, 1) &&
+                        wxGetApp().app_config->get_bool("enable_pbr_material");
+    m_volumes.SetUsePbr(usePbr);
+    const bool isPbrCanvas = m_canvas_type == CanvasView3D || m_canvas_type == CanvasAssembleView;
+    m_volumes.SetDebugNormalColor(isPbrCanvas && _showPbrDebugPanel && _showNormalColor);
+
     GLShaderProgram* shader = wxGetApp().get_shader("gouraud");
     ECanvasType canvas_type = this->m_canvas_type;
     bool                 partly_inside_enable = canvas_type == ECanvasType::CanvasAssembleView ? false : true;
@@ -8914,6 +8946,293 @@ void GLCanvas3D::_render_overlays()
     m_labels.render(sorted_instances);
 
     _render_3d_navigator();
+}
+
+void GLCanvas3D::RenderPbrDebugPanel()
+{
+    ImGuiWrapper* imgui = wxGetApp().imgui();
+    if (imgui == nullptr)
+        return;
+
+    PbrMaterialTable& table = PbrMaterialTable::Instance();
+    // Copy: editing refreshes the collection's material list during this frame.
+    const std::vector<PbrMaterialMatch> matches = m_volumes.GetExtruderMaterials();
+
+    bool isOpen = true;
+    ImGui::SetNextWindowPos(ImVec2(60.0f, 60.0f), ImGuiCond_FirstUseEver);
+    imgui->begin(std::string("PBR Material Debug"), &isOpen, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse);
+
+    bool pbrEnabled = wxGetApp().app_config->get_bool("enable_pbr_material");
+    if (ImGui::Checkbox("Enable PBR rendering", &pbrEnabled))
+    {
+        wxGetApp().app_config->set_bool("enable_pbr_material", pbrEnabled);
+        m_dirty = true;
+    }
+    if (!wxGetApp().is_gl_version_greater_or_equal_to(3, 1))
+        imgui->text("OpenGL 3.1 is required, PBR has no effect.");
+    RenderPbrNormalOptions();
+    ImGui::Separator();
+
+    bool changed = false;
+    if (matches.empty())
+        imgui->text("No filament.");
+    for (size_t i = 0; i < matches.size(); ++i)
+        changed = RenderPbrMaterialRow(i, matches[i]) || changed;
+
+    // Edits apply live, the file is only written by Save.
+    if (ImGui::Button("Save"))
+        _pbrSaveFailed = !table.Save();
+    ImGui::SameLine();
+    if (ImGui::Button("Reload from file"))
+    {
+        _pbrSaveFailed = false;
+        table.Reload();
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (_pbrSaveFailed)
+        imgui->text("Save failed, see the log.");
+    else
+        imgui->text(table.IsDirty() ? "Unsaved changes" : "Saved");
+    imgui->text("File: " + table.GetPath());
+    imgui->end();
+
+    if (changed)
+    {
+        update_volumes_colors_by_extruder();
+        imgui->set_requires_extra_frame();
+        m_dirty = true;
+    }
+    if (!isOpen)
+    {
+        _showPbrDebugPanel = false;
+        m_dirty = true;
+    }
+    if (!_showPbrDebugPanel && _pbrNormalLines.is_initialized())
+    {
+        _pbrNormalLines.reset();
+        _pbrNormalLinesKey = 0;
+    }
+}
+
+bool GLCanvas3D::RenderPbrMaterialRow(const size_t filamentIdx, const PbrMaterialMatch& match)
+{
+    const std::string id = std::to_string(filamentIdx);
+    std::string matchText = "default";
+    if (match.source == PbrMatchSource::Name)
+        matchText = "name: " + match.key;
+    else if (match.source == PbrMatchSource::Type)
+        matchText = "type: " + match.key;
+
+    ImGuiWrapper::text("#" + std::to_string(filamentIdx + 1) + "  " +
+                       (match.filamentName.empty() ? std::string("(unknown preset)") : match.filamentName));
+    ImGuiWrapper::text("    matched " + matchText);
+
+    PbrMaterialParams params = match.params;
+    bool edited = false;
+    ImGui::PushItemWidth(220.0f);
+    edited = ImGui::SliderFloat(("metallic##" + id).c_str(), &params.metallic, 0.0f, 1.0f, "%.3f") || edited;
+    edited = ImGui::SliderFloat(("roughness##" + id).c_str(), &params.roughness, 0.045f, 1.0f, "%.3f") || edited;
+    ImGui::PopItemWidth();
+
+    PbrMaterialTable& table = PbrMaterialTable::Instance();
+    if (edited)
+        table.SetMaterial(match.source, match.key, params);
+
+    // Type / default entries are shared, a name entry tunes only this filament.
+    if (match.source != PbrMatchSource::Name && !match.filamentName.empty() &&
+        ImGui::Button(("Create entry for this filament##" + id).c_str()))
+        edited = table.SetMaterial(PbrMatchSource::Name, match.filamentName, params) || edited;
+
+    ImGui::Separator();
+    return edited;
+}
+
+void GLCanvas3D::RenderPbrNormalOptions()
+{
+    ImGuiWrapper* imgui = wxGetApp().imgui();
+    AppConfig* config = wxGetApp().app_config;
+    if (imgui == nullptr || config == nullptr)
+        return;
+
+    if (ImGui::Checkbox("Show normals as color (X red, Y green, Z blue)", &_showNormalColor))
+        m_dirty = true;
+
+    // Smoothing changes the uploaded meshes, so a full scene reload is needed after the frame.
+    bool reload = false;
+    bool smooth = config->get_bool("pbr_smooth_normals");
+    if (ImGui::Checkbox("Smooth normals (angle split)", &smooth))
+    {
+        config->set_bool("pbr_smooth_normals", smooth);
+        reload = true;
+    }
+    if (smooth)
+    {
+        float angle = GetVolumeNormalCreaseAngle();
+        ImGui::PushItemWidth(220.0f);
+        if (ImGui::SliderFloat("crease angle (deg)", &angle, 1.0f, 90.0f, "%.0f"))
+            config->set("pbr_smooth_normals_angle", std::to_string(static_cast<int>(std::lround(angle))));
+        reload = ImGui::IsItemDeactivatedAfterEdit() || reload;
+        ImGui::PopItemWidth();
+    }
+    if (reload)
+    {
+        wxGetApp().CallAfter([]() {
+            Plater* plater = wxGetApp().plater();
+            if (plater == nullptr)
+                return;
+            for (GLCanvas3D* canvas : { plater->get_view3D_canvas3D(), plater->get_assmeble_canvas3D() })
+            {
+                if (canvas != nullptr)
+                    canvas->reload_scene(true, true);
+            }
+        });
+    }
+
+    if (ImGui::Checkbox("Show vertex normals", &_showPbrNormals))
+    {
+        // Free the line buffers when hidden, they are rebuilt on demand.
+        _pbrNormalLines.reset();
+        _pbrNormalLinesKey = 0;
+        m_dirty = true;
+    }
+    if (_showPbrNormals)
+    {
+        ImGui::PushItemWidth(220.0f);
+        if (ImGui::SliderFloat("normal length (mm)", &_pbrNormalLength, 0.2f, 20.0f, "%.1f"))
+            m_dirty = true;
+        ImGui::PopItemWidth();
+        imgui->text(std::string(m_selection.is_empty() ? "All objects" : "Selected objects") + ", " +
+                    std::to_string(_pbrNormalLineCount) + " lines" +
+                    (_pbrNormalStride > 1 ? ", 1 of every " + std::to_string(_pbrNormalStride) + " triangles" : std::string()));
+    }
+}
+
+// Cap of debug normal lines, larger meshes are sampled by a triangle stride.
+static const size_t PBR_MAX_NORMAL_LINES = 200000;
+
+static void HashCombine(size_t& seed, const size_t value)
+{
+    seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+}
+
+const ModelVolume* GLCanvas3D::GetPbrModelVolume(const GLVolume& volume) const
+{
+    if (m_model == nullptr || volume.object_idx() < 0 || volume.volume_idx() < 0)
+        return nullptr;
+    const size_t objectIdx = static_cast<size_t>(volume.object_idx());
+    const size_t volumeIdx = static_cast<size_t>(volume.volume_idx());
+    if (objectIdx >= m_model->objects.size() || m_model->objects[objectIdx] == nullptr)
+        return nullptr;
+    const ModelObject* object = m_model->objects[objectIdx];
+    if (volumeIdx >= object->volumes.size())
+        return nullptr;
+    return object->volumes[volumeIdx];
+}
+
+std::vector<const GLVolume*> GLCanvas3D::CollectPbrNormalVolumes() const
+{
+    std::vector<const GLVolume*> result;
+    const Selection::IndicesList& selected = m_selection.get_volume_idxs();
+    for (unsigned int idx = 0; idx < static_cast<unsigned int>(m_volumes.volumes.size()); ++idx)
+    {
+        const GLVolume* volume = m_volumes.volumes[idx];
+        if (volume == nullptr || !volume->is_active || volume->is_wipe_tower || GetPbrModelVolume(*volume) == nullptr)
+            continue;
+        if (!selected.empty() && selected.find(idx) == selected.end())
+            continue;
+        result.push_back(volume);
+    }
+    return result;
+}
+
+size_t GLCanvas3D::ComputePbrNormalKey(const std::vector<const GLVolume*>& volumes) const
+{
+    size_t key = std::hash<float>()(_pbrNormalLength);
+    HashCombine(key, std::hash<float>()(GetVolumeNormalCreaseAngle()));
+    for (const GLVolume* volume : volumes)
+    {
+        HashCombine(key, std::hash<const void*>()(volume));
+        const ModelVolume* modelVolume = GetPbrModelVolume(*volume);
+        if (modelVolume != nullptr)
+        {
+            HashCombine(key, std::hash<const void*>()(&modelVolume->mesh()));
+            HashCombine(key, modelVolume->mesh().its.indices.size());
+        }
+        const Transform3d world = volume->world_matrix();
+        for (int i = 0; i < 16; ++i)
+            HashCombine(key, std::hash<double>()(world.matrix().data()[i]));
+    }
+    return key;
+}
+
+void GLCanvas3D::BuildPbrNormalLines(const std::vector<const GLVolume*>& volumes)
+{
+    _pbrNormalLines.reset();
+    _pbrNormalLineCount = 0;
+
+    // Three corner normals per triangle, the same normals the volumes are rendered with.
+    size_t totalTriangles = 0;
+    for (const GLVolume* volume : volumes)
+        totalTriangles += GetPbrModelVolume(*volume)->mesh().its.indices.size();
+    _pbrNormalStride = std::max<size_t>(1, (3 * totalTriangles + PBR_MAX_NORMAL_LINES - 1) / PBR_MAX_NORMAL_LINES);
+    if (totalTriangles == 0)
+        return;
+
+    GLModel::Geometry data;
+    data.format = { GLModel::Geometry::EPrimitiveType::Lines, GLModel::Geometry::EVertexLayout::P3 };
+    data.color = ColorRGBA(0.94f, 0.62f, 0.15f, 1.0f);
+    const size_t maxLines = 3 * (totalTriangles / _pbrNormalStride + volumes.size());
+    data.reserve_vertices(2 * maxLines);
+    data.reserve_indices(2 * maxLines);
+
+    const float creaseAngle = GetVolumeNormalCreaseAngle();
+    const double length = static_cast<double>(_pbrNormalLength);
+    unsigned int vertexCount = 0;
+    for (const GLVolume* volume : volumes)
+    {
+        const indexed_triangle_set& its = GetPbrModelVolume(*volume)->mesh().its;
+        const Transform3d world = volume->world_matrix();
+        // Same normal transform as the gouraud shader (inverse transpose).
+        const Matrix3d normalMatrix = world.matrix().block<3, 3>(0, 0).inverse().transpose();
+        VisitCornerNormals(its, creaseAngle, _pbrNormalStride,
+            [&data, &vertexCount, &world, &normalMatrix, length](const Vec3f& position, const Vec3f& normal)
+            {
+                const Vec3d worldPosition = world * position.cast<double>();
+                const Vec3d worldNormal = (normalMatrix * normal.cast<double>()).normalized();
+                data.add_vertex(Vec3f(worldPosition.cast<float>()));
+                data.add_vertex(Vec3f((worldPosition + worldNormal * length).cast<float>()));
+                data.add_line(vertexCount, vertexCount + 1);
+                vertexCount += 2;
+            });
+    }
+
+    _pbrNormalLineCount = vertexCount / 2;
+    if (_pbrNormalLineCount > 0)
+        _pbrNormalLines.init_from(std::move(data));
+}
+
+void GLCanvas3D::RenderPbrNormalLines()
+{
+    const std::vector<const GLVolume*> volumes = CollectPbrNormalVolumes();
+    const size_t key = ComputePbrNormalKey(volumes);
+    if (key != _pbrNormalLinesKey)
+    {
+        BuildPbrNormalLines(volumes);
+        _pbrNormalLinesKey = key;
+    }
+    if (!_pbrNormalLines.is_initialized())
+        return;
+
+    GLShaderProgram* shader = wxGetApp().get_shader("flat");
+    if (shader == nullptr)
+        return;
+    shader->start_using();
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    shader->set_uniform("view_model_matrix", camera.get_view_matrix());
+    shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+    _pbrNormalLines.render();
+    shader->stop_using();
 }
 
 void GLCanvas3D::_render_style_editor()

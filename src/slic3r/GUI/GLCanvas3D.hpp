@@ -604,6 +604,20 @@ private:
 
     bool m_is_touchpad_navigation{ false };
 
+    // PBR material debug panel, toggled by F8.
+    bool _showPbrDebugPanel{ false };
+    // Debug vertex normal lines, rebuilt when the volume set, transforms or smoothing change.
+    bool _showPbrNormals{ false };
+    // Render world space normals as color instead of shading.
+    bool _showNormalColor{ false };
+    // Last material Save failed.
+    bool _pbrSaveFailed{ false };
+    float _pbrNormalLength{ 2.0f };
+    GLModel _pbrNormalLines;
+    size_t _pbrNormalLinesKey{ 0 };
+    size_t _pbrNormalLineCount{ 0 };
+    size_t _pbrNormalStride{ 1 };
+
     // Screen is only refreshed from the OnIdle handler if it is dirty.
     bool m_dirty;
     bool m_initialized;
@@ -1308,6 +1322,26 @@ private:
     void _check_and_update_toolbar_icon_scale();
     void _render_overlays();
     void _render_style_editor();
+    /// @brief Render the PBR material debug panel, edits are applied live and saved on slider release.
+    void RenderPbrDebugPanel();
+    /// @brief Render sliders of one filament material.
+    /// @param filamentIdx 0-based filament index.
+    /// @param match material matched for the filament.
+    /// @return true if the material table was changed.
+    bool RenderPbrMaterialRow(const size_t filamentIdx, const PbrMaterialMatch& match);
+    /// @brief Render normal debug options: normal color, smooth normals toggle and vertex normal lines.
+    void RenderPbrNormalOptions();
+    /// @brief Get the model volume rendered by a GLVolume.
+    /// @return nullptr if the GLVolume has no valid model volume.
+    const ModelVolume* GetPbrModelVolume(const GLVolume& volume) const;
+    /// @brief Collect volumes for normal lines: selected ones, or all object volumes if nothing is selected.
+    std::vector<const GLVolume*> CollectPbrNormalVolumes() const;
+    /// @brief Hash of volumes, transforms, meshes and line length, used to rebuild normal lines.
+    size_t ComputePbrNormalKey(const std::vector<const GLVolume*>& volumes) const;
+    /// @brief Build world space vertex normal lines at the corners of (sampled) triangles.
+    void BuildPbrNormalLines(const std::vector<const GLVolume*>& volumes);
+    /// @brief Render face normal lines of the scene volumes.
+    void RenderPbrNormalLines();
     void _render_volumes_for_picking(const Camera& camera) const;
     void _render_current_gizmo() const;
     void _render_gizmos_overlay();

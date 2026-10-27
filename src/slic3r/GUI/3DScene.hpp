@@ -14,6 +14,7 @@
 #include "GLModel.hpp"
 #include "GLShader.hpp"
 #include "MeshUtils.hpp"
+#include "PbrMaterial.hpp"
 
 #include <atomic>
 #include <functional>
@@ -61,6 +62,9 @@ enum ModelInstanceEPrintVolumeState : unsigned char;
 
 using ModelObjectPtrs = std::vector<ModelObject*>;
 
+/// @brief Crease angle (degrees) of volume normals, 0 when smoothing is off and face normals are used.
+float GetVolumeNormalCreaseAngle();
+
 // Return appropriate color based on the ModelVolume.
 extern ColorRGBA color_from_model_volume(const ModelVolume& model_volume);
 
@@ -98,6 +102,8 @@ public:
     static float              s_curZoom;
     static Matrix4d           s_curViewProjMatrix;
     static std::array<int, 4> s_curViewport;
+    // Per-extruder PBR materials, valid only inside GLVolumeCollection::render() when PBR is on.
+    static const std::vector<GUI::PbrMaterialMatch>* s_pbrMaterials;
 
     enum EHoverState : unsigned char
     {
@@ -455,6 +461,11 @@ private:
     Slope m_slope;
     bool m_show_sinking_contours = false;
 
+    bool _usePbr{ false };
+    bool _debugNormalColor{ false };
+    // PBR material per filament, indexed like the extruder colors.
+    std::vector<GUI::PbrMaterialMatch> _extruderMaterials;
+
 public:
     GLVolumePtrs volumes;
 
@@ -548,6 +559,12 @@ public:
     void set_slope_normal_z(float normal_z) { m_slope.normal_z = normal_z; }
     void set_default_slope_normal_z() { m_slope.normal_z = -::cos(Geometry::deg2rad(90.0f - 45.0f)); }
     void set_show_sinking_contours(bool show) { m_show_sinking_contours = show; }
+    /// @brief Enable PBR shading for the next render() calls (gouraud shader only).
+    void SetUsePbr(const bool usePbr) { _usePbr = usePbr; }
+    /// @brief Render world space normals as color for the next render() calls (gouraud shader only).
+    void SetDebugNormalColor(const bool enable) { _debugNormalColor = enable; }
+    /// @brief Get the material matched for each filament, refreshed by update_colors_by_extruder().
+    const std::vector<GUI::PbrMaterialMatch>& GetExtruderMaterials() const { return _extruderMaterials; }
 
     // returns true if all the volumes are completely contained in the print volume
     // returns the containment state in the given out_state, if non-null

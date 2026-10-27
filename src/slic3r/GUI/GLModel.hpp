@@ -6,6 +6,7 @@
 #include "libslic3r/Color.hpp"
 #include <vector>
 #include <string>
+#include <functional>
 
 struct indexed_triangle_set;
 
@@ -175,6 +176,10 @@ namespace GUI {
         void init_from(Geometry&& data);
         void init_from(const TriangleMesh& mesh);
         void init_from(const indexed_triangle_set& its);
+        /// @brief Init with angle-split smooth normals, vertices are shared inside smooth regions.
+        /// @param its source mesh.
+        /// @param creaseAngleDeg faces meeting at a larger angle keep a hard edge.
+        void InitFromSmooth(const indexed_triangle_set& its, const float creaseAngleDeg);
         void init_from(const Polygons& polygons, float z);
         bool init_from_file(const std::string& filename);
 
@@ -245,6 +250,14 @@ namespace GUI {
     // the origin of the diamond is in its center
     // the diamond is contained into a box with size [1, 1, 1]
     GLModel::Geometry diamond(unsigned int resolution);
+
+    /// @brief Visit the corner normals of sampled faces, the same normals the volume models are rendered with.
+    /// @param its source mesh.
+    /// @param creaseAngleDeg angle-split smoothing when > 0, plain face normals otherwise.
+    /// @param faceStride visit one of every faceStride faces, 0 is treated as 1.
+    /// @param visitor receives the corner position and its normalized normal.
+    void VisitCornerNormals(const indexed_triangle_set& its, const float creaseAngleDeg, const size_t faceStride,
+                            const std::function<void(const Vec3f& position, const Vec3f& normal)>& visitor);
 
     // create a sphere with smooth normals
     // the origin of the sphere is in its center
