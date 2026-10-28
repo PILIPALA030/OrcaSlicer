@@ -217,12 +217,6 @@ void AppConfig::set_defaults()
     if (get("enable_pbr_material").empty())
         set_bool("enable_pbr_material", false);
 
-    if (get("pbr_smooth_normals").empty())
-        set_bool("pbr_smooth_normals", false);
-
-    if (get("pbr_smooth_normals_angle").empty())
-        set("pbr_smooth_normals_angle", "30");
-
 //#ifdef SUPPORT_SHOW_HINTS
     if (get("show_hints").empty())
         set_bool("show_hints", true);

@@ -2,6 +2,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 namespace Slic3r {
 namespace GUI {
@@ -12,6 +13,36 @@ struct PbrMaterialParams
     float metallic{ 0.0f };
     float roughness{ 0.55f };
 };
+
+/// @brief Scene lighting of the PBR shader (dark studio with a lit floor), linear values.
+struct PbrLightingParams
+{
+    float exposure{ 1.0f };
+    float keyLight{ 0.65f };
+    float fillLight{ 0.15f };
+    float ambientDiffuse{ 0.5f };
+    float sky{ 0.04f };
+    float ground{ 0.35f };
+    float reflection{ 1.0f };
+    float background{ 0.2f };
+    float softboxLeft{ 12.0f };
+    float softboxRight{ 12.0f };
+    float softboxSize{ 0.5f };
+};
+
+/// @brief Description of one lighting parameter: json key, shader uniform, member and range.
+struct PbrLightingField
+{
+    const char* key;
+    const char* uniform;
+    float PbrLightingParams::*member;
+    float minValue;
+    float maxValue;
+};
+
+/// @brief Get all lighting parameters, shared by json io, shader uniforms and the debug panel.
+/// @return the field list.
+const std::vector<PbrLightingField>& GetPbrLightingFields();
 
 /// @brief Section of the material table that matched a filament.
 enum class PbrMatchSource
@@ -49,6 +80,14 @@ public:
     /// @brief Get the fallback material.
     /// @return the default material.
     const PbrMaterialParams& GetDefault() const { return _default; }
+
+    /// @brief Get the scene lighting.
+    /// @return the lighting parameters.
+    const PbrLightingParams& GetLighting() const { return _lighting; }
+
+    /// @brief Set the scene lighting in memory, values are clamped to their ranges.
+    /// @param lighting new lighting parameters.
+    void SetLighting(const PbrLightingParams& lighting);
 
     /// @brief Set an entry in memory, created if missing. Key is ignored for the default source.
     /// @param source section to edit.
@@ -90,6 +129,7 @@ private:
     std::map<std::string, PbrMaterialParams> _names;
     std::map<std::string, PbrMaterialParams> _types;
     PbrMaterialParams _default;
+    PbrLightingParams _lighting;
     bool _dirty{ false };
 };
 

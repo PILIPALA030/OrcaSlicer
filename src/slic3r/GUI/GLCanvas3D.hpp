@@ -1329,8 +1329,10 @@ private:
     /// @param match material matched for the filament.
     /// @return true if the material table was changed.
     bool RenderPbrMaterialRow(const size_t filamentIdx, const PbrMaterialMatch& match);
-    /// @brief Render normal debug options: normal color, smooth normals toggle and vertex normal lines.
+    /// @brief Render normal debug options: normal color view and vertex normal lines.
     void RenderPbrNormalOptions();
+    /// @brief Render lighting sliders, edits apply live and are saved with the material table.
+    void RenderPbrLightingOptions();
     /// @brief Get the model volume rendered by a GLVolume.
     /// @return nullptr if the GLVolume has no valid model volume.
     const ModelVolume* GetPbrModelVolume(const GLVolume& volume) const;

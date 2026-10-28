@@ -118,14 +118,12 @@ static Slic3r::GUI::PbrMaterialMatch MatchPbrMaterial(const Slic3r::PresetBundle
 
 namespace Slic3r {
 
+// Faces meeting at a larger angle keep a hard edge, smaller ones are shaded smooth.
+static const float VOLUME_NORMAL_CREASE_ANGLE = 30.0f;
+
 float GetVolumeNormalCreaseAngle()
 {
-    const AppConfig* config = GUI::wxGetApp().app_config;
-    if (config == nullptr || !config->get_bool("pbr_smooth_normals"))
-        return 0.0f;
-    const std::string text = config->get("pbr_smooth_normals_angle");
-    const float angle = text.empty() ? 30.0f : std::strtof(text.c_str(), nullptr);
-    return std::min(std::max(angle, 1.0f), 180.0f);
+    return VOLUME_NORMAL_CREASE_ANGLE;
 }
 
 } // namespace Slic3r
@@ -1265,6 +1263,12 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
     shader->set_uniform("use_pbr", _usePbr);
     shader->set_uniform("debug_normal_color", _debugNormalColor);
     GLVolume::s_pbrMaterials = _usePbr ? &_extruderMaterials : nullptr;
+    if (_usePbr)
+    {
+        const GUI::PbrLightingParams& lighting = GUI::PbrMaterialTable::Instance().GetLighting();
+        for (const GUI::PbrLightingField& field : GUI::GetPbrLightingFields())
+            shader->set_uniform(field.uniform, lighting.*field.member);
+    }
 
     if (type == ERenderType::Transparent) {
         glsafe(::glEnable(GL_BLEND));

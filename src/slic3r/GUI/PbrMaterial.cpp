@@ -22,6 +22,7 @@ const char* const PBR_PRESETS_FILE = "/materials/pbr_presets.json";
 const char* const PBR_KEY_DEFAULT = "default";
 const char* const PBR_KEY_NAMES = "names";
 const char* const PBR_KEY_TYPES = "types";
+const char* const PBR_KEY_LIGHTING = "lighting";
 // Avoid GGX singularity at zero roughness.
 const float PBR_MIN_ROUGHNESS = 0.045f;
 
@@ -72,10 +73,45 @@ void ReadSection(const nlohmann::json& root, const char* name, const bool upperK
 }
 
 // Keep 3 decimals so the saved file stays readable.
+double RoundValue(const float value)
+{
+    return std::round(static_cast<double>(value) * 1000.0) / 1000.0;
+}
+
 void WriteParams(std::ostringstream& out, const PbrMaterialParams& params)
 {
-    out << "{ \"metallic\": " << std::round(static_cast<double>(params.metallic) * 1000.0) / 1000.0
-        << ", \"roughness\": " << std::round(static_cast<double>(params.roughness) * 1000.0) / 1000.0 << " }";
+    out << "{ \"metallic\": " << RoundValue(params.metallic) << ", \"roughness\": " << RoundValue(params.roughness) << " }";
+}
+
+PbrLightingParams ClampLighting(const PbrLightingParams& lighting)
+{
+    PbrLightingParams clamped = lighting;
+    for (const PbrLightingField& field : GetPbrLightingFields())
+        clamped.*field.member = std::min(std::max(clamped.*field.member, field.minValue), field.maxValue);
+    return clamped;
+}
+
+PbrLightingParams ReadLighting(const nlohmann::json& root)
+{
+    PbrLightingParams lighting;
+    const nlohmann::json::const_iterator section = root.find(PBR_KEY_LIGHTING);
+    if (section == root.end() || !section->is_object())
+        return lighting;
+    for (const PbrLightingField& field : GetPbrLightingFields())
+        lighting.*field.member = ReadFloat(*section, field.key, lighting.*field.member);
+    return ClampLighting(lighting);
+}
+
+void WriteLighting(std::ostringstream& out, const PbrLightingParams& lighting)
+{
+    const std::vector<PbrLightingField>& fields = GetPbrLightingFields();
+    out << "    \"" << PBR_KEY_LIGHTING << "\": {\n";
+    for (size_t i = 0; i < fields.size(); ++i)
+    {
+        out << "        \"" << fields[i].key << "\": " << RoundValue(lighting.*fields[i].member);
+        out << (i + 1 < fields.size() ? ",\n" : "\n");
+    }
+    out << "    },\n";
 }
 
 void WriteSection(std::ostringstream& out, const char* name, const std::map<std::string, PbrMaterialParams>& section,
@@ -93,6 +129,24 @@ void WriteSection(std::ostringstream& out, const char* name, const std::map<std:
 }
 
 } // namespace
+
+const std::vector<PbrLightingField>& GetPbrLightingFields()
+{
+    static const std::vector<PbrLightingField> fields = {
+        { "exposure",        "pbr_exposure",        &PbrLightingParams::exposure,       0.1f,  4.0f },
+        { "key_light",       "pbr_key_light",       &PbrLightingParams::keyLight,       0.0f,  3.0f },
+        { "fill_light",      "pbr_fill_light",      &PbrLightingParams::fillLight,      0.0f,  3.0f },
+        { "ambient_diffuse", "pbr_ambient_diffuse", &PbrLightingParams::ambientDiffuse, 0.0f,  3.0f },
+        { "sky",             "pbr_sky",             &PbrLightingParams::sky,            0.0f,  1.0f },
+        { "ground",          "pbr_ground",          &PbrLightingParams::ground,         0.0f,  1.0f },
+        { "reflection",      "pbr_reflection",      &PbrLightingParams::reflection,     0.0f,  3.0f },
+        { "background",      "pbr_background",      &PbrLightingParams::background,     0.0f,  1.0f },
+        { "softbox_left",    "pbr_softbox_left",    &PbrLightingParams::softboxLeft,    0.0f, 40.0f },
+        { "softbox_right",   "pbr_softbox_right",   &PbrLightingParams::softboxRight,   0.0f, 40.0f },
+        { "softbox_size",    "pbr_softbox_size",    &PbrLightingParams::softboxSize,    0.05f, 1.5f },
+    };
+    return fields;
+}
 
 PbrMaterialTable& PbrMaterialTable::Instance()
 {
@@ -112,6 +166,7 @@ bool PbrMaterialTable::Load()
     _names.clear();
     _types.clear();
     _default = PbrMaterialParams();
+    _lighting = PbrLightingParams();
     _dirty = false;
 
     boost::nowide::ifstream file(_path);
@@ -129,7 +184,14 @@ bool PbrMaterialTable::Load()
 
     ReadSection(root, PBR_KEY_NAMES, false, _names);
     ReadSection(root, PBR_KEY_TYPES, true, _types);
+    _lighting = ReadLighting(root);
     return true;
+}
+
+void PbrMaterialTable::SetLighting(const PbrLightingParams& lighting)
+{
+    _lighting = ClampLighting(lighting);
+    _dirty = true;
 }
 
 bool PbrMaterialTable::Reload()
@@ -146,6 +208,7 @@ bool PbrMaterialTable::Save()
     out << "{\n    \"" << PBR_KEY_DEFAULT << "\": ";
     WriteParams(out, _default);
     out << ",\n";
+    WriteLighting(out, _lighting);
     WriteSection(out, PBR_KEY_NAMES, _names, false);
     WriteSection(out, PBR_KEY_TYPES, _types, true);
     out << "}\n";

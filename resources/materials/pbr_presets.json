@@ -1,5 +1,18 @@
 {
     "default": { "metallic": 0, "roughness": 0.55 },
+    "lighting": {
+        "exposure": 1,
+        "key_light": 0.65,
+        "fill_light": 0.15,
+        "ambient_diffuse": 0.5,
+        "sky": 0.04,
+        "ground": 0.35,
+        "reflection": 1,
+        "background": 0.2,
+        "softbox_left": 12,
+        "softbox_right": 12,
+        "softbox_size": 0.5
+    },
     "names": {
         "Generic ABS": { "metallic": 0, "roughness": 0.65 },
         "Generic ASA": { "metallic": 0, "roughness": 0.7 },

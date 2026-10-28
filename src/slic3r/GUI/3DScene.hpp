@@ -62,7 +62,7 @@ enum ModelInstanceEPrintVolumeState : unsigned char;
 
 using ModelObjectPtrs = std::vector<ModelObject*>;
 
-/// @brief Crease angle (degrees) of volume normals, 0 when smoothing is off and face normals are used.
+/// @brief Crease angle (degrees) of the angle-split smooth normals used by object volumes.
 float GetVolumeNormalCreaseAngle();
 
 // Return appropriate color based on the ModelVolume.

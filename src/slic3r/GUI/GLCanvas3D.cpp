@@ -8972,6 +8972,8 @@ void GLCanvas3D::RenderPbrDebugPanel()
         imgui->text("OpenGL 3.1 is required, PBR has no effect.");
     RenderPbrNormalOptions();
     ImGui::Separator();
+    RenderPbrLightingOptions();
+    ImGui::Separator();
 
     bool changed = false;
     if (matches.empty())
@@ -9048,46 +9050,33 @@ bool GLCanvas3D::RenderPbrMaterialRow(const size_t filamentIdx, const PbrMateria
     return edited;
 }
 
+void GLCanvas3D::RenderPbrLightingOptions()
+{
+    if (!ImGui::CollapsingHeader("Lighting"))
+        return;
+
+    PbrMaterialTable& table = PbrMaterialTable::Instance();
+    PbrLightingParams lighting = table.GetLighting();
+    bool edited = false;
+    ImGui::PushItemWidth(220.0f);
+    for (const PbrLightingField& field : GetPbrLightingFields())
+        edited = ImGui::SliderFloat(field.key, &(lighting.*field.member), field.minValue, field.maxValue, "%.3f") || edited;
+    ImGui::PopItemWidth();
+    if (edited)
+    {
+        table.SetLighting(lighting);
+        m_dirty = true;
+    }
+}
+
 void GLCanvas3D::RenderPbrNormalOptions()
 {
     ImGuiWrapper* imgui = wxGetApp().imgui();
-    AppConfig* config = wxGetApp().app_config;
-    if (imgui == nullptr || config == nullptr)
+    if (imgui == nullptr)
         return;
 
     if (ImGui::Checkbox("Show normals as color (X red, Y green, Z blue)", &_showNormalColor))
         m_dirty = true;
-
-    // Smoothing changes the uploaded meshes, so a full scene reload is needed after the frame.
-    bool reload = false;
-    bool smooth = config->get_bool("pbr_smooth_normals");
-    if (ImGui::Checkbox("Smooth normals (angle split)", &smooth))
-    {
-        config->set_bool("pbr_smooth_normals", smooth);
-        reload = true;
-    }
-    if (smooth)
-    {
-        float angle = GetVolumeNormalCreaseAngle();
-        ImGui::PushItemWidth(220.0f);
-        if (ImGui::SliderFloat("crease angle (deg)", &angle, 1.0f, 90.0f, "%.0f"))
-            config->set("pbr_smooth_normals_angle", std::to_string(static_cast<int>(std::lround(angle))));
-        reload = ImGui::IsItemDeactivatedAfterEdit() || reload;
-        ImGui::PopItemWidth();
-    }
-    if (reload)
-    {
-        wxGetApp().CallAfter([]() {
-            Plater* plater = wxGetApp().plater();
-            if (plater == nullptr)
-                return;
-            for (GLCanvas3D* canvas : { plater->get_view3D_canvas3D(), plater->get_assmeble_canvas3D() })
-            {
-                if (canvas != nullptr)
-                    canvas->reload_scene(true, true);
-            }
-        });
-    }
 
     if (ImGui::Checkbox("Show vertex normals", &_showPbrNormals))
     {
