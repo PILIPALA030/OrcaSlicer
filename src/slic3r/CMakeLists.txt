@@ -378,6 +378,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/PathData.hpp
     GUI/PathRenderer.cpp
     GUI/PathRenderer.hpp
+    GUI/PbrEnvironment.cpp
+    GUI/PbrEnvironment.hpp
     GUI/PbrMaterial.cpp
     GUI/PbrMaterial.hpp
     GUI/PhysicalPrinterDialog.cpp

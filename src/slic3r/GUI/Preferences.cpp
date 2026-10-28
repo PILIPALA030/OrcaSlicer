@@ -773,10 +773,11 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxWindow *pa
 
         if (param == "enable_pbr_material" && wxGetApp().plater() != nullptr)
         {
+            // Full reload: PBR switches the volume meshes between face normals and smooth normals.
             for (GLCanvas3D* canvas : { wxGetApp().plater()->get_view3D_canvas3D(), wxGetApp().plater()->get_assmeble_canvas3D() })
             {
                 if (canvas != nullptr)
-                    canvas->set_as_dirty();
+                    canvas->reload_scene(true, true);
             }
         }
 

@@ -62,7 +62,8 @@ enum ModelInstanceEPrintVolumeState : unsigned char;
 
 using ModelObjectPtrs = std::vector<ModelObject*>;
 
-/// @brief Crease angle (degrees) of the angle-split smooth normals used by object volumes.
+/// @brief Crease angle (degrees) of the angle-split smooth normals used by object volumes when PBR is on,
+///        0 when PBR is off and face normals are used. Changing PBR needs a full scene reload.
 float GetVolumeNormalCreaseAngle();
 
 // Return appropriate color based on the ModelVolume.

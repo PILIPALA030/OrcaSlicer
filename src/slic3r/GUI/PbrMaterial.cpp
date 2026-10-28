@@ -133,17 +133,16 @@ void WriteSection(std::ostringstream& out, const char* name, const std::map<std:
 const std::vector<PbrLightingField>& GetPbrLightingFields()
 {
     static const std::vector<PbrLightingField> fields = {
-        { "exposure",        "pbr_exposure",        &PbrLightingParams::exposure,       0.1f,  4.0f },
-        { "key_light",       "pbr_key_light",       &PbrLightingParams::keyLight,       0.0f,  3.0f },
-        { "fill_light",      "pbr_fill_light",      &PbrLightingParams::fillLight,      0.0f,  3.0f },
-        { "ambient_diffuse", "pbr_ambient_diffuse", &PbrLightingParams::ambientDiffuse, 0.0f,  3.0f },
-        { "sky",             "pbr_sky",             &PbrLightingParams::sky,            0.0f,  1.0f },
-        { "ground",          "pbr_ground",          &PbrLightingParams::ground,         0.0f,  1.0f },
-        { "reflection",      "pbr_reflection",      &PbrLightingParams::reflection,     0.0f,  3.0f },
-        { "background",      "pbr_background",      &PbrLightingParams::background,     0.0f,  1.0f },
-        { "softbox_left",    "pbr_softbox_left",    &PbrLightingParams::softboxLeft,    0.0f, 40.0f },
-        { "softbox_right",   "pbr_softbox_right",   &PbrLightingParams::softboxRight,   0.0f, 40.0f },
-        { "softbox_size",    "pbr_softbox_size",    &PbrLightingParams::softboxSize,    0.05f, 1.5f },
+        { "exposure",      "pbr_exposure",      &PbrLightingParams::exposure,     0.1f,    4.0f },
+        { "env_intensity", "pbr_env_intensity", &PbrLightingParams::envIntensity, 0.0f,    3.0f },
+        { "env_rotation",  "pbr_env_rotation",  &PbrLightingParams::envRotation,  -180.0f, 180.0f },
+        { "diffuse",       "pbr_diffuse",       &PbrLightingParams::diffuse,      0.0f,    3.0f },
+        { "reflection",    "pbr_reflection",    &PbrLightingParams::reflection,   0.0f,    3.0f },
+        { "reflection_saturation", "pbr_reflection_saturation", &PbrLightingParams::reflectionSaturation, 0.0f, 1.0f },
+        // Skybox shader uniforms, ignored by the gouraud shader.
+        { "skybox_brightness", "brightness",    &PbrLightingParams::skyboxBrightness, 0.0f, 2.0f },
+        { "skybox_saturation", "saturation",    &PbrLightingParams::skyboxSaturation, 0.0f, 1.0f },
+        { "skybox_blur",       "blur",          &PbrLightingParams::skyboxBlur,       0.0f, 6.0f },
     };
     return fields;
 }

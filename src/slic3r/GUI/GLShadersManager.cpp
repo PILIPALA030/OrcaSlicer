@@ -76,6 +76,14 @@ std::pair<bool, std::string> GLShadersManager::init()
         valid &= append_shader("gpu_path", { prefix + "gpu_path.vs", prefix + "gpu_path.fs" });
         valid &= append_shader("gpu_path_marker", { prefix + "gpu_path_marker.vs", prefix + "gpu_path_marker.fs" });
     }
+    // used to render the PBR skybox behind the 3D editor, optional: without it the plain background is kept
+    if (GUI::wxGetApp().is_gl_version_greater_or_equal_to(3, 1)) {
+        const size_t errorLength = error.size();
+        if (!append_shader("pbr_skybox", { prefix + "pbr_skybox.vs", prefix + "pbr_skybox.fs" })) {
+            error.erase(errorLength);
+            BOOST_LOG_TRIVIAL(warning) << "PBR skybox shader unavailable";
+        }
+    }
     //used to render thumbnail
     valid &= append_shader("thumbnail", { prefix + "thumbnail.vs", prefix + "thumbnail.fs"});
     // used to render printbed

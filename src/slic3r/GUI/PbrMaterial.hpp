@@ -14,20 +14,21 @@ struct PbrMaterialParams
     float roughness{ 0.55f };
 };
 
-/// @brief Scene lighting of the PBR shader (dark studio with a lit floor), linear values.
+/// @brief Image based lighting of the PBR shader.
 struct PbrLightingParams
 {
     float exposure{ 1.0f };
-    float keyLight{ 0.65f };
-    float fillLight{ 0.15f };
-    float ambientDiffuse{ 0.5f };
-    float sky{ 0.04f };
-    float ground{ 0.35f };
+    // Baked environment average diffuse is 0.7; the default rotation lights the printer front view from the upper left.
+    float envIntensity{ 0.5f };
+    float envRotation{ 150.0f };
+    float diffuse{ 1.0f };
     float reflection{ 1.0f };
-    float background{ 0.2f };
-    float softboxLeft{ 12.0f };
-    float softboxRight{ 12.0f };
-    float softboxSize{ 0.5f };
+    // 0 = gray reflections, 1 = studio colors; diffuse always stays gray to keep filament colors.
+    float reflectionSaturation{ 0.0f };
+    // Skybox panorama behind the scene.
+    float skyboxBrightness{ 1.0f };
+    float skyboxSaturation{ 1.0f };
+    float skyboxBlur{ 1.0f };
 };
 
 /// @brief Description of one lighting parameter: json key, shader uniform, member and range.
