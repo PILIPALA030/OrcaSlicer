@@ -464,11 +464,18 @@ void Bed3D::render_axes()
         m_axes.render();
 }
 
-/// @brief PBR shading of the bed follows the volumes: Prepare / Assemble views with PBR enabled.
+/// @brief PBR shading of the bed: only a textured PEI current plate in Prepare / Assemble views with PBR enabled,
+///        other plate types keep the original shading.
 static bool IsPbrBedCanvas(GLCanvas3D& canvas)
 {
     const GLCanvas3D::ECanvasType type = canvas.get_canvas_type();
-    return (type == GLCanvas3D::CanvasView3D || type == GLCanvas3D::CanvasAssembleView) && IsPbrRenderingEnabled();
+    if ((type != GLCanvas3D::CanvasView3D && type != GLCanvas3D::CanvasAssembleView) || !IsPbrRenderingEnabled())
+        return false;
+
+    Plater* plater = wxGetApp().plater();
+    const PartPlate* plate = plater != nullptr ? plater->get_partplate_list().get_curr_plate() : nullptr;
+    // A plate without its own type uses the project one.
+    return plate != nullptr && plate->get_bed_type(true) == btPTE;
 }
 
 void Bed3D::render_system(GLCanvas3D& canvas, const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom)
@@ -687,10 +694,7 @@ void Bed3D::render_model(const Transform3d& view_matrix, const Transform3d& proj
     GLShaderProgram* pbrShader = use_pbr ? wxGetApp().get_shader("gouraud") : nullptr;
     if (pbrShader != nullptr && !m_model.get_filename().empty())
     {
-        const PbrLightingParams& lighting = PbrMaterialTable::Instance().GetLighting();
-        PbrMaterialParams material;
-        material.metallic = lighting.bedMetallic;
-        material.roughness = lighting.bedRoughness;
+        const PbrMaterialParams& material = PbrMaterialTable::Instance().GetBed();
         pbrShader->start_using();
         const bool envBound = BeginPbrSurface(*pbrShader, view_matrix, projection_matrix,
                                               Geometry::assemble_transform(m_model_offset), material);

@@ -56,9 +56,6 @@ struct PbrLightingParams
     float reflection{ 1.0f };
     // 0 = gray reflections, 1 = studio colors; diffuse always stays gray to keep filament colors.
     float reflectionSaturation{ 0.0f };
-    // Build plate surface, textured PEI by default.
-    float bedMetallic{ 0.0f };
-    float bedRoughness{ 0.6f };
 };
 
 /// @brief Description of one lighting parameter: json key, shader uniform, member and range.
@@ -82,7 +79,9 @@ enum class PbrMatchSource
 {
     Name,
     Type,
-    Default
+    Default,
+    // Build plate surface, never returned by Find().
+    Bed
 };
 
 /// @brief Material lookup result of one filament.
@@ -114,6 +113,10 @@ public:
     /// @return the default material.
     const PbrMaterialParams& GetDefault() const { return _default; }
 
+    /// @brief Get the build plate material, used by textured PEI plates only.
+    /// @return the bed material.
+    const PbrMaterialParams& GetBed() const { return _bed; }
+
     /// @brief Get the scene lighting.
     /// @return the lighting parameters.
     const PbrLightingParams& GetLighting() const { return _lighting; }
@@ -122,7 +125,7 @@ public:
     /// @param lighting new lighting parameters.
     void SetLighting(const PbrLightingParams& lighting);
 
-    /// @brief Set an entry in memory, created if missing. Key is ignored for the default source.
+    /// @brief Set an entry in memory, created if missing. Key is ignored for the default and bed sources.
     /// @param source section to edit.
     /// @param key preset name or filament type, must not be empty for name / type.
     /// @param params new parameters, clamped to the valid range.
@@ -162,6 +165,7 @@ private:
     std::map<std::string, PbrMaterialParams> _names;
     std::map<std::string, PbrMaterialParams> _types;
     PbrMaterialParams _default;
+    PbrMaterialParams _bed;
     PbrLightingParams _lighting;
     bool _dirty{ false };
 };

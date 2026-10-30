@@ -8985,6 +8985,8 @@ void GLCanvas3D::RenderPbrDebugPanel()
     ImGui::Separator();
     RenderPbrLightingOptions();
     ImGui::Separator();
+    RenderPbrBedOptions();
+    ImGui::Separator();
 
     bool changed = false;
     if (matches.empty())
@@ -9040,6 +9042,24 @@ static void RenderPbrFieldDescription(const char* description)
     ImGui::PopStyleColor();
 }
 
+/// @brief Show one slider per material parameter.
+/// @param params material edited in place.
+/// @param id unique ImGui id suffix of this material.
+/// @return true if a value changed.
+static bool RenderPbrMaterialSliders(PbrMaterialParams& params, const std::string& id)
+{
+    bool edited = false;
+    ImGui::PushItemWidth(220.0f);
+    for (const PbrMaterialField& field : GetPbrMaterialFields())
+    {
+        const std::string label = std::string(field.key) + "##" + id;
+        edited = ImGui::SliderFloat(label.c_str(), &(params.*field.member), field.minValue, field.maxValue, "%.3f") || edited;
+        RenderPbrFieldDescription(field.description);
+    }
+    ImGui::PopItemWidth();
+    return edited;
+}
+
 bool GLCanvas3D::RenderPbrMaterialRow(const size_t filamentIdx, const PbrMaterialMatch& match)
 {
     const std::string id = std::to_string(filamentIdx);
@@ -9054,15 +9074,7 @@ bool GLCanvas3D::RenderPbrMaterialRow(const size_t filamentIdx, const PbrMateria
     ImGuiWrapper::text("    matched " + matchText);
 
     PbrMaterialParams params = match.params;
-    bool edited = false;
-    ImGui::PushItemWidth(220.0f);
-    for (const PbrMaterialField& field : GetPbrMaterialFields())
-    {
-        const std::string label = std::string(field.key) + "##" + id;
-        edited = ImGui::SliderFloat(label.c_str(), &(params.*field.member), field.minValue, field.maxValue, "%.3f") || edited;
-        RenderPbrFieldDescription(field.description);
-    }
-    ImGui::PopItemWidth();
+    bool edited = RenderPbrMaterialSliders(params, id);
 
     PbrMaterialTable& table = PbrMaterialTable::Instance();
     if (edited)
@@ -9075,6 +9087,20 @@ bool GLCanvas3D::RenderPbrMaterialRow(const size_t filamentIdx, const PbrMateria
 
     ImGui::Separator();
     return edited;
+}
+
+void GLCanvas3D::RenderPbrBedOptions()
+{
+    if (!ImGui::CollapsingHeader("Build plate (textured PEI only)"))
+        return;
+
+    PbrMaterialTable& table = PbrMaterialTable::Instance();
+    PbrMaterialParams params = table.GetBed();
+    if (RenderPbrMaterialSliders(params, "bed"))
+    {
+        table.SetMaterial(PbrMatchSource::Bed, std::string(), params);
+        m_dirty = true;
+    }
 }
 
 void GLCanvas3D::RenderPbrLightingOptions()

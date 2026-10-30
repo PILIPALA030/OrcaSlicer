@@ -20,11 +20,20 @@ namespace {
 
 const char* const PBR_PRESETS_FILE = "/materials/pbr_presets.json";
 const char* const PBR_KEY_DEFAULT = "default";
+const char* const PBR_KEY_BED = "bed";
 const char* const PBR_KEY_NAMES = "names";
 const char* const PBR_KEY_TYPES = "types";
 const char* const PBR_KEY_LIGHTING = "lighting";
 // Avoid GGX singularity at zero roughness.
 const float PBR_MIN_ROUGHNESS = 0.045f;
+
+// Build plate without a json entry: plain textured PEI.
+PbrMaterialParams DefaultBedParams()
+{
+    PbrMaterialParams params;
+    params.roughness = 0.6f;
+    return params;
+}
 
 PbrMaterialParams ClampParams(const PbrMaterialParams& params)
 {
@@ -180,11 +189,6 @@ const std::vector<PbrLightingField>& GetPbrLightingFields()
           "Scale of the reflections and highlights" },
         { "reflection_saturation", "pbr_reflection_saturation", &PbrLightingParams::reflectionSaturation, 0.0f, 1.0f,
           "Reflection color: 0 = gray studio, 1 = original studio colors" },
-        // Bed material, applied by the bed renderer (no shader uniform of its own).
-        { "bed_metallic", "bed_metallic", &PbrLightingParams::bedMetallic, 0.0f, 1.0f,
-          "Build plate metallic, 0 = PEI plastic look" },
-        { "bed_roughness", "bed_roughness", &PbrLightingParams::bedRoughness, 0.045f, 1.0f,
-          "Build plate roughness, higher = less glossy" },
     };
     return fields;
 }
@@ -207,6 +211,7 @@ bool PbrMaterialTable::Load()
     _names.clear();
     _types.clear();
     _default = PbrMaterialParams();
+    _bed = DefaultBedParams();
     _lighting = PbrLightingParams();
     _dirty = false;
 
@@ -222,6 +227,9 @@ bool PbrMaterialTable::Load()
     const nlohmann::json::const_iterator defaultIt = root.find(PBR_KEY_DEFAULT);
     if (defaultIt != root.end() && defaultIt->is_object())
         _default = ReadParams(*defaultIt, _default);
+    const nlohmann::json::const_iterator bedIt = root.find(PBR_KEY_BED);
+    if (bedIt != root.end() && bedIt->is_object())
+        _bed = ReadParams(*bedIt, _bed);
 
     ReadSection(root, PBR_KEY_NAMES, false, _names);
     ReadSection(root, PBR_KEY_TYPES, true, _types);
@@ -248,6 +256,8 @@ bool PbrMaterialTable::Save()
     std::ostringstream out;
     out << "{\n    \"" << PBR_KEY_DEFAULT << "\": ";
     WriteParams(out, _default);
+    out << ",\n    \"" << PBR_KEY_BED << "\": ";
+    WriteParams(out, _bed);
     out << ",\n";
     WriteLighting(out, _lighting);
     WriteSection(out, PBR_KEY_NAMES, _names, false);
@@ -288,6 +298,9 @@ bool PbrMaterialTable::SetMaterial(const PbrMatchSource source, const std::strin
         break;
     case PbrMatchSource::Default:
         _default = clamped;
+        break;
+    case PbrMatchSource::Bed:
+        _bed = clamped;
         break;
     default:
         return false;

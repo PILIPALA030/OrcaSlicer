@@ -1333,6 +1333,8 @@ private:
     void RenderPbrNormalOptions();
     /// @brief Render lighting sliders, edits apply live and are saved with the material table.
     void RenderPbrLightingOptions();
+    /// @brief Render build plate material sliders, edits apply live and are saved with the material table.
+    void RenderPbrBedOptions();
     /// @brief Get the model volume rendered by a GLVolume.
     /// @return nullptr if the GLVolume has no valid model volume.
     const ModelVolume* GetPbrModelVolume(const GLVolume& volume) const;
