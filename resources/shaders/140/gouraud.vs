@@ -54,6 +54,8 @@ out vec3 eye_normal;
 out vec3 eye_position;
 // World space normal, used by the normal color debug view.
 out vec3 world_normal;
+// Model space position (mm), used by the PBR surface pattern so it moves with the object.
+out vec3 object_position;
 
 void main()
 {
@@ -68,6 +70,7 @@ void main()
     vec4 position = view_model_matrix * vec4(v_position, 1.0);
     eye_position = position.xyz;
     world_normal = slope.volume_world_normal_matrix * v_normal;
+    object_position = v_position;
     intensity.y = LIGHT_TOP_SPECULAR * pow(max(dot(-normalize(position.xyz), reflect(-LIGHT_TOP_DIR, eye_normal)), 0.0), LIGHT_TOP_SHININESS);
 
 	// Perform the same lighting calculation for the 2nd light source (no specular applied).

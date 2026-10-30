@@ -13,6 +13,10 @@ namespace GUI {
 class PbrEnvironment
 {
 public:
+    // Texture units of the PBR samplers, unit 0 is left to 2D textures.
+    static const int ENV_TEXTURE_UNIT = 1;
+    static const int NOISE_TEXTURE_UNIT = 2;
+
     /// @brief Get the shared environment. Main thread only.
     /// @return the environment instance.
     static PbrEnvironment& Instance();
@@ -39,13 +43,14 @@ public:
     /// @return the 9 coefficients.
     const std::array<float, 9>& GetSh() const { return _sh; }
 
-    /// @brief Load the color panorama of the skybox once, needs a current GL context.
-    /// @return true if the skybox texture is ready to bind.
-    bool EnsureSkyboxLoaded();
+    /// @brief Generate the tileable 3D noise of the material surface pattern once, needs a current GL 3.1+ context.
+    ///        Texel: r = value, gba = gradient, packed as described in gouraud.fs.
+    /// @return true if the 3D texture is ready to bind.
+    bool EnsureNoiseLoaded();
 
-    /// @brief Get the GL texture of the skybox panorama (with mipmaps).
-    /// @return texture id, 0 if not loaded.
-    unsigned int GetSkyboxTextureId() const { return _skyboxId; }
+    /// @brief Get the GL 3D noise texture (repeat wrap, with mipmaps).
+    /// @return texture id, 0 if not created.
+    unsigned int GetNoiseTextureId() const { return _noiseId; }
 
 private:
     PbrEnvironment() = default;
@@ -55,18 +60,17 @@ private:
     /// @return false if the file is missing or invalid.
     bool LoadAndUpload(const std::string& path);
 
-    /// @brief Load the skybox png and upload it with box filtered mipmaps.
-    /// @param path full path of the png.
-    /// @return false if the image can not be loaded.
-    bool LoadSkybox(const std::string& path);
+    /// @brief Build the noise volume on the CPU and upload it with mipmaps.
+    /// @return false if the GL texture can not be created.
+    bool CreateNoiseTexture();
 
     // GL objects live until exit, the shared context is gone before static destructors run.
     unsigned int _textureId{ 0 };
     float _maxLod{ 0.0f };
     std::array<float, 9> _sh{};
     bool _loadTried{ false };
-    unsigned int _skyboxId{ 0 };
-    bool _skyboxTried{ false };
+    unsigned int _noiseId{ 0 };
+    bool _noiseTried{ false };
 };
 
 } // namespace GUI

@@ -3,6 +3,7 @@
 #include "GLShadersManager.hpp"
 #include "3DScene.hpp"
 #include "GUI_App.hpp"
+#include "PbrEnvironment.hpp"
 
 #include <cassert>
 #include <algorithm>
@@ -76,14 +77,6 @@ std::pair<bool, std::string> GLShadersManager::init()
         valid &= append_shader("gpu_path", { prefix + "gpu_path.vs", prefix + "gpu_path.fs" });
         valid &= append_shader("gpu_path_marker", { prefix + "gpu_path_marker.vs", prefix + "gpu_path_marker.fs" });
     }
-    // used to render the PBR skybox behind the 3D editor, optional: without it the plain background is kept
-    if (GUI::wxGetApp().is_gl_version_greater_or_equal_to(3, 1)) {
-        const size_t errorLength = error.size();
-        if (!append_shader("pbr_skybox", { prefix + "pbr_skybox.vs", prefix + "pbr_skybox.fs" })) {
-            error.erase(errorLength);
-            BOOST_LOG_TRIVIAL(warning) << "PBR skybox shader unavailable";
-        }
-    }
     //used to render thumbnail
     valid &= append_shader("thumbnail", { prefix + "thumbnail.vs", prefix + "thumbnail.fs"});
     // used to render printbed
@@ -99,6 +92,14 @@ std::pair<bool, std::string> GLShadersManager::init()
         , { "ENABLE_ENVIRONMENT_MAP"sv }
 #endif // ENABLE_ENVIRONMENT_MAP
         );
+    // Cube and 3D samplers both default to unit 0, which is invalid for any draw; give them their own units now.
+    GLShaderProgram* gouraud = get_shader("gouraud");
+    if (gouraud != nullptr && GUI::wxGetApp().is_gl_version_greater_or_equal_to(3, 1)) {
+        gouraud->start_using();
+        gouraud->set_uniform("pbr_env_map", GUI::PbrEnvironment::ENV_TEXTURE_UNIT);
+        gouraud->set_uniform("pbr_noise_tex", GUI::PbrEnvironment::NOISE_TEXTURE_UNIT);
+        gouraud->stop_using();
+    }
     // used to render variable layers heights in 3d editor
     valid &= append_shader("variable_layer_height", { prefix + "variable_layer_height.vs", prefix + "variable_layer_height.fs" });
     // used to render highlight contour around selected triangles inside the multi-material gizmo

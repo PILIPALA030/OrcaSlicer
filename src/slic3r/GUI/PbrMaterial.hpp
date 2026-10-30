@@ -12,7 +12,38 @@ struct PbrMaterialParams
 {
     float metallic{ 0.0f };
     float roughness{ 0.55f };
+    // Procedural surface pattern in model space (mm), no textures; 0 disables it.
+    float colorVariation{ 0.0f };
+    float variationScale{ 8.0f };
+    float speckle{ 0.0f };
+    float speckleSize{ 0.4f };
+    float speckleDarkness{ 0.5f };
+    // Procedural micro relief: grain slope strength and grain size (mm); speckles get raised by it too.
+    float bump{ 0.0f };
+    float bumpScale{ 0.25f };
+    // Relief shape: 0 = smooth waves, 1 = packed grains (sandblasted / matte).
+    float bumpGrain{ 0.0f };
+    // Rough surface retro reflection (Burley diffuse): brighter, softer edges of matte filaments.
+    float sheen{ 0.0f };
 };
+
+/// @brief Description of one material parameter: json key, shader uniform, member and range.
+struct PbrMaterialField
+{
+    const char* key;
+    const char* uniform;
+    float PbrMaterialParams::*member;
+    float minValue;
+    float maxValue;
+    // Written to json even when equal to the default value.
+    bool alwaysWrite;
+    // Short help shown after the debug panel slider.
+    const char* description;
+};
+
+/// @brief Get all material parameters, shared by json io, shader uniforms and the debug panel.
+/// @return the field list.
+const std::vector<PbrMaterialField>& GetPbrMaterialFields();
 
 /// @brief Image based lighting of the PBR shader.
 struct PbrLightingParams
@@ -25,10 +56,9 @@ struct PbrLightingParams
     float reflection{ 1.0f };
     // 0 = gray reflections, 1 = studio colors; diffuse always stays gray to keep filament colors.
     float reflectionSaturation{ 0.0f };
-    // Skybox panorama behind the scene.
-    float skyboxBrightness{ 1.0f };
-    float skyboxSaturation{ 1.0f };
-    float skyboxBlur{ 1.0f };
+    // Build plate surface, textured PEI by default.
+    float bedMetallic{ 0.0f };
+    float bedRoughness{ 0.6f };
 };
 
 /// @brief Description of one lighting parameter: json key, shader uniform, member and range.
@@ -39,6 +69,8 @@ struct PbrLightingField
     float PbrLightingParams::*member;
     float minValue;
     float maxValue;
+    // Short help shown after the debug panel slider.
+    const char* description;
 };
 
 /// @brief Get all lighting parameters, shared by json io, shader uniforms and the debug panel.

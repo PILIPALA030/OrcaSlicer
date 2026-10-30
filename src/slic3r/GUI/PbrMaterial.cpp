@@ -26,16 +26,11 @@ const char* const PBR_KEY_LIGHTING = "lighting";
 // Avoid GGX singularity at zero roughness.
 const float PBR_MIN_ROUGHNESS = 0.045f;
 
-float ClampValue(const float value, const float minValue)
-{
-    return std::min(std::max(value, minValue), 1.0f);
-}
-
 PbrMaterialParams ClampParams(const PbrMaterialParams& params)
 {
-    PbrMaterialParams clamped;
-    clamped.metallic = ClampValue(params.metallic, 0.0f);
-    clamped.roughness = ClampValue(params.roughness, PBR_MIN_ROUGHNESS);
+    PbrMaterialParams clamped = params;
+    for (const PbrMaterialField& field : GetPbrMaterialFields())
+        clamped.*field.member = std::min(std::max(clamped.*field.member, field.minValue), field.maxValue);
     return clamped;
 }
 
@@ -50,8 +45,8 @@ float ReadFloat(const nlohmann::json& item, const char* name, const float fallba
 PbrMaterialParams ReadParams(const nlohmann::json& item, const PbrMaterialParams& fallback)
 {
     PbrMaterialParams params;
-    params.metallic = ReadFloat(item, "metallic", fallback.metallic);
-    params.roughness = ReadFloat(item, "roughness", fallback.roughness);
+    for (const PbrMaterialField& field : GetPbrMaterialFields())
+        params.*field.member = ReadFloat(item, field.key, fallback.*field.member);
     return ClampParams(params);
 }
 
@@ -80,7 +75,18 @@ double RoundValue(const float value)
 
 void WriteParams(std::ostringstream& out, const PbrMaterialParams& params)
 {
-    out << "{ \"metallic\": " << RoundValue(params.metallic) << ", \"roughness\": " << RoundValue(params.roughness) << " }";
+    // Pattern fields at their default value are skipped to keep one short line per entry.
+    const PbrMaterialParams defaults;
+    const char* separator = "{ ";
+    for (const PbrMaterialField& field : GetPbrMaterialFields())
+    {
+        const double value = RoundValue(params.*field.member);
+        if (!field.alwaysWrite && value == RoundValue(defaults.*field.member))
+            continue;
+        out << separator << "\"" << field.key << "\": " << value;
+        separator = ", ";
+    }
+    out << " }";
 }
 
 PbrLightingParams ClampLighting(const PbrLightingParams& lighting)
@@ -130,19 +136,55 @@ void WriteSection(std::ostringstream& out, const char* name, const std::map<std:
 
 } // namespace
 
+const std::vector<PbrMaterialField>& GetPbrMaterialFields()
+{
+    static const std::vector<PbrMaterialField> fields = {
+        { "metallic", "pbr_metallic", &PbrMaterialParams::metallic, 0.0f, 1.0f, true,
+          "0 = plastic, 1 = metal (reflections take the filament color)" },
+        { "roughness", "pbr_roughness", &PbrMaterialParams::roughness, PBR_MIN_ROUGHNESS, 1.0f, true,
+          "Highlight blur: low = glossy sharp highlights, high = dull" },
+        { "color_variation", "pbr_color_variation", &PbrMaterialParams::colorVariation, 0.0f, 0.5f, false,
+          "Strength of slow light / dark color drift, 0 = off" },
+        { "variation_scale", "pbr_variation_scale", &PbrMaterialParams::variationScale, 0.5f, 50.0f, false,
+          "Size of the color drift patches (mm)" },
+        { "speckle", "pbr_speckle", &PbrMaterialParams::speckle, 0.0f, 1.0f, false,
+          "Amount of dark specks such as wood fibers, 0 = off" },
+        { "speckle_size", "pbr_speckle_size", &PbrMaterialParams::speckleSize, 0.05f, 5.0f, false,
+          "Size of one speck (mm)" },
+        { "speckle_darkness", "pbr_speckle_darkness", &PbrMaterialParams::speckleDarkness, 0.0f, 1.0f, false,
+          "How much darker the specks are than the base color" },
+        { "bump", "pbr_bump", &PbrMaterialParams::bump, 0.0f, 1.0f, false,
+          "Strength of the surface micro relief, 0 = smooth" },
+        { "bump_scale", "pbr_bump_scale", &PbrMaterialParams::bumpScale, 0.05f, 5.0f, false,
+          "Size of one relief bump (mm)" },
+        { "bump_grain", "pbr_bump_grain", &PbrMaterialParams::bumpGrain, 0.0f, 1.0f, false,
+          "Relief shape: 0 = smooth waves (wood), 1 = packed grains (matte)" },
+        { "sheen", "pbr_sheen", &PbrMaterialParams::sheen, 0.0f, 1.0f, false,
+          "Soft bright edges of rough surfaces (dusty matte look)" },
+    };
+    return fields;
+}
+
 const std::vector<PbrLightingField>& GetPbrLightingFields()
 {
     static const std::vector<PbrLightingField> fields = {
-        { "exposure",      "pbr_exposure",      &PbrLightingParams::exposure,     0.1f,    4.0f },
-        { "env_intensity", "pbr_env_intensity", &PbrLightingParams::envIntensity, 0.0f,    3.0f },
-        { "env_rotation",  "pbr_env_rotation",  &PbrLightingParams::envRotation,  -180.0f, 180.0f },
-        { "diffuse",       "pbr_diffuse",       &PbrLightingParams::diffuse,      0.0f,    3.0f },
-        { "reflection",    "pbr_reflection",    &PbrLightingParams::reflection,   0.0f,    3.0f },
-        { "reflection_saturation", "pbr_reflection_saturation", &PbrLightingParams::reflectionSaturation, 0.0f, 1.0f },
-        // Skybox shader uniforms, ignored by the gouraud shader.
-        { "skybox_brightness", "brightness",    &PbrLightingParams::skyboxBrightness, 0.0f, 2.0f },
-        { "skybox_saturation", "saturation",    &PbrLightingParams::skyboxSaturation, 0.0f, 1.0f },
-        { "skybox_blur",       "blur",          &PbrLightingParams::skyboxBlur,       0.0f, 6.0f },
+        { "exposure", "pbr_exposure", &PbrLightingParams::exposure, 0.1f, 4.0f,
+          "Overall brightness before tone mapping" },
+        { "env_intensity", "pbr_env_intensity", &PbrLightingParams::envIntensity, 0.0f, 3.0f,
+          "Strength of the studio environment light" },
+        { "env_rotation", "pbr_env_rotation", &PbrLightingParams::envRotation, -180.0f, 180.0f,
+          "Turn the studio around the vertical axis (degrees)" },
+        { "diffuse", "pbr_diffuse", &PbrLightingParams::diffuse, 0.0f, 3.0f,
+          "Scale of the base color (diffuse) lighting" },
+        { "reflection", "pbr_reflection", &PbrLightingParams::reflection, 0.0f, 3.0f,
+          "Scale of the reflections and highlights" },
+        { "reflection_saturation", "pbr_reflection_saturation", &PbrLightingParams::reflectionSaturation, 0.0f, 1.0f,
+          "Reflection color: 0 = gray studio, 1 = original studio colors" },
+        // Bed material, applied by the bed renderer (no shader uniform of its own).
+        { "bed_metallic", "bed_metallic", &PbrLightingParams::bedMetallic, 0.0f, 1.0f,
+          "Build plate metallic, 0 = PEI plastic look" },
+        { "bed_roughness", "bed_roughness", &PbrLightingParams::bedRoughness, 0.045f, 1.0f,
+          "Build plate roughness, higher = less glossy" },
     };
     return fields;
 }

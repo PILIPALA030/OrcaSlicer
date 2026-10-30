@@ -1322,9 +1322,6 @@ private:
     void _check_and_update_toolbar_icon_scale();
     void _render_overlays();
     void _render_style_editor();
-    /// @brief Draw the studio panorama as background when PBR is on (Prepare / Assemble views).
-    /// @return false if the plain background must be drawn instead.
-    bool RenderPbrSkybox();
     /// @brief Render the PBR material debug panel, edits are applied live and saved on slider release.
     void RenderPbrDebugPanel();
     /// @brief Render sliders of one filament material.

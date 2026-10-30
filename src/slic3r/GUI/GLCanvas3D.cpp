@@ -17,7 +17,6 @@
 #include "3DScene.hpp"
 #include "BackgroundSlicingProcess.hpp"
 #include "GLShader.hpp"
-#include "PbrEnvironment.hpp"
 #include "GLSubTextureBindRenderer.hpp"
 #include "GLToolbarBackgroundTextureCache.hpp"
 #include "GUI.hpp"
@@ -8543,13 +8542,6 @@ void GLCanvas3D::_render_background()
         m_background.init_from(std::move(init_data));
     }
 
-    // The red out-of-bed warning background keeps priority over the PBR skybox.
-    if (!use_error_color && RenderPbrSkybox())
-    {
-        glsafe(::glEnable(GL_DEPTH_TEST));
-        return;
-    }
-
     GLShaderProgram* shader = wxGetApp().get_shader("background");
     if (shader != nullptr) {
         shader->start_using();
@@ -8559,42 +8551,6 @@ void GLCanvas3D::_render_background()
     }
 
     glsafe(::glEnable(GL_DEPTH_TEST));
-}
-
-bool GLCanvas3D::RenderPbrSkybox()
-{
-    if ((m_canvas_type != CanvasView3D && m_canvas_type != CanvasAssembleView) ||
-        !wxGetApp().is_gl_version_greater_or_equal_to(3, 1) || !wxGetApp().app_config->get_bool("enable_pbr_material"))
-        return false;
-
-    GLShaderProgram* shader = wxGetApp().get_shader("pbr_skybox");
-    PbrEnvironment& environment = PbrEnvironment::Instance();
-    if (shader == nullptr || !m_background.is_initialized() || !environment.EnsureSkyboxLoaded())
-        return false;
-
-    // The perspective camera zooms by widening the field of view; above 60 degrees the panorama would be
-    // stretched like an ultra wide lens, so it is clamped. Orthographic views have parallel rays, they use 45.
-    static const double SKYBOX_MAX_FOV_DEG = 60.0;
-    const Camera& camera = wxGetApp().plater()->get_camera();
-    const double fovDeg = camera.get_type() == Camera::EType::Perspective ? std::min(camera.get_fov(), SKYBOX_MAX_FOV_DEG) : 45.0;
-    const std::array<int, 4>& viewport = camera.get_viewport();
-    const float aspect = static_cast<float>(viewport[2]) / static_cast<float>(std::max(viewport[3], 1));
-    const PbrLightingParams& lighting = PbrMaterialTable::Instance().GetLighting();
-
-    shader->start_using();
-    glsafe(::glActiveTexture(GL_TEXTURE0));
-    glsafe(::glBindTexture(GL_TEXTURE_2D, environment.GetSkyboxTextureId()));
-    shader->set_uniform("skybox_tex", 0);
-    shader->set_uniform("view_tan", static_cast<float>(std::tan(Geometry::deg2rad(0.5 * fovDeg))));
-    shader->set_uniform("aspect", aspect);
-    shader->set_uniform("view_to_env", PbrEnvironment::ViewToEnvironment(camera.get_view_matrix()));
-    shader->set_uniform("env_rotation", lighting.envRotation);
-    for (const PbrLightingField& field : GetPbrLightingFields())
-        shader->set_uniform(field.uniform, lighting.*field.member);
-    m_background.render();
-    glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
-    shader->stop_using();
-    return true;
 }
 
 void GLCanvas3D::_render_bed(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool show_axes)
@@ -9072,6 +9028,18 @@ void GLCanvas3D::RenderPbrDebugPanel()
     }
 }
 
+/// @brief Show the help of a PBR debug slider on the same line, dimmed.
+/// @param description help text, nothing is drawn when null or empty.
+static void RenderPbrFieldDescription(const char* description)
+{
+    if (description == nullptr || description[0] == '\0')
+        return;
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextUnformatted(description);
+    ImGui::PopStyleColor();
+}
+
 bool GLCanvas3D::RenderPbrMaterialRow(const size_t filamentIdx, const PbrMaterialMatch& match)
 {
     const std::string id = std::to_string(filamentIdx);
@@ -9088,8 +9056,12 @@ bool GLCanvas3D::RenderPbrMaterialRow(const size_t filamentIdx, const PbrMateria
     PbrMaterialParams params = match.params;
     bool edited = false;
     ImGui::PushItemWidth(220.0f);
-    edited = ImGui::SliderFloat(("metallic##" + id).c_str(), &params.metallic, 0.0f, 1.0f, "%.3f") || edited;
-    edited = ImGui::SliderFloat(("roughness##" + id).c_str(), &params.roughness, 0.045f, 1.0f, "%.3f") || edited;
+    for (const PbrMaterialField& field : GetPbrMaterialFields())
+    {
+        const std::string label = std::string(field.key) + "##" + id;
+        edited = ImGui::SliderFloat(label.c_str(), &(params.*field.member), field.minValue, field.maxValue, "%.3f") || edited;
+        RenderPbrFieldDescription(field.description);
+    }
     ImGui::PopItemWidth();
 
     PbrMaterialTable& table = PbrMaterialTable::Instance();
@@ -9115,7 +9087,10 @@ void GLCanvas3D::RenderPbrLightingOptions()
     bool edited = false;
     ImGui::PushItemWidth(220.0f);
     for (const PbrLightingField& field : GetPbrLightingFields())
+    {
         edited = ImGui::SliderFloat(field.key, &(lighting.*field.member), field.minValue, field.maxValue, "%.3f") || edited;
+        RenderPbrFieldDescription(field.description);
+    }
     ImGui::PopItemWidth();
     if (edited)
     {

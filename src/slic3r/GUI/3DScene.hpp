@@ -66,6 +66,20 @@ using ModelObjectPtrs = std::vector<ModelObject*>;
 ///        0 when PBR is off and face normals are used. Changing PBR needs a full scene reload.
 float GetVolumeNormalCreaseAngle();
 
+/// @brief Check the PBR preference and that the GL 3.1 shaders are in use.
+/// @return true if PBR rendering is enabled.
+bool IsPbrRenderingEnabled();
+
+/// @brief Set up the current gouraud shader to draw a plain surface (no clipping, slope or print volume
+///        checks) with PBR lighting and the given material. The shader must already be in use.
+/// @return true if the environment cube map was bound; pass it to EndPbrSurface().
+bool BeginPbrSurface(GLShaderProgram& shader, const Transform3d& viewMatrix, const Transform3d& projectionMatrix,
+                     const Transform3d& modelMatrix, const GUI::PbrMaterialParams& material);
+
+/// @brief Restore the gouraud shader state after BeginPbrSurface().
+/// @param envBound value returned by BeginPbrSurface().
+void EndPbrSurface(GLShaderProgram& shader, const bool envBound);
+
 // Return appropriate color based on the ModelVolume.
 extern ColorRGBA color_from_model_volume(const ModelVolume& model_volume);
 

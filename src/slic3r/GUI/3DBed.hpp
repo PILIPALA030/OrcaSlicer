@@ -169,7 +169,7 @@ private:
     void render_axes();
     void render_system(GLCanvas3D& canvas, const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom);
     //void render_texture(bool bottom, GLCanvas3D& canvas);
-    void render_model(const Transform3d& view_matrix, const Transform3d& projection_matrix);
+    void render_model(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool use_pbr = false);
     void render_custom(GLCanvas3D& canvas, const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom);
     void render_default(bool bottom, const Transform3d& view_matrix, const Transform3d& projection_matrix);
     

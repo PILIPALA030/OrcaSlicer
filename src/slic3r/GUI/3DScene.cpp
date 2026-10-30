@@ -27,6 +27,7 @@
 #include "PbrEnvironment.hpp"
 #include <thread>
 #include <algorithm>
+#include <cfloat>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -122,13 +123,16 @@ namespace Slic3r {
 // Faces meeting at a larger angle keep a hard edge, smaller ones are shaded smooth.
 static const float VOLUME_NORMAL_CREASE_ANGLE = 30.0f;
 
+bool IsPbrRenderingEnabled()
+{
+    const AppConfig* config = GUI::wxGetApp().app_config;
+    return config != nullptr && config->get_bool("enable_pbr_material") && GUI::wxGetApp().is_gl_version_greater_or_equal_to(3, 1);
+}
+
 float GetVolumeNormalCreaseAngle()
 {
     // PBR shades curved surfaces smooth, the classic shading keeps the faceted face normals.
-    const AppConfig* config = GUI::wxGetApp().app_config;
-    const bool usePbr = config != nullptr && config->get_bool("enable_pbr_material") &&
-                        GUI::wxGetApp().is_gl_version_greater_or_equal_to(3, 1);
-    return usePbr ? VOLUME_NORMAL_CREASE_ANGLE : 0.0f;
+    return IsPbrRenderingEnabled() ? VOLUME_NORMAL_CREASE_ANGLE : 0.0f;
 }
 
 } // namespace Slic3r
@@ -142,11 +146,12 @@ static void InitVolumeModel(Slic3r::GUI::GLModel& model, const indexed_triangle_
         model.init_from(its);
 }
 
-// Texture unit of the PBR environment cube map, unit 0 is left to 2D textures.
-static const int PBR_ENV_TEXTURE_UNIT = 1;
+static const int PBR_ENV_TEXTURE_UNIT = Slic3r::GUI::PbrEnvironment::ENV_TEXTURE_UNIT;
+static const int PBR_NOISE_TEXTURE_UNIT = Slic3r::GUI::PbrEnvironment::NOISE_TEXTURE_UNIT;
 
-/// @brief Bind the IBL cube map and upload its uniforms, the shader falls back to a gradient when it is not ready.
-/// @return true if the cube map was bound and must be unbound after rendering.
+/// @brief Bind the IBL cube map and the pattern noise, and upload their uniforms.
+///        The shader falls back to a gradient environment and no pattern when they are not ready.
+/// @return true if a texture was bound and UnbindPbrTextures() must be called after rendering.
 static bool BindPbrEnvironment(Slic3r::GLShaderProgram* shader)
 {
     static const char* const SH_UNIFORMS[9] = { "pbr_sh[0]", "pbr_sh[1]", "pbr_sh[2]", "pbr_sh[3]", "pbr_sh[4]",
@@ -155,19 +160,36 @@ static bool BindPbrEnvironment(Slic3r::GLShaderProgram* shader)
         return false;
 
     Slic3r::GUI::PbrEnvironment& environment = Slic3r::GUI::PbrEnvironment::Instance();
+    const bool noiseReady = environment.EnsureNoiseLoaded();
+    shader->set_uniform("pbr_noise_ready", noiseReady);
+    if (noiseReady)
+    {
+        glsafe(::glActiveTexture(GL_TEXTURE0 + PBR_NOISE_TEXTURE_UNIT));
+        glsafe(::glBindTexture(GL_TEXTURE_3D, environment.GetNoiseTextureId()));
+    }
+
     const bool ready = environment.EnsureLoaded();
     shader->set_uniform("pbr_env_ready", ready);
-    if (!ready)
-        return false;
-
-    glsafe(::glActiveTexture(GL_TEXTURE0 + PBR_ENV_TEXTURE_UNIT));
-    glsafe(::glBindTexture(GL_TEXTURE_CUBE_MAP, environment.GetTextureId()));
+    if (ready)
+    {
+        glsafe(::glActiveTexture(GL_TEXTURE0 + PBR_ENV_TEXTURE_UNIT));
+        glsafe(::glBindTexture(GL_TEXTURE_CUBE_MAP, environment.GetTextureId()));
+        shader->set_uniform("pbr_env_max_lod", environment.GetMaxLod());
+        const std::array<float, 9>& sh = environment.GetSh();
+        for (size_t i = 0; i < sh.size(); ++i)
+            shader->set_uniform(SH_UNIFORMS[i], sh[i]);
+    }
     glsafe(::glActiveTexture(GL_TEXTURE0));
-    shader->set_uniform("pbr_env_max_lod", environment.GetMaxLod());
-    const std::array<float, 9>& sh = environment.GetSh();
-    for (size_t i = 0; i < sh.size(); ++i)
-        shader->set_uniform(SH_UNIFORMS[i], sh[i]);
-    return true;
+    return ready || noiseReady;
+}
+
+static void UnbindPbrTextures()
+{
+    glsafe(::glActiveTexture(GL_TEXTURE0 + PBR_ENV_TEXTURE_UNIT));
+    glsafe(::glBindTexture(GL_TEXTURE_CUBE_MAP, 0));
+    glsafe(::glActiveTexture(GL_TEXTURE0 + PBR_NOISE_TEXTURE_UNIT));
+    glsafe(::glBindTexture(GL_TEXTURE_3D, 0));
+    glsafe(::glActiveTexture(GL_TEXTURE0));
 }
 
 /// @brief Upload material uniforms, ignored by shaders without them.
@@ -175,9 +197,52 @@ static void SetPbrMaterialUniforms(Slic3r::GLShaderProgram* shader, const Slic3r
 {
     if (shader == nullptr)
         return;
-    shader->set_uniform("pbr_metallic", material.metallic);
-    shader->set_uniform("pbr_roughness", material.roughness);
+    for (const Slic3r::GUI::PbrMaterialField& field : Slic3r::GUI::GetPbrMaterialFields())
+        shader->set_uniform(field.uniform, material.*field.member);
 }
+
+namespace Slic3r {
+
+bool BeginPbrSurface(GLShaderProgram& shader, const Transform3d& viewMatrix, const Transform3d& projectionMatrix,
+                     const Transform3d& modelMatrix, const GUI::PbrMaterialParams& material)
+{
+    // Everything passes: no clipping planes, z range, slope or print volume coloring.
+    static const std::array<double, 4> CLIPS_NOTHING = { 0.0, 0.0, 0.0, 1.0 };
+    static const std::array<float, 2> FULL_Z_RANGE = { -FLT_MAX, FLT_MAX };
+    shader.set_uniform("z_range", FULL_Z_RANGE);
+    shader.set_uniform("clipping_plane", CLIPS_NOTHING);
+    shader.set_uniform("use_color_clip_plane", false);
+    shader.set_uniform("print_volume.type", -1);
+    shader.set_uniform("slope.actived", false);
+
+    const Matrix3d normalMatrix = modelMatrix.matrix().block<3, 3>(0, 0).inverse().transpose();
+    shader.set_uniform("volume_world_matrix", modelMatrix);
+    shader.set_uniform("slope.volume_world_normal_matrix", static_cast<Matrix3f>(normalMatrix.cast<float>()));
+    shader.set_uniform("view_model_matrix", viewMatrix * modelMatrix);
+    shader.set_uniform("projection_matrix", projectionMatrix);
+    shader.set_uniform("view_normal_matrix", static_cast<Matrix3d>(viewMatrix.matrix().block<3, 3>(0, 0) * normalMatrix));
+
+    shader.set_uniform("use_pbr", true);
+    shader.set_uniform("debug_normal_color", false);
+    shader.set_uniform("pbr_env_map", PBR_ENV_TEXTURE_UNIT);
+    shader.set_uniform("pbr_noise_tex", PBR_NOISE_TEXTURE_UNIT);
+    const GUI::PbrLightingParams& lighting = GUI::PbrMaterialTable::Instance().GetLighting();
+    for (const GUI::PbrLightingField& field : GUI::GetPbrLightingFields())
+        shader.set_uniform(field.uniform, lighting.*field.member);
+    shader.set_uniform("pbr_view_to_env", GUI::PbrEnvironment::ViewToEnvironment(viewMatrix));
+    SetPbrMaterialUniforms(&shader, material);
+    return BindPbrEnvironment(&shader);
+}
+
+void EndPbrSurface(GLShaderProgram& shader, const bool envBound)
+{
+    // Uniforms persist on the program, other gouraud users expect PBR off.
+    shader.set_uniform("use_pbr", false);
+    if (envBound)
+        UnbindPbrTextures();
+}
+
+} // namespace Slic3r
 
 float FullyTransparentMaterialThreshold  = 0.1f;
 float FullTransparentModdifiedToFixAlpha = 0.3f;
@@ -1296,8 +1361,9 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
     shader->set_uniform("use_pbr", _usePbr);
     shader->set_uniform("debug_normal_color", _debugNormalColor);
     GLVolume::s_pbrMaterials = _usePbr ? &_extruderMaterials : nullptr;
-    // The cube sampler always points to its own unit, so it never shares a unit with 2D samplers.
+    // The cube and 3D samplers always point to their own units, so they never share a unit with 2D samplers.
     shader->set_uniform("pbr_env_map", PBR_ENV_TEXTURE_UNIT);
+    shader->set_uniform("pbr_noise_tex", PBR_NOISE_TEXTURE_UNIT);
     bool pbrEnvBound = false;
     if (_usePbr)
     {
@@ -1483,11 +1549,7 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
     shader->set_uniform("debug_normal_color", false);
     GLVolume::s_pbrMaterials = nullptr;
     if (pbrEnvBound)
-    {
-        glsafe(::glActiveTexture(GL_TEXTURE0 + PBR_ENV_TEXTURE_UNIT));
-        glsafe(::glBindTexture(GL_TEXTURE_CUBE_MAP, 0));
-        glsafe(::glActiveTexture(GL_TEXTURE0));
-    }
+        UnbindPbrTextures();
 
     if (disable_cullface)
         glsafe(::glEnable(GL_CULL_FACE));

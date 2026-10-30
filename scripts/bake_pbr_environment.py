@@ -1,13 +1,10 @@
 """Bake an equirectangular Radiance HDR into the PBR environment used by the 140 gouraud shader.
 
-Source of resources/materials/pbr_environment.bin and pbr_skybox.png:
-    Ferndale Studio 04 (4k), Poly Haven, CC0: https://polyhaven.com/a/ferndale_studio_04
+Source of resources/materials/pbr_environment.bin:
+    Ferndale Studio 03 (4k), Poly Haven, CC0: https://polyhaven.com/a/ferndale_studio_03
 
 Usage:
-    python -I scripts/bake_pbr_environment.py <input.hdr> <output.bin> [--skybox <output.png>]
-
-The optional skybox is the color panorama (2048 x 1024, sRGB, already exposed with SKYBOX_EXPOSURE)
-shown behind the scene in PBR mode; it needs Pillow.
+    python -I scripts/bake_pbr_environment.py <input.hdr> <output.bin>
 
 Output (little endian):
     char[8]  magic "PBRENV1\\0"
@@ -34,8 +31,6 @@ BASE_SIZE = 128
 MIP_COUNT = 5
 SAMPLE_COUNT = 1024
 TARGET_DIFFUSE = 0.7
-SKYBOX_WIDTH = 2048
-SKYBOX_EXPOSURE = 0.55
 
 
 def read_hdr(path):
@@ -221,30 +216,10 @@ def diffuse_sh(image):
     return radiance_sh * band / np.pi
 
 
-def write_skybox(rgb, scale, path):
-    """Color panorama for the background: box downsampled, exposed, highlight shoulder, sRGB 8 bit png."""
-    from PIL import Image
-
-    image = rgb.astype(np.float64) * scale * SKYBOX_EXPOSURE
-    while image.shape[1] > SKYBOX_WIDTH:
-        image = 0.25 * (image[0::2, 0::2] + image[1::2, 0::2] + image[0::2, 1::2] + image[1::2, 1::2])
-    # Same highlight shoulder as the shader tone mapping.
-    peak = np.max(image, axis=-1, keepdims=True)
-    start, d = 0.76, 0.24
-    new_peak = 1.0 - d * d / (peak + d - start)
-    compressed = image * new_peak / np.maximum(peak, 1e-6)
-    g = 1.0 - 1.0 / (0.15 * (peak - new_peak) + 1.0)
-    compressed = compressed * (1.0 - g) + new_peak * g
-    image = np.where(peak < start, image, compressed)
-    srgb = np.clip(image, 0.0, 1.0) ** (1.0 / 2.2)
-    Image.fromarray((srgb * 255.0 + 0.5).astype(np.uint8), "RGB").save(path, optimize=True)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("input", help="equirectangular Radiance .hdr")
     parser.add_argument("output", help="output .bin")
-    parser.add_argument("--skybox", help="optional output .png color panorama")
     args = parser.parse_args()
 
     rgb = read_hdr(args.input)
@@ -280,10 +255,6 @@ def main():
     with open(args.output, "wb") as file:
         file.write(blob)
     print("wrote %s (%d bytes)" % (args.output, len(blob)))
-
-    if args.skybox:
-        write_skybox(rgb, scale, args.skybox)
-        print("wrote %s" % args.skybox)
     return 0
 
 

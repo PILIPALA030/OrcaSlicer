@@ -464,10 +464,17 @@ void Bed3D::render_axes()
         m_axes.render();
 }
 
+/// @brief PBR shading of the bed follows the volumes: Prepare / Assemble views with PBR enabled.
+static bool IsPbrBedCanvas(GLCanvas3D& canvas)
+{
+    const GLCanvas3D::ECanvasType type = canvas.get_canvas_type();
+    return (type == GLCanvas3D::CanvasView3D || type == GLCanvas3D::CanvasAssembleView) && IsPbrRenderingEnabled();
+}
+
 void Bed3D::render_system(GLCanvas3D& canvas, const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom)
 {
     if (!bottom)
-        render_model(view_matrix, projection_matrix);
+        render_model(view_matrix, projection_matrix, IsPbrBedCanvas(canvas));
 
     /*if (show_texture)
         render_texture(bottom, canvas);*/
@@ -662,7 +669,7 @@ void Bed3D::update_bed_triangles()
     const_cast<BoundingBoxf3&>(m_extended_bounding_box) = calc_extended_bounding_box();
 }
 
-void Bed3D::render_model(const Transform3d& view_matrix, const Transform3d& projection_matrix)
+void Bed3D::render_model(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool use_pbr)
 {
     if (m_model_filename.empty())
         return;
@@ -674,6 +681,23 @@ void Bed3D::render_model(const Transform3d& view_matrix, const Transform3d& proj
 
         // BBS: remove the bed picking logic
         //register_raycasters_for_picking(m_model.model.get_geometry(), Geometry::assemble_transform(m_model_offset));
+    }
+
+    // PBR: lit by the same studio environment as the volumes, with the bed material from the PBR presets.
+    GLShaderProgram* pbrShader = use_pbr ? wxGetApp().get_shader("gouraud") : nullptr;
+    if (pbrShader != nullptr && !m_model.get_filename().empty())
+    {
+        const PbrLightingParams& lighting = PbrMaterialTable::Instance().GetLighting();
+        PbrMaterialParams material;
+        material.metallic = lighting.bedMetallic;
+        material.roughness = lighting.bedRoughness;
+        pbrShader->start_using();
+        const bool envBound = BeginPbrSurface(*pbrShader, view_matrix, projection_matrix,
+                                              Geometry::assemble_transform(m_model_offset), material);
+        m_model.render();
+        EndPbrSurface(*pbrShader, envBound);
+        pbrShader->stop_using();
+        return;
     }
 
     if (!m_model.get_filename().empty()) {
@@ -700,7 +724,7 @@ void Bed3D::render_custom(GLCanvas3D& canvas, const Transform3d& view_matrix, co
     }
 
     if (!bottom)
-        render_model(view_matrix, projection_matrix);
+        render_model(view_matrix, projection_matrix, IsPbrBedCanvas(canvas));
 
     /*if (show_texture)
         render_texture(bottom, canvas);*/
