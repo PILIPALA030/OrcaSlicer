@@ -542,6 +542,106 @@ private:
         unsigned int height{ 0 };
     };
 
+    /** @brief Offscreen targets of the PBR glow halo at reduced resolution, ping-ponged by the blur. */
+    struct PbrGlowResources
+    {
+        unsigned int maskFramebuffer{ 0 };
+        unsigned int maskTexture{ 0 };
+        unsigned int blurFramebuffer{ 0 };
+        unsigned int blurTexture{ 0 };
+        unsigned int width{ 0 };
+        unsigned int height{ 0 };
+    };
+
+    /** @brief Mipmapped copy of the frame drawn before PBR translucent volumes, sampled through them. */
+    struct PbrSceneCapture
+    {
+        unsigned int framebuffer{ 0 };
+        unsigned int texture{ 0 };
+        unsigned int width{ 0 };
+        unsigned int height{ 0 };
+    };
+
+    /** @brief Result of a scene copy, passed to the translucent volumes sampling it. */
+    struct PbrSceneCopy
+    {
+        float maxLod{ 0.0f };
+        // Copied rectangle: origin x, origin y in window pixels, 1 / width, 1 / height.
+        std::array<float, 4> rect{ 0.0f, 0.0f, 0.0f, 0.0f };
+        // Viewport size / copied rectangle size.
+        Vec2f viewportScale{ Vec2f::Zero() };
+    };
+
+    /** @brief Render stages timed by the PBR debug panel; a stage may run several times per frame. */
+    enum class PbrTimerStage : unsigned char
+    {
+        Scene,
+        OpaqueObjects,
+        Bed,
+        TranslucentCopy,
+        TranslucentDraw,
+        GlowHalo,
+        Count
+    };
+
+    /** @brief Smoothed GPU and CPU milliseconds of one measurement, negative until measured. */
+    struct PbrTiming
+    {
+        double gpu{ -1.0 };
+        double cpu{ -1.0 };
+    };
+
+    /** @brief Stage timings with PBR on and the PBR off (main-like) baseline. Each run of a stage is a span between
+     *         two GPU timestamps, so stages may nest and repeat; results are read SLOT_COUNT frames later to never stall. */
+    struct PbrTimers
+    {
+        static const size_t STAGE_COUNT = static_cast<size_t>(PbrTimerStage::Count);
+        static const size_t MAX_SPANS = 16;
+        // Frames in flight covered: a GPU bound frame may finish several frames after it is submitted.
+        static const size_t SLOT_COUNT = 6;
+        // Timestamp pool of each frame slot (slots used in turn): start / end per span.
+        std::array<std::array<unsigned int, 2 * MAX_SPANS>, SLOT_COUNT> queries{};
+        // Stage of each span recorded in a slot, and whether its end timestamp was issued.
+        std::array<std::vector<unsigned char>, SLOT_COUNT> spanStages;
+        std::array<std::vector<bool>, SLOT_COUNT> spanClosed;
+        // PBR state of the frame that used each slot: PBR off frames measure the baseline.
+        std::array<bool, SLOT_COUNT> slotPbr{};
+        std::array<PbrTiming, STAGE_COUNT> pbrOn{};
+        std::array<PbrTiming, STAGE_COUNT> pbrOff{};
+        // CPU time and runs of the current frame, folded in when the next frame starts.
+        std::array<double, STAGE_COUNT> cpuFrameSums{};
+        std::array<bool, STAGE_COUNT> ranThisFrame{};
+        std::array<std::chrono::steady_clock::time_point, STAGE_COUNT> cpuStart{};
+        // Open span of each stage in the current slot, -1 if none.
+        std::array<int, STAGE_COUNT> openSpan{ -1, -1, -1, -1, -1, -1 };
+        // Scene of the last baseline frame, another one makes the baseline stale.
+        size_t baselineVolumeCount{ 0 };
+        Transform3d baselineViewMatrix{ Transform3d::Identity() };
+        double baselineZoom{ 0.0 };
+        // Last scene copy: size and how it was made.
+        unsigned int copyWidth{ 0 };
+        unsigned int copyHeight{ 0 };
+        bool copyHalfResolution{ false };
+        bool copyMultisampled{ false };
+        unsigned int frameIndex{ 0 };
+        // Frames whose GPU results were still not ready when their slot came back, dropped.
+        unsigned int droppedFrames{ 0 };
+        int sceneCopies{ 0 };
+        bool framePbr{ false };
+        // The frame being drawn is timed, its CPU sums are folded in by the next CollectPbrTimers().
+        bool frameTimed{ false };
+        // Frames still skipped after a PBR switch or an object count change (mesh rebuild, uploads).
+        int warmupFrames{ 0 };
+        std::array<bool, SLOT_COUNT> slotWarmup{};
+        bool frameWarmup{ false };
+        // State of the last timed frame, a different one starts a warm-up.
+        bool lastTimedPbr{ false };
+        size_t lastTimedVolumeCount{ 0 };
+        bool hasLastTimedFrame{ false };
+        bool initialized{ false };
+        bool supported{ false };
+    };
+
     /** @brief Data-driven symmetric samples for one Gaussian blur pass. */
     struct GaussianSampleKernel
     {
@@ -668,6 +768,13 @@ private:
     Slope m_slope;
 
     SelectionHighlightResources m_selectionHighlightResources;
+    PbrGlowResources _pbrGlowResources;
+    PbrSceneCapture _pbrSceneCapture;
+    // Set when the frame copy failed once (e.g. framebuffer format mismatch), translucency then falls back.
+    bool _pbrSceneCaptureUnsupported{ false };
+    PbrTimers _pbrTimers;
+    // Redraw every frame while the debug panel is open, to keep the timings updating.
+    bool _pbrContinuousRedraw{ false };
 
     OrientSettings m_orient_settings_fff, m_orient_settings_sla;
 
@@ -1335,6 +1442,49 @@ private:
     void RenderPbrLightingOptions();
     /// @brief Render build plate material sliders, edits apply live and are saved with the material table.
     void RenderPbrBedOptions();
+    /// @brief Add a blurred halo around volumes whose PBR material glows, only when such volumes are shown.
+    void RenderPbrGlowHalo();
+    /// @brief Create or resize the glow halo targets.
+    /// @param canvasSize full canvas size in pixels.
+    /// @return false if the framebuffers can not be created.
+    bool EnsurePbrGlowResources(const Size& canvasSize);
+    /// @brief Draw glowing volumes into the glow mask, colored by their emission.
+    /// @param screenRect receives their union in normalized device coordinates: min x, min y, max x, max y.
+    /// @return false if no shown volume glows.
+    bool RenderPbrGlowMask(Vec4d& screenRect);
+    /// @brief Delete the glow halo targets, needs the canvas context current.
+    void ReleasePbrGlowResources();
+    /// @brief Check whether translucent PBR volumes are drawn after the bed, over a copy of the scene.
+    /// @return true in Prepare / Assemble views with PBR, no painting gizmo or layer editing, and a translucent volume.
+    bool ShouldDeferPbrTranslucent();
+    /// @brief Draw the translucent PBR volumes far to near, each group over a fresh copy of the frame,
+    ///        so volumes overlapping on screen see the ones behind them.
+    void RenderPbrTranslucentObjects();
+    /// @brief Copy a rectangle of the current frame into the mipmapped scene texture, at half resolution when possible.
+    /// @param region window pixel rectangle to cover: min x, min y, max x, max y.
+    /// @param largestRegion width and height of the largest region of this frame, sizes the texture.
+    /// @param copy receives the mip count and the mapping from window pixels to the copy.
+    /// @return false if the copy is not available, translucent volumes then use the fallback shading.
+    bool CapturePbrScene(const std::array<int, 4>& region, const std::array<int, 2>& largestRegion, PbrSceneCopy& copy);
+    /// @brief Delete the scene copy, needs the canvas context current.
+    void ReleasePbrSceneCapture();
+    /// @brief Fold the previous frame into the averages and advance the query slot, at the start of a frame.
+    void CollectPbrTimers();
+    /// @brief Start a span of a stage (GPU timestamp and CPU clock), only while the debug panel is open.
+    ///        Different stages may nest, a stage may run several times per frame.
+    /// @param stage stage to time.
+    void BeginPbrTimer(PbrTimerStage stage);
+    /// @brief End the open span of a stage, if any.
+    /// @param stage stage started by BeginPbrTimer().
+    void EndPbrTimer(PbrTimerStage stage);
+    /// @brief Start timing the whole scene, also records whether this frame uses PBR.
+    void BeginPbrFrameTimer();
+    /// @brief Stop timing the whole scene, PBR off frames also record the baseline scene.
+    void EndPbrFrameTimer();
+    /// @brief Render the GPU timing section of the debug panel.
+    void RenderPbrTimingOptions();
+    /// @brief Delete the timer queries, needs the canvas context current.
+    void ReleasePbrTimers();
     /// @brief Get the model volume rendered by a GLVolume.
     /// @return nullptr if the GLVolume has no valid model volume.
     const ModelVolume* GetPbrModelVolume(const GLVolume& volume) const;

@@ -25,6 +25,15 @@ struct PbrMaterialParams
     float bumpGrain{ 0.0f };
     // Rough surface retro reflection (Burley diffuse): brighter, softer edges of matte filaments.
     float sheen{ 0.0f };
+    // Light scattered through the body (translucent filaments): softer shading, bright thin edges.
+    float transmission{ 0.0f };
+    // Self glow (glow in the dark filaments), color in sRGB.
+    float emission{ 0.0f };
+    float emissionR{ 0.45f };
+    float emissionG{ 1.0f };
+    float emissionB{ 0.55f };
+    // Glow color source: 0 = the color above, 1 = the filament color.
+    float emissionTint{ 0.0f };
 };
 
 /// @brief Description of one material parameter: json key, shader uniform, member and range.
@@ -56,6 +65,10 @@ struct PbrLightingParams
     float reflection{ 1.0f };
     // 0 = gray reflections, 1 = studio colors; diffuse always stays gray to keep filament colors.
     float reflectionSaturation{ 0.0f };
+    // Virtual light behind the object (camera relative), shows translucent filaments from any view.
+    float backLight{ 0.6f };
+    // Halo around glowing filaments, drawn by the canvas (not a gouraud uniform).
+    float glowHalo{ 1.0f };
 };
 
 /// @brief Description of one lighting parameter: json key, shader uniform, member and range.
@@ -148,6 +161,14 @@ public:
     /// @return full path of the json file.
     const std::string& GetPath() const { return _path; }
 
+    /// @brief Dim the environment to check glowing materials. Runtime only, never saved.
+    /// @param enabled true to turn the lights off.
+    void SetLightsOffPreview(const bool enabled) { _lightsOffPreview = enabled; }
+
+    /// @brief Check the lights off preview.
+    /// @return true if the environment is dimmed.
+    bool IsLightsOffPreview() const { return _lightsOffPreview; }
+
 private:
     PbrMaterialTable();
 
@@ -168,6 +189,7 @@ private:
     PbrMaterialParams _bed;
     PbrLightingParams _lighting;
     bool _dirty{ false };
+    bool _lightsOffPreview{ false };
 };
 
 } // namespace GUI

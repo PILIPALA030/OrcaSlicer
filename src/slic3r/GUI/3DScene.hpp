@@ -243,6 +243,8 @@ public:
 	    bool                is_modifier : 1;
 	    // Wheter or not this volume has been generated from the wipe tower
         bool                is_wipe_tower : 1;
+        // Mesh is closed and outward facing (no open edges, positive volume): its back faces are never visible.
+        bool                is_closed_mesh : 1;
 	    // Wheter or not this volume has been generated from an extrusion path
 	    bool                is_extrusion_path : 1;
 	    // Wheter or not to always render this volume using its own alpha
@@ -425,6 +427,14 @@ typedef std::vector<GLVolume*> GLVolumePtrs;
 typedef std::pair<GLVolume*, std::pair<unsigned int, double>> GLVolumeWithIdAndZ;
 typedef std::vector<GLVolumeWithIdAndZ> GLVolumeWithIdAndZList;
 
+/// @brief Volumes drawn by an opaque render when PBR translucent filaments are drawn after the bed.
+enum class PbrTranslucentPass : unsigned char
+{
+    All,
+    SkipTranslucent,
+    OnlyTranslucent
+};
+
 class GLVolumeCollection
 {
 public:
@@ -478,6 +488,16 @@ private:
 
     bool _usePbr{ false };
     bool _debugNormalColor{ false };
+    PbrTranslucentPass _pbrTranslucentPass{ PbrTranslucentPass::All };
+    // Mipmapped copy of the scene behind translucent volumes, 0 if not captured.
+    unsigned int _pbrSceneTexture{ 0 };
+    float _pbrSceneMaxLod{ 0.0f };
+    // Copied frame rectangle: origin x, origin y in window pixels, 1 / width, 1 / height.
+    std::array<float, 4> _pbrSceneRect{ 0.0f, 0.0f, 0.0f, 0.0f };
+    // Viewport size / copied rectangle size, turns screen uv offsets into copy uv offsets.
+    Vec2f _pbrSceneViewportScale{ Vec2f::Zero() };
+    // Volumes of the current OnlyTranslucent group, empty for all.
+    std::vector<const GLVolume*> _pbrTranslucentGroup;
     // PBR material per filament, indexed like the extruder colors.
     std::vector<GUI::PbrMaterialMatch> _extruderMaterials;
 
@@ -580,6 +600,31 @@ public:
     void SetDebugNormalColor(const bool enable) { _debugNormalColor = enable; }
     /// @brief Get the material matched for each filament, refreshed by update_colors_by_extruder().
     const std::vector<GUI::PbrMaterialMatch>& GetExtruderMaterials() const { return _extruderMaterials; }
+    /// @brief Select the volumes drawn by the next opaque render() calls.
+    void SetPbrTranslucentPass(const PbrTranslucentPass pass) { _pbrTranslucentPass = pass; }
+    /// @brief Set the scene copy sampled by translucent volumes in the OnlyTranslucent pass.
+    /// @param textureId mipmapped 2D texture of a rectangle of the frame drawn so far, 0 to disable.
+    /// @param maxLod last mip level of the texture.
+    /// @param sceneRect copied rectangle: origin x, origin y in window pixels, 1 / width, 1 / height.
+    /// @param viewportScale viewport size / copied rectangle size.
+    void SetPbrSceneTexture(const unsigned int textureId, const float maxLod, const std::array<float, 4>& sceneRect,
+                            const Vec2f& viewportScale)
+    {
+        _pbrSceneTexture = textureId;
+        _pbrSceneMaxLod = maxLod;
+        _pbrSceneRect = sceneRect;
+        _pbrSceneViewportScale = viewportScale;
+    }
+    /// @brief Restrict the OnlyTranslucent pass to some volumes, drawn together over the same scene copy.
+    /// @param group volumes to draw, empty for all translucent volumes.
+    void SetPbrTranslucentGroup(const std::vector<const GLVolume*>& group) { _pbrTranslucentGroup = group; }
+    /// @brief Check whether a volume uses a translucent PBR filament (transmission > 0) as its base filament.
+    /// @param volume volume to check.
+    /// @return false for modifiers and the wipe tower.
+    bool IsPbrTranslucentVolume(const GLVolume& volume) const;
+    /// @brief Check for an active volume with a translucent PBR filament.
+    /// @return true if at least one active volume is translucent.
+    bool HasPbrTranslucentVolume() const;
 
     // returns true if all the volumes are completely contained in the print volume
     // returns the containment state in the given out_state, if non-null

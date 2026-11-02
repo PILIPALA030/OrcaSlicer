@@ -138,6 +138,99 @@ std::vector<uint8_t> BuildNoiseTexels()
     return texels;
 }
 
+// Flat build plate noise: 2D, both grain octaves (ratio 2, tileable) pre-summed; layout matches gouraud.fs.
+const int PBR_BED_NOISE_SIZE = 512;
+// Texels per low octave noise unit: a 128 unit period, 51 mm with 0.4 mm grains.
+const float PBR_BED_NOISE_TEXELS_PER_UNIT = 4.0f;
+const float PBR_BED_NOISE_LOW_SIGMA = 2.0f;
+const float PBR_BED_NOISE_HIGH_SIGMA = 1.0f;
+const float PBR_BED_NOISE_LOW_WEIGHT = 0.65f;
+const float PBR_BED_NOISE_HIGH_WEIGHT = 0.35f;
+const uint32_t PBR_BED_NOISE_SEED = 20261102u;
+
+size_t BedNoiseIndex(const int x, const int y)
+{
+    const int n = PBR_BED_NOISE_SIZE;
+    return static_cast<size_t>((y % n + n) % n) * static_cast<size_t>(n) + static_cast<size_t>((x % n + n) % n);
+}
+
+/// @brief White noise blurred by a periodic Gaussian and normalized to zero mean, unit deviation.
+/// @param random generator, advanced by the size of the field.
+/// @param sigma blur deviation in texels.
+std::vector<float> BuildBedNoiseLayer(std::mt19937& random, const float sigma)
+{
+    const size_t count = static_cast<size_t>(PBR_BED_NOISE_SIZE) * PBR_BED_NOISE_SIZE;
+    std::vector<float> field(count);
+    for (float& value : field)
+        value = static_cast<float>(static_cast<double>(random()) / 4294967295.0 * 2.0 - 1.0);
+
+    const int radius = static_cast<int>(std::ceil(3.0f * sigma));
+    std::vector<float> kernel;
+    float kernelSum = 0.0f;
+    for (int k = -radius; k <= radius; ++k)
+    {
+        const float t = static_cast<float>(k) / sigma;
+        kernel.push_back(std::exp(-0.5f * t * t));
+        kernelSum += kernel.back();
+    }
+    for (float& weight : kernel)
+        weight /= kernelSum;
+
+    std::vector<float> blurred(count);
+    for (int axis = 0; axis < 2; ++axis)
+    {
+        for (int y = 0; y < PBR_BED_NOISE_SIZE; ++y)
+            for (int x = 0; x < PBR_BED_NOISE_SIZE; ++x)
+            {
+                float sum = 0.0f;
+                for (int k = -radius; k <= radius; ++k)
+                    sum += kernel[static_cast<size_t>(k + radius)] *
+                           field[BedNoiseIndex(x + (axis == 0 ? k : 0), y + (axis == 1 ? k : 0))];
+                blurred[BedNoiseIndex(x, y)] = sum;
+            }
+        field.swap(blurred);
+    }
+
+    double mean = 0.0;
+    for (const float value : field)
+        mean += value;
+    mean /= static_cast<double>(count);
+    double variance = 0.0;
+    for (const float value : field)
+        variance += (value - mean) * (value - mean);
+    const double deviation = std::sqrt(variance / static_cast<double>(count));
+    const double scale = deviation > 0.0 ? 1.0 / deviation : 0.0;
+    for (float& value : field)
+        value = static_cast<float>((value - mean) * scale);
+    return field;
+}
+
+/// @brief Both octaves summed like the 3D two octave noise, with the gradient per low octave unit.
+/// @return RGBA8 texels: r = 0.5 + (value - 0.5) * pack, gb = 0.5 + gradient / (2 * range), a unused.
+std::vector<uint8_t> BuildBedNoiseTexels()
+{
+    std::mt19937 random(PBR_BED_NOISE_SEED);
+    const std::vector<float> low = BuildBedNoiseLayer(random, PBR_BED_NOISE_LOW_SIGMA);
+    const std::vector<float> high = BuildBedNoiseLayer(random, PBR_BED_NOISE_HIGH_SIGMA);
+    std::vector<float> field(low.size());
+    for (size_t i = 0; i < field.size(); ++i)
+        field[i] = 0.5f + PBR_NOISE_STD * (PBR_BED_NOISE_LOW_WEIGHT * low[i] + PBR_BED_NOISE_HIGH_WEIGHT * high[i]);
+
+    std::vector<uint8_t> texels(field.size() * 4);
+    const float gradientScale = 0.5f * PBR_BED_NOISE_TEXELS_PER_UNIT / (2.0f * PBR_NOISE_GRADIENT_RANGE);
+    for (int y = 0; y < PBR_BED_NOISE_SIZE; ++y)
+        for (int x = 0; x < PBR_BED_NOISE_SIZE; ++x)
+        {
+            const size_t index = BedNoiseIndex(x, y);
+            uint8_t* texel = texels.data() + index * 4;
+            texel[0] = PackUnit(0.5f + (field[index] - 0.5f) * PBR_NOISE_VALUE_PACK);
+            texel[1] = PackUnit(0.5f + (field[BedNoiseIndex(x + 1, y)] - field[BedNoiseIndex(x - 1, y)]) * gradientScale);
+            texel[2] = PackUnit(0.5f + (field[BedNoiseIndex(x, y + 1)] - field[BedNoiseIndex(x, y - 1)]) * gradientScale);
+            texel[3] = 255;
+        }
+    return texels;
+}
+
 } // namespace
 
 PbrEnvironment& PbrEnvironment::Instance()
@@ -212,6 +305,48 @@ bool PbrEnvironment::CreateNoiseTexture()
     // Averaged mips fade sub-pixel relief out instead of letting it alias.
     glsafe(::glGenerateMipmap(GL_TEXTURE_3D));
     glsafe(::glBindTexture(GL_TEXTURE_3D, 0));
+    glsafe(::glPixelStorei(GL_UNPACK_ALIGNMENT, previousAlignment));
+    return true;
+}
+
+bool PbrEnvironment::EnsureBedNoiseLoaded()
+{
+    if (_bedNoiseId != 0)
+        return true;
+    if (_bedNoiseTried)
+        return false;
+
+    _bedNoiseTried = true;
+    if (!CreateBedNoiseTexture())
+    {
+        BOOST_LOG_TRIVIAL(warning) << "PBR bed noise texture unavailable, the build plate uses the 3D noise";
+        return false;
+    }
+    return true;
+}
+
+bool PbrEnvironment::CreateBedNoiseTexture()
+{
+    const std::vector<uint8_t> texels = BuildBedNoiseTexels();
+    glsafe(::glGenTextures(1, &_bedNoiseId));
+    if (_bedNoiseId == 0)
+        return false;
+
+    GLint previousAlignment = 4;
+    GLint previousTexture = 0;
+    glsafe(::glGetIntegerv(GL_UNPACK_ALIGNMENT, &previousAlignment));
+    glsafe(::glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture));
+    glsafe(::glPixelStorei(GL_UNPACK_ALIGNMENT, 1));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, _bedNoiseId));
+    glsafe(::glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, PBR_BED_NOISE_SIZE, PBR_BED_NOISE_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                          texels.data()));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT));
+    // Averaged mips fade sub-pixel relief out instead of letting it alias.
+    glsafe(::glGenerateMipmap(GL_TEXTURE_2D));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture)));
     glsafe(::glPixelStorei(GL_UNPACK_ALIGNMENT, previousAlignment));
     return true;
 }

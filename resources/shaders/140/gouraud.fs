@@ -69,11 +69,36 @@ uniform float pbr_bump;
 uniform float pbr_bump_scale;
 uniform float pbr_sheen;
 uniform float pbr_bump_grain;
+uniform float pbr_transmission;
+// Self glow, color in sRGB.
+uniform float pbr_emission;
+uniform float pbr_emission_r;
+uniform float pbr_emission_g;
+uniform float pbr_emission_b;
+// 0 = the color above, 1 = the filament color.
+uniform float pbr_emission_tint;
+// Environment scale, below 1 in the lights off preview.
+uniform float pbr_light_scale;
+// Mipmapped copy of the frame behind translucent volumes, bound only while they are drawn after the bed.
+uniform sampler2D pbr_scene_tex;
+uniform bool pbr_scene_ready;
+uniform float pbr_scene_max_lod;
+// The copy holds a rectangle of the frame: origin x, origin y in window pixels, 1 / width, 1 / height.
+uniform vec4 pbr_scene_rect;
+// Viewport size / copied rectangle size, turns screen uv offsets into copy uv offsets.
+uniform vec2 pbr_scene_viewport_scale;
+// Strength of a virtual light behind the object (camera relative), shows translucency from any view.
+uniform float pbr_back_light;
+// Eye space direction to that light: behind the object and a bit above.
+const vec3 BACK_LIGHT_DIR = vec3(0.0, 0.33, -0.944);
 // Shared with the vertex shader, brings the relief gradient to eye space.
 uniform mat3 view_normal_matrix;
 // Tileable noise volume built by PbrEnvironment: r = value, gba = gradient per noise unit.
 uniform sampler3D pbr_noise_tex;
 uniform bool pbr_noise_ready;
+// Flat build plate: relief from a 2D noise in the model xy plane instead of the 3D noise.
+uniform sampler2D pbr_bed_noise_tex;
+uniform bool pbr_planar_pattern;
 in vec3 object_position;
 // Image based lighting fixed in the world: eye space directions are turned into environment space.
 // Cube map mips are GGX prefiltered (lod = roughness * max lod), SH gives irradiance / pi.
@@ -109,6 +134,31 @@ vec3 rotate_environment(vec3 dir)
     float c = cos(angle);
     float s = sin(angle);
     return vec3(c * dir.x + s * dir.z, dir.y, -s * dir.x + c * dir.z);
+}
+
+// Inverse of rotate_environment().
+vec3 unrotate_environment(vec3 dir)
+{
+    float angle = radians(pbr_env_rotation);
+    float c = cos(angle);
+    float s = sin(angle);
+    return vec3(c * dir.x - s * dir.z, dir.y, s * dir.x + c * dir.z);
+}
+
+// Strongest light direction of the environment (environment space), from the linear SH band.
+vec3 environment_key_direction()
+{
+    vec3 d = vec3(pbr_sh[3], pbr_sh[1], pbr_sh[2]);
+    float len = length(d);
+    return len > 1e-5 ? unrotate_environment(d / len) : vec3(0.0, 1.0, 0.0);
+}
+
+// Fast translucency (Barre-Brisebois 2011): light entering the far side and leaving toward the viewer.
+// n = normal, v = to the viewer, l = to the light, all in the same space.
+float translucency(vec3 n, vec3 v, vec3 l)
+{
+    vec3 h = normalize(l + n * 0.3);
+    return pow(clamp(dot(v, -h), 0.0, 1.0), 4.0);
 }
 
 // Prefiltered radiance around 'dir', blended from gray to the studio color by the reflection saturation;
@@ -186,6 +236,31 @@ float mip_slope_kept(float units_per_mm)
     return exp2(-0.7 * lod * lod);
 }
 
+// Bed noise layout, must match PbrEnvironment.cpp: 512 texels, 4 per low octave unit.
+const float BED_NOISE_UV_PER_UNIT = 4.0 / 512.0;
+// Turn of the plate plane before sampling the bed noise, about 37 degrees.
+const vec2 BED_NOISE_ROTATION = vec2(0.7986, 0.6018);
+
+vec2 rotate_bed_noise(vec2 v)
+{
+    vec2 r = BED_NOISE_ROTATION;
+    return vec2(r.x * v.x - r.y * v.y, r.y * v.x + r.x * v.y);
+}
+
+vec2 unrotate_bed_noise(vec2 v)
+{
+    vec2 r = BED_NOISE_ROTATION;
+    return vec2(r.x * v.x + r.y * v.y, -r.y * v.x + r.x * v.y);
+}
+
+// Share of the bed noise slope energy the mip chain keeps, measured 1 / 0.80 / 0.42 / 0.11 for lod 0..3.
+float bed_slope_kept(float units_per_mm)
+{
+    float texels = max(length(dpdx_object.xy), length(dpdy_object.xy)) * units_per_mm * 4.0;
+    float lod = max(log2(max(texels, 1e-6)), 0.0);
+    return exp2(-0.33 * lod * lod);
+}
+
 // Two incommensurate octaves hide the texture repeat; the sum has std 0.136.
 vec4 two_octave_noise(vec3 p, float units_per_mm)
 {
@@ -230,16 +305,46 @@ SurfacePattern surface_pattern(float footprint)
         // Speckles stand slightly proud of the surface.
         pattern.slope += pbr_bump * 0.1 * (60.0 * x * (1.0 - x)) * n.yzw * (1.0 - unresolved);
     }
-    if (pbr_bump > 0.0) {
+    if (pbr_bump > 0.0 && pbr_planar_pattern) {
+        // Flat build plate: one 2D fetch holds both octaves. The plate plane is turned so the texture repeat
+        // does not line up with its edges; the gradient is turned back afterwards.
+        float units_per_mm = 1.0 / max(pbr_bump_scale, 0.05);
+        float k = units_per_mm * BED_NOISE_UV_PER_UNIT;
+        vec2 uv = rotate_bed_noise(object_position.xy) * k;
+        vec4 t = textureGrad(pbr_bed_noise_tex, uv, rotate_bed_noise(dpdx_object.xy) * k,
+                             rotate_bed_noise(dpdy_object.xy) * k);
+        float value = 0.5 + (t.x - 0.5) / NOISE_VALUE_PACK;
+        vec3 g = vec3(unrotate_bed_noise((t.yz * 2.0 - 1.0) * NOISE_GRADIENT_RANGE), 0.0);
+        // Same grain shape and roughness transfer as the 3D path, with the statistics measured for this texture:
+        // mean squared slope 0.114 for waves, 0.456 for grains.
+        pattern.slope += pbr_bump * mix(g, 2.0 * sign(value - 0.5) * g, pbr_bump_grain);
+        float lost = 1.0 - bed_slope_kept(units_per_mm);
+        pattern.slope_variance += pbr_bump * pbr_bump * mix(0.114, 0.456, pbr_bump_grain) * lost;
+    }
+    else if (pbr_bump > 0.0) {
+        // Below this share of slope kept by the mips an octave is not fetched; its slope goes to roughness instead.
+        const float MIN_KEPT_SLOPE = 0.15;
         float units_per_mm = 1.0 / max(pbr_bump_scale, 0.05);
         // Mips already average sub-pixel slopes away, no extra fade.
-        vec4 n = two_octave_noise(object_position * units_per_mm, units_per_mm);
+        float kept_low = mip_slope_kept(units_per_mm);
+        float kept_high = mip_slope_kept(units_per_mm * 2.3);
+        vec4 n = vec4(0.5, 0.0, 0.0, 0.0);
+        if (kept_low >= MIN_KEPT_SLOPE) {
+            vec4 low = noise_sample(object_position * units_per_mm, units_per_mm);
+            n += vec4(0.65 * (low.x - 0.5), 0.65 * low.yzw);
+        } else
+            kept_low = 0.0;
+        if (kept_high >= MIN_KEPT_SLOPE) {
+            vec4 high = noise_sample(object_position * units_per_mm * 2.3 + 7.0, units_per_mm * 2.3);
+            n += vec4(0.35 * (high.x - 0.5), 0.35 * 2.3 * high.yzw);
+        } else
+            kept_high = 0.0;
         // Grain shape: height |n - 0.5| turns the waves into packed pebbles split by sharp valleys.
         vec3 grad = mix(n.yzw, 2.0 * sign(n.x - 0.5) * n.yzw, pbr_bump_grain);
         pattern.slope += pbr_bump * grad;
-        // The slope energy the mips removed goes to roughness. Octave shares 0.39 / 0.61; measured mean squared
-        // tangential slope: 0.083 for waves, 0.33 for grains.
-        float lost = 0.39 * (1.0 - mip_slope_kept(units_per_mm)) + 0.61 * (1.0 - mip_slope_kept(units_per_mm * 2.3));
+        // The slope energy the mips removed or the skipped octaves had goes to roughness. Octave shares 0.39 / 0.61;
+        // measured mean squared tangential slope: 0.083 for waves, 0.33 for grains.
+        float lost = 0.39 * (1.0 - kept_low) + 0.61 * (1.0 - kept_high);
         pattern.slope_variance += pbr_bump * pbr_bump * mix(0.083, 0.33, pbr_bump_grain) * lost;
     }
     return pattern;
@@ -273,16 +378,58 @@ vec3 shade_pbr(vec3 base_color, float footprint)
     vec3 env_normal = pbr_view_to_env * n;
     vec3 specular = environment_radiance(env_reflect, roughness) * (f0 * env_brdf.x + env_brdf.y) * pbr_reflection;
     float irradiance = environment_irradiance(env_normal);
+    float mean_irradiance = pbr_env_ready ? pbr_sh[0] * 0.282095 : 0.42;
     if (pbr_sheen > 0.0) {
         // Burley diffuse retro reflection: view term with F90 = 0.5 + 2 * roughness (light near the view),
         // light term approximated by flattening the irradiance toward its mean.
-        float mean_irradiance = pbr_env_ready ? pbr_sh[0] * 0.282095 : 0.42;
         irradiance = mix(irradiance, mean_irradiance, 0.3 * pbr_sheen * roughness);
         float f90 = 0.5 + 2.0 * roughness;
         irradiance *= 1.0 + pbr_sheen * max(f90 - 1.0, 0.0) * pow(1.0 - n_dot_v, 5.0);
     }
+    if (pbr_emission > 0.0)
+        // Glowing filaments look lit from inside: flatten the environment shading.
+        irradiance = mix(irradiance, mean_irradiance, 0.5 * clamp(pbr_emission, 0.0, 1.0));
     vec3 diffuse = irradiance * albedo * (1.0 - metallic) * pbr_diffuse;
-    vec3 color = (diffuse + specular) * pbr_env_intensity;
+    // Frosted see-through, only when the volume is drawn over a copy of the scene: share of the surface
+    // showing the scene behind, and that scene in radiance before exposure.
+    float see_amount = 0.0;
+    vec3 see_through = ZERO;
+    if (pbr_transmission > 0.0) {
+        // Translucent body. Thickness along the view ray is estimated from N.V: 1 facing the viewer,
+        // 0 at silhouettes; thick parts absorb more light and get a deeper tint.
+        float t = clamp(pbr_transmission, 0.0, 1.0);
+        float thickness = n_dot_v;
+        vec3 tint = pow(max(albedo, vec3(0.001)), vec3(0.5 + 2.0 * thickness)) * exp(-1.5 * thickness);
+        float scattered = mix(irradiance, mean_irradiance, 0.5 * t);
+        // Light coming through from behind: the environment key light, a camera relative back light
+        // and, without a scene copy, the blurred environment behind the object.
+        vec3 key_dir = environment_key_direction();
+        vec3 key = environment_radiance(key_dir, 0.6) * translucency(env_normal, pbr_view_to_env * v, key_dir);
+        vec3 back = vec3(pbr_back_light * translucency(n, v, BACK_LIGHT_DIR));
+        float behind_weight = 0.5;
+        if (pbr_scene_ready) {
+            // Blur grows with roughness and thickness, a small shift along the normal mimics refraction.
+            vec2 scene_uv = (gl_FragCoord.xy - pbr_scene_rect.xy) * pbr_scene_rect.zw +
+                            n.xy * (0.02 * thickness) * pbr_scene_viewport_scale;
+            scene_uv = clamp(scene_uv, vec2(0.0), vec2(1.0));
+            float lod = pbr_scene_max_lod * clamp(0.2 + 0.35 * roughness + 0.15 * thickness, 0.0, 0.9);
+            // The copy holds display colors after exposure; bring them back to radiance.
+            vec3 scene = srgb_to_linear(textureLod(pbr_scene_tex, scene_uv, lod).rgb) / max(pbr_exposure, 0.001);
+            float reflectance = 0.04 * env_brdf.x + env_brdf.y;
+            see_amount = 0.8 * t * (1.0 - reflectance);
+            see_through = scene * pow(max(albedo, vec3(0.001)), vec3(0.3 + 0.7 * thickness));
+            // The real scene replaces the environment guess.
+            behind_weight = 0.0;
+        }
+        vec3 behind = environment_radiance(pbr_view_to_env * (-v), 1.0);
+        vec3 through = (key + back + behind_weight * behind) * tint;
+        diffuse = (scattered * (1.0 - 0.5 * t) * albedo + through * t) * (1.0 - metallic) * pbr_diffuse;
+    }
+    // Lights off preview dims only the environment, glow stays; the scene copy is already lit.
+    vec3 color = (diffuse * (1.0 - see_amount) + specular) * pbr_env_intensity * pbr_light_scale + see_through * see_amount;
+    if (pbr_emission > 0.0)
+        color += srgb_to_linear(mix(vec3(pbr_emission_r, pbr_emission_g, pbr_emission_b), base_color,
+                                    clamp(pbr_emission_tint, 0.0, 1.0))) * pbr_emission;
 
     return linear_to_srgb(pbr_neutral_tone_mapping(color * pbr_exposure));
 }

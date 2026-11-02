@@ -74,7 +74,10 @@
 #include <float.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 
 #ifndef IMGUI_DEFINE_MATH_OPERATORS
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -1587,6 +1590,14 @@ GLCanvas3D::~GLCanvas3D()
         m_selectionHighlightResources.glowTexture != 0;
     if (hasSelectionHighlightResources && m_canvas != nullptr && _set_current())
         ReleaseSelectionHighlightResources();
+    const bool hasPbrGlowResources = _pbrGlowResources.maskFramebuffer != 0 || _pbrGlowResources.maskTexture != 0 ||
+                                     _pbrGlowResources.blurFramebuffer != 0 || _pbrGlowResources.blurTexture != 0;
+    if (hasPbrGlowResources && m_canvas != nullptr && _set_current())
+        ReleasePbrGlowResources();
+    if ((_pbrSceneCapture.framebuffer != 0 || _pbrSceneCapture.texture != 0) && m_canvas != nullptr && _set_current())
+        ReleasePbrSceneCapture();
+    if (_pbrTimers.initialized && _pbrTimers.supported && m_canvas != nullptr && _set_current())
+        ReleasePbrTimers();
 
     reset_volumes(ResetVolumesMode::CanvasDestruction);
 
@@ -3003,6 +3014,8 @@ void GLCanvas3D::render(bool only_init)
     }
 
     const ESelectionHighlightMode highlightMode = ResolveSelectionHighlightMode();
+    CollectPbrTimers();
+    BeginPbrFrameTimer();
 
     // draw scene
     glsafe(::glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
@@ -3024,14 +3037,27 @@ void GLCanvas3D::render(bool only_init)
     /* view3D render*/
     int hover_id = (m_hover_plate_idxs.size() > 0)?m_hover_plate_idxs.front():-1;
     if (m_canvas_type == ECanvasType::CanvasView3D) {
+        // Translucent PBR filaments are drawn after the bed, over a copy of everything behind them.
+        const bool deferTranslucent = ShouldDeferPbrTranslucent();
+        if (deferTranslucent)
+            m_volumes.SetPbrTranslucentPass(PbrTranslucentPass::SkipTranslucent);
         //BBS: add outline logic
+        BeginPbrTimer(PbrTimerStage::OpaqueObjects);
         _render_objects(GLVolumeCollection::ERenderType::Opaque, !m_gizmos.is_running());
+        EndPbrTimer(PbrTimerStage::OpaqueObjects);
+        m_volumes.SetPbrTranslucentPass(PbrTranslucentPass::All);
         _render_sla_slices();
         _render_selection();
         if (!no_partplate)
+        {
+            BeginPbrTimer(PbrTimerStage::Bed);
             _render_bed(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), show_axes);
+            EndPbrTimer(PbrTimerStage::Bed);
+        }
         if (!no_partplate) //BBS: add outline logic
             _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), only_current, only_body, hover_id, true, show_grid);
+        if (deferTranslucent)
+            RenderPbrTranslucentObjects();
         _render_objects(GLVolumeCollection::ERenderType::Transparent, !m_gizmos.is_running());
     }
     /* preview render */
@@ -3050,15 +3076,28 @@ void GLCanvas3D::render(bool only_init)
         if (m_show_world_axes) {
             m_axes.render();
         }
+        const bool deferTranslucent = ShouldDeferPbrTranslucent();
+        if (deferTranslucent)
+            m_volumes.SetPbrTranslucentPass(PbrTranslucentPass::SkipTranslucent);
+        BeginPbrTimer(PbrTimerStage::OpaqueObjects);
         _render_objects(GLVolumeCollection::ERenderType::Opaque, !m_gizmos.is_running());
+        EndPbrTimer(PbrTimerStage::OpaqueObjects);
+        m_volumes.SetPbrTranslucentPass(PbrTranslucentPass::All);
         _render_selection();
         //_render_bed(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), show_axes);
         _render_plane();
+        if (deferTranslucent)
+            RenderPbrTranslucentObjects();
         //BBS: add outline logic insteadof selection under assemble view
         //_render_selection();
         // BBS: add outline logic
         _render_objects(GLVolumeCollection::ERenderType::Transparent, !m_gizmos.is_running());
     }
+
+    // Glow halo under the selection outline.
+    BeginPbrTimer(PbrTimerStage::GlowHalo);
+    RenderPbrGlowHalo();
+    EndPbrTimer(PbrTimerStage::GlowHalo);
 
     if (highlightMode == ESelectionHighlightMode::UnifiedFramebuffer)
     {
@@ -3068,6 +3107,8 @@ void GLCanvas3D::render(bool only_init)
     {
         RenderSelectionStencilFallback();
     }
+    // Scene done: background, objects, bed, translucent and glow passes, selection outline.
+    EndPbrFrameTimer();
 
     if (_showPbrDebugPanel && _showPbrNormals && (m_canvas_type == CanvasView3D || m_canvas_type == CanvasAssembleView))
         RenderPbrNormalLines();
@@ -4432,6 +4473,7 @@ void GLCanvas3D::on_char(wxKeyEvent& evt)
                 {
                     _pbrNormalLines.reset();
                     _pbrNormalLinesKey = 0;
+                    PbrMaterialTable::Instance().SetLightsOffPreview(false);
                 }
                 m_dirty = true;
             }
@@ -8982,11 +9024,21 @@ void GLCanvas3D::RenderPbrDebugPanel()
     if (!wxGetApp().is_gl_version_greater_or_equal_to(3, 1))
         imgui->text("OpenGL 3.1 is required, PBR has no effect.");
     RenderPbrNormalOptions();
+    bool lightsOff = table.IsLightsOffPreview();
+    if (ImGui::Checkbox("Lights off preview (check glowing filaments)", &lightsOff))
+    {
+        table.SetLightsOffPreview(lightsOff);
+        m_dirty = true;
+    }
     ImGui::Separator();
     RenderPbrLightingOptions();
     ImGui::Separator();
     RenderPbrBedOptions();
     ImGui::Separator();
+    RenderPbrTimingOptions();
+    ImGui::Separator();
+    if (_pbrContinuousRedraw)
+        imgui->set_requires_extra_frame();
 
     bool changed = false;
     if (matches.empty())
@@ -9021,6 +9073,8 @@ void GLCanvas3D::RenderPbrDebugPanel()
     if (!isOpen)
     {
         _showPbrDebugPanel = false;
+        // The preview is a debug aid, never leave the scene dark.
+        table.SetLightsOffPreview(false);
         m_dirty = true;
     }
     if (!_showPbrDebugPanel && _pbrNormalLines.is_initialized())
@@ -9101,6 +9155,847 @@ void GLCanvas3D::RenderPbrBedOptions()
         table.SetMaterial(PbrMatchSource::Bed, std::string(), params);
         m_dirty = true;
     }
+}
+
+/// @brief Screen rectangle of a world box in normalized device coordinates: min x, min y, max x, max y.
+/// @param box world space box.
+/// @param viewProjection projection * view matrix.
+/// @return the whole screen when the box crosses the camera plane.
+static Vec4d PbrScreenRect(const BoundingBoxf3& box, const Matrix4d& viewProjection)
+{
+    Vec4d rect(DBL_MAX, DBL_MAX, -DBL_MAX, -DBL_MAX);
+    for (int corner = 0; corner < 8; ++corner)
+    {
+        const Vec4d point((corner & 1) != 0 ? box.max.x() : box.min.x(), (corner & 2) != 0 ? box.max.y() : box.min.y(),
+                          (corner & 4) != 0 ? box.max.z() : box.min.z(), 1.0);
+        const Vec4d clip = viewProjection * point;
+        if (clip.w() <= 1e-6)
+            return Vec4d(-1.0, -1.0, 1.0, 1.0);
+        const double x = clip.x() / clip.w();
+        const double y = clip.y() / clip.w();
+        rect = Vec4d(std::min(rect.x(), x), std::min(rect.y(), y), std::max(rect.z(), x), std::max(rect.w(), y));
+    }
+    return rect;
+}
+
+/// @brief Union of two screen rectangles (min x, min y, max x, max y).
+static Vec4d PbrRectUnion(const Vec4d& lhs, const Vec4d& rhs)
+{
+    return Vec4d(std::min(lhs.x(), rhs.x()), std::min(lhs.y(), rhs.y()), std::max(lhs.z(), rhs.z()), std::max(lhs.w(), rhs.w()));
+}
+
+/// @brief Pixel rectangle of a screen rectangle in a target, grown by a margin and clamped to the target.
+/// @param ndcRect min x, min y, max x, max y in normalized device coordinates.
+/// @param target x, y, width, height of the target in pixels.
+/// @param margin pixels added on every side.
+/// @return min x, min y, max x, max y in pixels, empty (max <= min) when outside the target.
+static std::array<int, 4> PbrPixelRect(const Vec4d& ndcRect, const std::array<int, 4>& target, const int margin)
+{
+    const double width = static_cast<double>(target[2]);
+    const double height = static_cast<double>(target[3]);
+    const int minX = static_cast<int>(std::floor((std::max(ndcRect.x(), -1.0) * 0.5 + 0.5) * width)) - margin;
+    const int minY = static_cast<int>(std::floor((std::max(ndcRect.y(), -1.0) * 0.5 + 0.5) * height)) - margin;
+    const int maxX = static_cast<int>(std::ceil((std::min(ndcRect.z(), 1.0) * 0.5 + 0.5) * width)) + margin;
+    const int maxY = static_cast<int>(std::ceil((std::min(ndcRect.w(), 1.0) * 0.5 + 0.5) * height)) + margin;
+    return { target[0] + std::max(minX, 0), target[1] + std::max(minY, 0), target[0] + std::min(maxX, target[2]),
+             target[1] + std::min(maxY, target[3]) };
+}
+
+bool GLCanvas3D::EnsurePbrGlowResources(const Size& canvasSize)
+{
+    // Quarter resolution: the halo is blurred anyway and the passes stay cheap.
+    static const float PBR_GLOW_SCALE = 0.25f;
+    if (canvasSize.get_width() <= 0 || canvasSize.get_height() <= 0 || !m_selectionFramebufferAvailable)
+        return false;
+
+    const unsigned int width = std::max(1U, static_cast<unsigned int>(std::ceil(canvasSize.get_width() * PBR_GLOW_SCALE)));
+    const unsigned int height = std::max(1U, static_cast<unsigned int>(std::ceil(canvasSize.get_height() * PBR_GLOW_SCALE)));
+    PbrGlowResources& resources = _pbrGlowResources;
+    if (resources.maskFramebuffer != 0 && resources.blurFramebuffer != 0 && resources.width == width &&
+        resources.height == height)
+        return true;
+
+    const OpenGLManager::EFramebufferType framebufferType = OpenGLManager::get_framebuffers_type();
+    if (framebufferType == OpenGLManager::EFramebufferType::Unknown)
+        return false;
+
+    // Creation binds the new framebuffer (draw and read) and texture, restore them afterwards.
+    GLint previousDrawFramebuffer = 0;
+    GLint previousReadFramebuffer = 0;
+    GLint previousTexture = 0;
+    glsafe(::glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture));
+    if (framebufferType == OpenGLManager::EFramebufferType::Arb)
+    {
+        glsafe(::glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previousDrawFramebuffer));
+        glsafe(::glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFramebuffer));
+    }
+    else
+        glsafe(::glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &previousDrawFramebuffer));
+
+    ReleasePbrGlowResources();
+    const bool complete =
+        CreateSelectionHighlightFramebuffer(framebufferType, width, height, resources.maskFramebuffer, resources.maskTexture) &&
+        CreateSelectionHighlightFramebuffer(framebufferType, width, height, resources.blurFramebuffer, resources.blurTexture);
+
+    glsafe(::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture)));
+    if (framebufferType == OpenGLManager::EFramebufferType::Arb)
+    {
+        glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(previousDrawFramebuffer)));
+        glsafe(::glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previousReadFramebuffer)));
+    }
+    else
+        glsafe(::glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, static_cast<GLuint>(previousDrawFramebuffer)));
+
+    if (!complete)
+    {
+        ReleasePbrGlowResources();
+        static bool warningLogged = false;
+        if (!warningLogged)
+        {
+            BOOST_LOG_TRIVIAL(warning) << "Unable to create the PBR glow framebuffers, the glow halo is disabled";
+            warningLogged = true;
+        }
+        return false;
+    }
+    resources.width = width;
+    resources.height = height;
+    return true;
+}
+
+bool GLCanvas3D::RenderPbrGlowMask(Vec4d& screenRect)
+{
+    // Mask brightness per unit of emission, saturates at emission 2.
+    static const float PBR_GLOW_MASK_PER_EMISSION = 0.5f;
+    screenRect = Vec4d(DBL_MAX, DBL_MAX, -DBL_MAX, -DBL_MAX);
+    GLShaderProgram* const shader = wxGetApp().get_shader("selection_mask");
+    if (shader == nullptr)
+        return false;
+
+    const std::vector<PbrMaterialMatch>& materials = m_volumes.GetExtruderMaterials();
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    const Transform3d& viewMatrix = camera.get_view_matrix();
+    const Matrix4d viewProjection = camera.get_projection_matrix().matrix() * viewMatrix.matrix();
+    bool drawn = false;
+    for (GLVolume* volume : m_volumes.volumes)
+    {
+        if (volume == nullptr || !volume->is_active || volume->is_modifier || volume->is_wipe_tower ||
+            volume->composite_id.volume_id < 0)
+            continue;
+
+        // Same filament mapping as the PBR shading; painted volumes glow with their base filament.
+        const int filamentIdx = std::max(volume->extruder_id, 1) - 1;
+        if (filamentIdx >= static_cast<int>(materials.size()))
+            continue;
+        const PbrMaterialParams& material = materials[static_cast<size_t>(filamentIdx)].params;
+        const BoundingBoxf3& box = volume->transformed_bounding_box();
+        if (material.emission <= 0.0f || !camera.GetFrustum().Intersects(box))
+            continue;
+
+        if (!drawn)
+        {
+            shader->start_using();
+            shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+            drawn = true;
+        }
+        screenRect = PbrRectUnion(screenRect, PbrScreenRect(box, viewProjection));
+        // Same color as the shader glow: fixed emission color blended toward the filament color.
+        const float strength = std::min(material.emission * PBR_GLOW_MASK_PER_EMISSION, 1.0f);
+        const float tint = std::min(std::max(material.emissionTint, 0.0f), 1.0f);
+        const ColorRGBA& filamentColor = volume->color;
+        shader->set_uniform("output_color",
+                            ColorRGB((material.emissionR + (filamentColor.r() - material.emissionR) * tint) * strength,
+                                     (material.emissionG + (filamentColor.g() - material.emissionG) * tint) * strength,
+                                     (material.emissionB + (filamentColor.b() - material.emissionB) * tint) * strength));
+        shader->set_uniform("view_model_matrix", viewMatrix * volume->world_matrix());
+        volume->render();
+    }
+    if (drawn)
+        shader->stop_using();
+    return drawn;
+}
+
+void GLCanvas3D::RenderPbrGlowHalo()
+{
+    // Halo brightness at glow_halo = 1, and blur tap spacing (mask texels) of each horizontal + vertical pass pair.
+    static const float PBR_GLOW_INTENSITY = 1.5f;
+    static const std::array<float, 2> PBR_GLOW_BLUR_STEPS = { 1.5f, 3.0f };
+    // Halo reach around the glowing volumes in mask texels: 4 taps per pass of both steps, plus a little.
+    static const int PBR_GLOW_MARGIN = 20;
+    if ((m_canvas_type != CanvasView3D && m_canvas_type != CanvasAssembleView) || !IsPbrRenderingEnabled() ||
+        !m_background.is_initialized())
+        return;
+
+    const float haloStrength = PbrMaterialTable::Instance().GetLighting().glowHalo;
+    const std::vector<PbrMaterialMatch>& materials = m_volumes.GetExtruderMaterials();
+    const bool anyGlow = std::any_of(materials.begin(), materials.end(),
+                                     [](const PbrMaterialMatch& match) { return match.params.emission > 0.0f; });
+    GLShaderProgram* const blurShader = wxGetApp().get_shader("pbr_glow_blur");
+    GLShaderProgram* const compositeShader = wxGetApp().get_shader("pbr_glow_composite");
+    const OpenGLManager::EFramebufferType framebufferType = OpenGLManager::get_framebuffers_type();
+    if (haloStrength <= 0.0f || !anyGlow || blurShader == nullptr || compositeShader == nullptr ||
+        framebufferType == OpenGLManager::EFramebufferType::Unknown)
+        return;
+
+    const MaskRenderState maskState = SaveMaskRenderState(framebufferType);
+    const CompositeRenderState compositeState = SaveCompositeRenderState();
+    const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    std::array<GLint, 4> scissorBox{ 0, 0, 0, 0 };
+    glsafe(::glGetIntegerv(GL_SCISSOR_BOX, scissorBox.data()));
+    ScopeGuard stateGuard([&maskState, &compositeState, scissorEnabled, scissorBox]()
+    {
+        glsafe(::glScissor(scissorBox[0], scissorBox[1], scissorBox[2], scissorBox[3]));
+        if (scissorEnabled == GL_TRUE)
+            glsafe(::glEnable(GL_SCISSOR_TEST));
+        else
+            glsafe(::glDisable(GL_SCISSOR_TEST));
+        RestoreCompositeRenderState(compositeState);
+        RestoreMaskRenderState(maskState);
+    });
+    if (!EnsurePbrGlowResources(get_canvas_size()))
+        return;
+
+    // Both targets are cleared whole: the blur reads a little outside the region it writes.
+    const PbrGlowResources& resources = _pbrGlowResources;
+    glsafe(::glDisable(GL_SCISSOR_TEST));
+    glsafe(::glViewport(0, 0, static_cast<GLsizei>(resources.width), static_cast<GLsizei>(resources.height)));
+    glsafe(::glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE));
+    glsafe(::glDisable(GL_DEPTH_TEST));
+    glsafe(::glDisable(GL_BLEND));
+    glsafe(::glDisable(GL_CULL_FACE));
+    glsafe(::glClearColor(0.0f, 0.0f, 0.0f, 0.0f));
+    BindSelectionHighlightDrawFramebuffer(framebufferType, resources.blurFramebuffer);
+    glsafe(::glClear(GL_COLOR_BUFFER_BIT));
+    BindSelectionHighlightDrawFramebuffer(framebufferType, resources.maskFramebuffer);
+    glsafe(::glClear(GL_COLOR_BUFFER_BIT));
+    Vec4d screenRect;
+    if (!RenderPbrGlowMask(screenRect))
+        return;
+
+    // Blur and composite only around the glowing volumes.
+    const std::array<int, 4> maskTarget = { 0, 0, static_cast<int>(resources.width), static_cast<int>(resources.height) };
+    const std::array<int, 4> maskRegion = PbrPixelRect(screenRect, maskTarget, PBR_GLOW_MARGIN);
+    const std::array<int, 4> sceneTarget = { maskState.viewport[0], maskState.viewport[1], maskState.viewport[2],
+                                             maskState.viewport[3] };
+    const int sceneMargin = static_cast<int>(std::ceil(static_cast<double>(PBR_GLOW_MARGIN) * maskState.viewport[2] /
+                                                       static_cast<double>(resources.width)));
+    const std::array<int, 4> sceneRegion = PbrPixelRect(screenRect, sceneTarget, sceneMargin);
+    if (maskRegion[2] <= maskRegion[0] || maskRegion[3] <= maskRegion[1] || sceneRegion[2] <= sceneRegion[0] ||
+        sceneRegion[3] <= sceneRegion[1])
+        return;
+    glsafe(::glEnable(GL_SCISSOR_TEST));
+    glsafe(::glScissor(maskRegion[0], maskRegion[1], maskRegion[2] - maskRegion[0], maskRegion[3] - maskRegion[1]));
+
+    // Separable blur ping-pong: mask -> blur (horizontal) -> mask (vertical), the second pair with wider taps.
+    const Vec2f texelUv(1.0f / static_cast<float>(resources.width), 1.0f / static_cast<float>(resources.height));
+    blurShader->start_using();
+    blurShader->set_uniform("source_texture", 0);
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+    for (const float step : PBR_GLOW_BLUR_STEPS)
+    {
+        BindSelectionHighlightDrawFramebuffer(framebufferType, resources.blurFramebuffer);
+        blurShader->set_uniform("step_uv", Vec2f(texelUv.x() * step, 0.0f));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, resources.maskTexture));
+        m_background.render();
+        BindSelectionHighlightDrawFramebuffer(framebufferType, resources.maskFramebuffer);
+        blurShader->set_uniform("step_uv", Vec2f(0.0f, texelUv.y() * step));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, resources.blurTexture));
+        m_background.render();
+    }
+    blurShader->stop_using();
+
+    // Back to the scene target: add the halo on top of everything drawn so far.
+    BindSelectionHighlightDrawFramebuffer(framebufferType, static_cast<unsigned int>(maskState.drawFramebuffer));
+    glsafe(::glViewport(maskState.viewport[0], maskState.viewport[1], maskState.viewport[2], maskState.viewport[3]));
+    glsafe(::glScissor(sceneRegion[0], sceneRegion[1], sceneRegion[2] - sceneRegion[0], sceneRegion[3] - sceneRegion[1]));
+    glsafe(::glEnable(GL_BLEND));
+    glsafe(::glBlendFunc(GL_ONE, GL_ONE));
+    compositeShader->start_using();
+    compositeShader->set_uniform("glow_texture", 0);
+    compositeShader->set_uniform("intensity", PBR_GLOW_INTENSITY * haloStrength);
+    glsafe(::glBindTexture(GL_TEXTURE_2D, resources.maskTexture));
+    m_background.render();
+    compositeShader->stop_using();
+}
+
+void GLCanvas3D::ReleasePbrGlowResources()
+{
+    PbrGlowResources& resources = _pbrGlowResources;
+    const OpenGLManager::EFramebufferType framebufferType = OpenGLManager::get_framebuffers_type();
+    for (unsigned int* framebuffer : { &resources.maskFramebuffer, &resources.blurFramebuffer })
+    {
+        if (*framebuffer == 0)
+            continue;
+        if (framebufferType == OpenGLManager::EFramebufferType::Arb)
+            glsafe(::glDeleteFramebuffers(1, framebuffer));
+        else if (framebufferType == OpenGLManager::EFramebufferType::Ext)
+            glsafe(::glDeleteFramebuffersEXT(1, framebuffer));
+    }
+    for (unsigned int* texture : { &resources.maskTexture, &resources.blurTexture })
+    {
+        if (*texture != 0)
+            glsafe(::glDeleteTextures(1, texture));
+    }
+    resources = PbrGlowResources{};
+}
+
+bool GLCanvas3D::ShouldDeferPbrTranslucent()
+{
+    if ((m_canvas_type != CanvasView3D && m_canvas_type != CanvasAssembleView) || !IsPbrRenderingEnabled())
+        return false;
+    // Painting gizmos and layer editing draw the volumes their own way.
+    if (dynamic_cast<GLGizmoPainterBase*>(m_gizmos.get_current()) != nullptr || m_layers_editing.is_enabled())
+        return false;
+    return m_volumes.HasPbrTranslucentVolume();
+}
+
+void GLCanvas3D::RenderPbrTranslucentObjects()
+{
+    // Scene copies per frame: the first one plus recaptures for volumes overlapping on screen.
+    static const size_t MAX_PBR_SCENE_COPIES = 5;
+    // Copy margin around the volumes, share of the larger viewport side: refraction shift and blur reach.
+    static const double PBR_SCENE_COPY_MARGIN = 0.04;
+    struct TranslucentItem
+    {
+        const GLVolume* volume{ nullptr };
+        // View space z of the nearest bounding box corner, larger is nearer.
+        double depth{ -DBL_MAX };
+        // Screen rectangle in normalized device coordinates: min x, min y, max x, max y.
+        Vec4d screenRect{ DBL_MAX, DBL_MAX, -DBL_MAX, -DBL_MAX };
+    };
+
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    const Transform3d& viewMatrix = camera.get_view_matrix();
+    const Matrix4d viewProjection = camera.get_projection_matrix().matrix() * viewMatrix.matrix();
+    std::vector<TranslucentItem> items;
+    for (const GLVolume* volume : m_volumes.volumes)
+    {
+        if (volume == nullptr || !volume->is_active || !m_volumes.IsPbrTranslucentVolume(*volume))
+            continue;
+        const BoundingBoxf3& box = volume->transformed_bounding_box();
+        if (!camera.GetFrustum().Intersects(box))
+            continue;
+
+        TranslucentItem item;
+        item.volume = volume;
+        item.screenRect = PbrScreenRect(box, viewProjection);
+        for (int corner = 0; corner < 8; ++corner)
+        {
+            const Vec3d point((corner & 1) != 0 ? box.max.x() : box.min.x(), (corner & 2) != 0 ? box.max.y() : box.min.y(),
+                              (corner & 4) != 0 ? box.max.z() : box.min.z());
+            item.depth = std::max(item.depth, (viewMatrix * point).z());
+        }
+        items.push_back(item);
+    }
+    // Far to near, like the transparent pass.
+    std::sort(items.begin(), items.end(),
+              [](const TranslucentItem& lhs, const TranslucentItem& rhs) { return lhs.depth < rhs.depth; });
+
+    // A volume overlapping one of its own group could not see it: it starts a new group over a fresh copy.
+    std::vector<std::vector<const GLVolume*>> groups;
+    std::vector<Vec4d> groupUnions;
+    std::vector<Vec4d> groupRects;
+    for (const TranslucentItem& item : items)
+    {
+        const bool overlapsGroup = std::any_of(groupRects.begin(), groupRects.end(), [&item](const Vec4d& rect)
+        {
+            return item.screenRect.x() < rect.z() && rect.x() < item.screenRect.z() &&
+                   item.screenRect.y() < rect.w() && rect.y() < item.screenRect.w();
+        });
+        if (groups.empty() || (overlapsGroup && groups.size() < MAX_PBR_SCENE_COPIES))
+        {
+            groups.emplace_back();
+            groupUnions.push_back(item.screenRect);
+            groupRects.clear();
+        }
+        groups.back().push_back(item.volume);
+        groupUnions.back() = PbrRectUnion(groupUnions.back(), item.screenRect);
+        groupRects.push_back(item.screenRect);
+    }
+
+    // Each group only needs the frame around its own volumes.
+    std::array<GLint, 4> viewport{ 0, 0, 0, 0 };
+    glsafe(::glGetIntegerv(GL_VIEWPORT, viewport.data()));
+    const std::array<int, 4> target = { viewport[0], viewport[1], viewport[2], viewport[3] };
+    const int margin = static_cast<int>(std::ceil(PBR_SCENE_COPY_MARGIN * std::max(viewport[2], viewport[3])));
+    std::vector<std::array<int, 4>> regions;
+    std::array<int, 2> largestRegion = { 0, 0 };
+    for (const Vec4d& groupUnion : groupUnions)
+    {
+        regions.push_back(PbrPixelRect(groupUnion, target, margin));
+        largestRegion[0] = std::max(largestRegion[0], regions.back()[2] - regions.back()[0]);
+        largestRegion[1] = std::max(largestRegion[1], regions.back()[3] - regions.back()[1]);
+    }
+
+    _pbrTimers.sceneCopies = static_cast<int>(groups.size());
+    m_volumes.SetPbrTranslucentPass(PbrTranslucentPass::OnlyTranslucent);
+    for (size_t groupIdx = 0; groupIdx < groups.size(); ++groupIdx)
+    {
+        PbrSceneCopy copy;
+        BeginPbrTimer(PbrTimerStage::TranslucentCopy);
+        const bool captured = CapturePbrScene(regions[groupIdx], largestRegion, copy);
+        EndPbrTimer(PbrTimerStage::TranslucentCopy);
+        m_volumes.SetPbrSceneTexture(captured ? _pbrSceneCapture.texture : 0, copy.maxLod, copy.rect, copy.viewportScale);
+        m_volumes.SetPbrTranslucentGroup(groups[groupIdx]);
+        BeginPbrTimer(PbrTimerStage::TranslucentDraw);
+        _render_objects(GLVolumeCollection::ERenderType::Opaque, !m_gizmos.is_running());
+        EndPbrTimer(PbrTimerStage::TranslucentDraw);
+    }
+    m_volumes.SetPbrTranslucentPass(PbrTranslucentPass::All);
+    m_volumes.SetPbrTranslucentGroup(std::vector<const GLVolume*>());
+    m_volumes.SetPbrSceneTexture(0, 0.0f, std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 0.0f }, Vec2f::Zero());
+}
+
+/// @brief Round a texture size up to a multiple of a granularity.
+static unsigned int RoundUpPbrCopySize(const unsigned int value, const unsigned int granularity)
+{
+    return (value + granularity - 1U) / granularity * granularity;
+}
+
+bool GLCanvas3D::CapturePbrScene(const std::array<int, 4>& region, const std::array<int, 2>& largestRegion, PbrSceneCopy& copy)
+{
+    // Error codes drained before the copy, enough for any pending errors without looping on a lost context.
+    static const int MAX_PENDING_GL_ERRORS = 8;
+    // Texture sizes are rounded up to this many texels, so a moving camera rarely reallocates the copy.
+    static const unsigned int PBR_SCENE_COPY_GRANULARITY = 64;
+    copy = PbrSceneCopy();
+    // glBlitFramebuffer resolves the multisampled frame; only the core framebuffer path provides it.
+    if (_pbrSceneCaptureUnsupported || !m_selectionFramebufferAvailable ||
+        OpenGLManager::get_framebuffers_type() != OpenGLManager::EFramebufferType::Arb)
+        return false;
+
+    std::array<GLint, 4> viewport{ 0, 0, 0, 0 };
+    glsafe(::glGetIntegerv(GL_VIEWPORT, viewport.data()));
+    if (viewport[2] <= 0 || viewport[3] <= 0 || region[2] <= region[0] || region[3] <= region[1] ||
+        largestRegion[0] <= 0 || largestRegion[1] <= 0)
+        return false;
+
+    // Half resolution is enough for a blurred copy. A multisampled frame can only be resolved and scaled
+    // in one blit with the scaled resolve extension, otherwise it is copied at full resolution.
+    GLint sampleBuffers = 0;
+    glsafe(::glGetIntegerv(GL_SAMPLE_BUFFERS, &sampleBuffers));
+    const bool multisampled = sampleBuffers > 0;
+    const bool halfResolution = !multisampled || GLEW_EXT_framebuffer_multisample_blit_scaled != 0;
+    const GLenum blitFilter = !multisampled ? GL_LINEAR : (halfResolution ? GL_SCALED_RESOLVE_FASTEST_EXT : GL_NEAREST);
+    const unsigned int divisor = halfResolution ? 2U : 1U;
+
+    // Texture sized for the largest region of the frame, bounded by what the viewport can fill.
+    const unsigned int maxWidth = std::max(1U, static_cast<unsigned int>(viewport[2]) / divisor);
+    const unsigned int maxHeight = std::max(1U, static_cast<unsigned int>(viewport[3]) / divisor);
+    const unsigned int neededWidth = (static_cast<unsigned int>(largestRegion[0]) + divisor - 1U) / divisor;
+    const unsigned int neededHeight = (static_cast<unsigned int>(largestRegion[1]) + divisor - 1U) / divisor;
+    unsigned int width = std::min(maxWidth, RoundUpPbrCopySize(neededWidth, PBR_SCENE_COPY_GRANULARITY));
+    unsigned int height = std::min(maxHeight, RoundUpPbrCopySize(neededHeight, PBR_SCENE_COPY_GRANULARITY));
+
+    PbrSceneCapture& capture = _pbrSceneCapture;
+    // Keep a larger texture while it fits the viewport and is at most twice the needed area.
+    const bool reuse = capture.framebuffer != 0 && capture.width >= width && capture.height >= height &&
+                       capture.width <= maxWidth && capture.height <= maxHeight &&
+                       static_cast<uint64_t>(capture.width) * capture.height <= 2ULL * width * height;
+    if (reuse)
+    {
+        width = capture.width;
+        height = capture.height;
+    }
+
+    GLint previousDrawFramebuffer = 0;
+    GLint previousReadFramebuffer = 0;
+    GLint previousActiveTexture = GL_TEXTURE0;
+    GLint previousTexture = 0;
+    glsafe(::glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previousDrawFramebuffer));
+    glsafe(::glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFramebuffer));
+    glsafe(::glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveTexture));
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+    glsafe(::glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture));
+    ScopeGuard stateGuard([previousDrawFramebuffer, previousReadFramebuffer, previousActiveTexture, previousTexture]()
+    {
+        glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(previousDrawFramebuffer)));
+        glsafe(::glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previousReadFramebuffer)));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture)));
+        glsafe(::glActiveTexture(static_cast<GLenum>(previousActiveTexture)));
+    });
+
+    if (!reuse)
+    {
+        ReleasePbrSceneCapture();
+        glsafe(::glGenTextures(1, &capture.texture));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, capture.texture));
+        glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR));
+        glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+        glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+        glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+        glsafe(::glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0,
+                              GL_RGBA, GL_UNSIGNED_BYTE, nullptr));
+        glsafe(::glGenerateMipmap(GL_TEXTURE_2D));
+        glsafe(::glGenFramebuffers(1, &capture.framebuffer));
+        glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, capture.framebuffer));
+        glsafe(::glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, capture.texture, 0));
+        if (::glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        {
+            ReleasePbrSceneCapture();
+            _pbrSceneCaptureUnsupported = true;
+            BOOST_LOG_TRIVIAL(warning) << "Unable to create the PBR scene copy, translucent filaments are not see-through";
+            return false;
+        }
+        capture.width = width;
+        capture.height = height;
+    }
+
+    // Source: the texture size in window pixels, centered on the region and kept inside the viewport.
+    const int sourceWidth = static_cast<int>(width * divisor);
+    const int sourceHeight = static_cast<int>(height * divisor);
+    const int sourceX = std::min(std::max((region[0] + region[2]) / 2 - sourceWidth / 2, viewport[0]),
+                                 viewport[0] + viewport[2] - sourceWidth);
+    const int sourceY = std::min(std::max((region[1] + region[3]) / 2 - sourceHeight / 2, viewport[1]),
+                                 viewport[1] + viewport[3] - sourceHeight);
+
+    // Copy what is drawn so far (opaque objects, bed, grid, earlier translucent groups); this also resolves multisampling.
+    int pendingErrors = 0;
+    while (pendingErrors < MAX_PENDING_GL_ERRORS && ::glGetError() != GL_NO_ERROR)
+        ++pendingErrors;
+    glsafe(::glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previousDrawFramebuffer)));
+    glsafe(::glBindFramebuffer(GL_DRAW_FRAMEBUFFER, capture.framebuffer));
+    ::glBlitFramebuffer(sourceX, sourceY, sourceX + sourceWidth, sourceY + sourceHeight, 0, 0, static_cast<GLint>(width),
+                        static_cast<GLint>(height), GL_COLOR_BUFFER_BIT, blitFilter);
+    if (::glGetError() != GL_NO_ERROR)
+    {
+        // Typically a multisampled frame whose format differs from RGBA8, give up for this canvas.
+        _pbrSceneCaptureUnsupported = true;
+        BOOST_LOG_TRIVIAL(warning) << "PBR scene copy failed, translucent filaments are not see-through";
+        return false;
+    }
+    glsafe(::glBindTexture(GL_TEXTURE_2D, capture.texture));
+    glsafe(::glGenerateMipmap(GL_TEXTURE_2D));
+
+    copy.maxLod = std::floor(std::log2(static_cast<float>(std::max(width, height))));
+    copy.rect = { static_cast<float>(sourceX), static_cast<float>(sourceY), 1.0f / static_cast<float>(sourceWidth),
+                  1.0f / static_cast<float>(sourceHeight) };
+    copy.viewportScale = Vec2f(static_cast<float>(viewport[2]) / static_cast<float>(sourceWidth),
+                               static_cast<float>(viewport[3]) / static_cast<float>(sourceHeight));
+    // Shown by the timing section of the debug panel.
+    _pbrTimers.copyWidth = width;
+    _pbrTimers.copyHeight = height;
+    _pbrTimers.copyHalfResolution = halfResolution;
+    _pbrTimers.copyMultisampled = multisampled;
+    return true;
+}
+
+/// @brief Fold a sample into a smoothed timing.
+/// @param average running average, negative until the first sample.
+/// @param sample new value in milliseconds.
+static void AddPbrTimingSample(double& average, const double sample)
+{
+    // Weight of a new sample in the displayed average.
+    static const double PBR_TIMER_SMOOTHING = 0.1;
+    average = average < 0.0 ? sample : average + (sample - average) * PBR_TIMER_SMOOTHING;
+}
+
+/// @brief Milliseconds elapsed on the CPU since a time point.
+static double PbrMillisecondsSince(const std::chrono::steady_clock::time_point& start)
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+/// @brief Stages that also run with PBR off (scene, objects, bed) have a baseline; the others are PBR only.
+static bool PbrStageHasBaseline(const size_t stage)
+{
+    return stage <= 2;
+}
+
+void GLCanvas3D::CollectPbrTimers()
+{
+    PbrTimers& timers = _pbrTimers;
+    // CPU: fold the frame that just ended, unless it was a warm-up frame. A PBR only stage that did not run cost nothing.
+    if (timers.frameTimed && !timers.frameWarmup)
+    {
+        for (size_t stage = 0; stage < PbrTimers::STAGE_COUNT; ++stage)
+        {
+            const bool ran = timers.ranThisFrame[stage];
+            if (timers.framePbr && (ran || !PbrStageHasBaseline(stage)))
+                AddPbrTimingSample(timers.pbrOn[stage].cpu, timers.cpuFrameSums[stage]);
+            else if (!timers.framePbr && ran && PbrStageHasBaseline(stage))
+                AddPbrTimingSample(timers.pbrOff[stage].cpu, timers.cpuFrameSums[stage]);
+        }
+    }
+    timers.frameTimed = false;
+    timers.cpuFrameSums.fill(0.0);
+    timers.ranThisFrame.fill(false);
+    timers.openSpan.fill(-1);
+    timers.sceneCopies = 0;
+    if (!_showPbrDebugPanel)
+        return;
+
+    if (!timers.initialized)
+    {
+        timers.initialized = true;
+        timers.supported = GLEW_VERSION_3_3 != 0 || GLEW_ARB_timer_query != 0;
+        if (!timers.supported)
+        {
+            BOOST_LOG_TRIVIAL(warning) << "GPU timer queries unavailable, the PBR debug panel shows no timings";
+            return;
+        }
+        for (std::array<unsigned int, 2 * PbrTimers::MAX_SPANS>& queries : timers.queries)
+            glsafe(::glGenQueries(static_cast<GLsizei>(queries.size()), queries.data()));
+    }
+    if (!timers.supported)
+        return;
+
+    // GPU: the slot of this frame was used SLOT_COUNT frames ago, its spans are read before reusing it.
+    ++timers.frameIndex;
+    const size_t slot = timers.frameIndex % PbrTimers::SLOT_COUNT;
+    std::vector<unsigned char>& spans = timers.spanStages[slot];
+    std::vector<bool>& closed = timers.spanClosed[slot];
+    // Spans of a warm-up frame are dropped.
+    bool available = !spans.empty() && !timers.slotWarmup[slot];
+    for (size_t span = 0; available && span < spans.size(); ++span)
+    {
+        if (!closed[span])
+            continue;
+        GLint ready = 0;
+        glsafe(::glGetQueryObjectiv(timers.queries[slot][2 * span + 1], GL_QUERY_RESULT_AVAILABLE, &ready));
+        // Still not finished: drop this frame rather than stall.
+        available = ready != 0;
+    }
+    if (!available && !spans.empty() && !timers.slotWarmup[slot])
+        ++timers.droppedFrames;
+    if (available)
+    {
+        std::array<double, PbrTimers::STAGE_COUNT> sums{};
+        std::array<bool, PbrTimers::STAGE_COUNT> ran{};
+        for (size_t span = 0; span < spans.size(); ++span)
+        {
+            if (!closed[span])
+                continue;
+            GLuint64 start = 0;
+            GLuint64 end = 0;
+            glsafe(::glGetQueryObjectui64v(timers.queries[slot][2 * span], GL_QUERY_RESULT, &start));
+            glsafe(::glGetQueryObjectui64v(timers.queries[slot][2 * span + 1], GL_QUERY_RESULT, &end));
+            sums[spans[span]] += end > start ? static_cast<double>(end - start) * 1.0e-6 : 0.0;
+            ran[spans[span]] = true;
+        }
+        const bool pbr = timers.slotPbr[slot];
+        for (size_t stage = 0; stage < PbrTimers::STAGE_COUNT; ++stage)
+        {
+            if (pbr && (ran[stage] || !PbrStageHasBaseline(stage)))
+                AddPbrTimingSample(timers.pbrOn[stage].gpu, sums[stage]);
+            else if (!pbr && ran[stage] && PbrStageHasBaseline(stage))
+                AddPbrTimingSample(timers.pbrOff[stage].gpu, sums[stage]);
+        }
+    }
+    spans.clear();
+    closed.clear();
+}
+
+void GLCanvas3D::BeginPbrTimer(const PbrTimerStage stage)
+{
+    PbrTimers& timers = _pbrTimers;
+    if (!_showPbrDebugPanel || !timers.supported || !timers.frameTimed || stage == PbrTimerStage::Count)
+        return;
+    const size_t index = static_cast<size_t>(stage);
+    const size_t slot = timers.frameIndex % PbrTimers::SLOT_COUNT;
+    std::vector<unsigned char>& spans = timers.spanStages[slot];
+    if (timers.openSpan[index] >= 0 || spans.size() >= PbrTimers::MAX_SPANS)
+        return;
+    glsafe(::glQueryCounter(timers.queries[slot][2 * spans.size()], GL_TIMESTAMP));
+    timers.openSpan[index] = static_cast<int>(spans.size());
+    spans.push_back(static_cast<unsigned char>(index));
+    timers.spanClosed[slot].push_back(false);
+    timers.cpuStart[index] = std::chrono::steady_clock::now();
+}
+
+void GLCanvas3D::EndPbrTimer(const PbrTimerStage stage)
+{
+    PbrTimers& timers = _pbrTimers;
+    if (stage == PbrTimerStage::Count)
+        return;
+    const size_t index = static_cast<size_t>(stage);
+    if (timers.openSpan[index] < 0)
+        return;
+    const size_t slot = timers.frameIndex % PbrTimers::SLOT_COUNT;
+    const size_t span = static_cast<size_t>(timers.openSpan[index]);
+    glsafe(::glQueryCounter(timers.queries[slot][2 * span + 1], GL_TIMESTAMP));
+    timers.spanClosed[slot][span] = true;
+    timers.openSpan[index] = -1;
+    timers.cpuFrameSums[index] += PbrMillisecondsSince(timers.cpuStart[index]);
+    timers.ranThisFrame[index] = true;
+}
+
+void GLCanvas3D::BeginPbrFrameTimer()
+{
+    // Frames skipped after a switch: rebuilt meshes, LOD models and plate textures upload over several frames.
+    static const int PBR_TIMER_WARMUP_FRAMES = 30;
+    PbrTimers& timers = _pbrTimers;
+    if (!_showPbrDebugPanel || !timers.supported)
+        return;
+
+    const bool pbr = IsPbrRenderingEnabled();
+    const size_t volumeCount = m_volumes.volumes.size();
+    if (timers.hasLastTimedFrame && (pbr != timers.lastTimedPbr || volumeCount != timers.lastTimedVolumeCount))
+    {
+        // Restart the averages of the state just entered, older ones were taken under other conditions.
+        timers.warmupFrames = PBR_TIMER_WARMUP_FRAMES;
+        (pbr ? timers.pbrOn : timers.pbrOff).fill(PbrTiming());
+    }
+    timers.hasLastTimedFrame = true;
+    timers.lastTimedPbr = pbr;
+    timers.lastTimedVolumeCount = volumeCount;
+    timers.frameWarmup = timers.warmupFrames > 0;
+    if (timers.warmupFrames > 0)
+        --timers.warmupFrames;
+
+    const size_t slot = timers.frameIndex % PbrTimers::SLOT_COUNT;
+    timers.framePbr = pbr;
+    timers.slotPbr[slot] = pbr;
+    timers.slotWarmup[slot] = timers.frameWarmup;
+    timers.frameTimed = true;
+    BeginPbrTimer(PbrTimerStage::Scene);
+}
+
+void GLCanvas3D::EndPbrFrameTimer()
+{
+    PbrTimers& timers = _pbrTimers;
+    if (!timers.frameTimed)
+        return;
+    EndPbrTimer(PbrTimerStage::Scene);
+    if (!timers.framePbr)
+    {
+        // Remember what the baseline saw, to flag it once the scene or the view changes.
+        const Camera& camera = wxGetApp().plater()->get_camera();
+        timers.baselineVolumeCount = m_volumes.volumes.size();
+        timers.baselineViewMatrix = camera.get_view_matrix();
+        timers.baselineZoom = camera.get_zoom();
+    }
+}
+
+/// @brief Format one value of the timing table.
+/// @param milliseconds value in ms, negative when not measured yet unless signed.
+/// @param showSign true for differences, which may be negative.
+/// @return text such as "0.42", "+1.20" or "-".
+static std::string FormatPbrMilliseconds(const double milliseconds, const bool showSign)
+{
+    if (!showSign && milliseconds < 0.0)
+        return "-";
+    std::ostringstream text;
+    if (showSign)
+        text << std::showpos;
+    text << std::fixed << std::setprecision(2) << milliseconds;
+    return text.str();
+}
+
+/// @brief Add one row of the timing table: stage, GPU on / off, CPU on / off.
+static void AddPbrTimingRow(const std::string& name, const std::array<std::string, 4>& values)
+{
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextUnformatted(name.c_str());
+    for (const std::string& value : values)
+    {
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(value.c_str());
+    }
+}
+
+void GLCanvas3D::RenderPbrTimingOptions()
+{
+    if (!ImGui::CollapsingHeader("Timing vs PBR off (main-like)"))
+        return;
+
+    PbrTimers& timers = _pbrTimers;
+    if (!timers.supported)
+    {
+        ImGuiWrapper::text("GPU timer queries need OpenGL 3.3, no timings.");
+        return;
+    }
+    ImGui::Checkbox("Redraw continuously while measuring", &_pbrContinuousRedraw);
+    ImGui::SameLine();
+    if (ImGui::Button("Reset baseline"))
+        timers.pbrOff.fill(PbrTiming());
+
+    const std::array<const char*, PbrTimers::STAGE_COUNT> stageNames = {
+        "Scene", "Objects (on: no translucent)", "Bed", "Translucent scene copy", "Translucent draw", "Glow halo" };
+    if (ImGui::BeginTable("PbrTimings", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit))
+    {
+        ImGui::TableSetupColumn("Stage");
+        ImGui::TableSetupColumn("GPU on");
+        ImGui::TableSetupColumn("GPU off");
+        ImGui::TableSetupColumn("CPU on");
+        ImGui::TableSetupColumn("CPU off");
+        ImGui::TableHeadersRow();
+        for (size_t stage = 0; stage < PbrTimers::STAGE_COUNT; ++stage)
+        {
+            std::string name = stageNames[stage];
+            if (stage == static_cast<size_t>(PbrTimerStage::TranslucentCopy))
+                name += " x" + std::to_string(timers.sceneCopies);
+            AddPbrTimingRow(name, { FormatPbrMilliseconds(timers.pbrOn[stage].gpu, false),
+                                    FormatPbrMilliseconds(timers.pbrOff[stage].gpu, false),
+                                    FormatPbrMilliseconds(timers.pbrOn[stage].cpu, false),
+                                    FormatPbrMilliseconds(timers.pbrOff[stage].cpu, false) });
+        }
+        const PbrTiming& sceneOn = timers.pbrOn[static_cast<size_t>(PbrTimerStage::Scene)];
+        const PbrTiming& sceneOff = timers.pbrOff[static_cast<size_t>(PbrTimerStage::Scene)];
+        if (sceneOn.gpu >= 0.0 && sceneOff.gpu >= 0.0)
+            AddPbrTimingRow("Added (scene on - off)", { FormatPbrMilliseconds(sceneOn.gpu - sceneOff.gpu, true), "",
+                                                        FormatPbrMilliseconds(sceneOn.cpu - sceneOff.cpu, true), "" });
+        ImGui::EndTable();
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    if (timers.warmupFrames > 0)
+    {
+        const std::string warmupText = "Warming up after a PBR or object change, " + std::to_string(timers.warmupFrames) +
+                                       " frames skipped before measuring again.";
+        ImGui::TextUnformatted(warmupText.c_str());
+    }
+    if (timers.droppedFrames > 0)
+    {
+        // Many drops mean the GPU runs more than SLOT_COUNT frames behind, the GPU columns then lag or stay empty.
+        const std::string droppedText = "GPU results dropped, not ready in " + std::to_string(PbrTimers::SLOT_COUNT) +
+                                        " frames: " + std::to_string(timers.droppedFrames);
+        ImGui::TextUnformatted(droppedText.c_str());
+    }
+    if (timers.copyWidth > 0)
+    {
+        std::string copyText = "Scene copy " + std::to_string(timers.copyWidth) + " x " + std::to_string(timers.copyHeight) +
+                               (timers.copyHalfResolution ? ", half resolution" : ", full resolution");
+        if (timers.copyMultisampled)
+            copyText += timers.copyHalfResolution ? ", scaled multisample resolve" : ", multisampled without scaled resolve";
+        ImGui::TextUnformatted(copyText.c_str());
+    }
+    if (timers.pbrOff[static_cast<size_t>(PbrTimerStage::Scene)].gpu < 0.0)
+        ImGui::TextUnformatted("Turn PBR off once to measure the baseline.");
+    else
+    {
+        // The baseline is only comparable with the same objects seen from the same view.
+        const Camera& camera = wxGetApp().plater()->get_camera();
+        const bool stale = m_volumes.volumes.size() != timers.baselineVolumeCount ||
+                           !camera.get_view_matrix().isApprox(timers.baselineViewMatrix, 1e-6) ||
+                           std::abs(camera.get_zoom() - timers.baselineZoom) > 1e-6 * std::max(1.0, timers.baselineZoom);
+        if (stale)
+            ImGui::TextUnformatted("Baseline is stale: objects or view changed since it was measured.");
+    }
+    ImGui::TextUnformatted("GPU time includes the GPU waiting for draw calls; CPU close to GPU means CPU bound.");
+    ImGui::TextUnformatted("Averaged over frames; the debug panel itself is not included.");
+    ImGui::PopStyleColor();
+}
+
+void GLCanvas3D::ReleasePbrTimers()
+{
+    PbrTimers& timers = _pbrTimers;
+    if (timers.initialized && timers.supported)
+    {
+        for (std::array<unsigned int, 2 * PbrTimers::MAX_SPANS>& queries : timers.queries)
+            glsafe(::glDeleteQueries(static_cast<GLsizei>(queries.size()), queries.data()));
+    }
+    timers = PbrTimers();
+}
+
+void GLCanvas3D::ReleasePbrSceneCapture()
+{
+    PbrSceneCapture& capture = _pbrSceneCapture;
+    if (capture.framebuffer != 0 && OpenGLManager::get_framebuffers_type() == OpenGLManager::EFramebufferType::Arb)
+        glsafe(::glDeleteFramebuffers(1, &capture.framebuffer));
+    if (capture.texture != 0)
+        glsafe(::glDeleteTextures(1, &capture.texture));
+    capture = PbrSceneCapture{};
 }
 
 void GLCanvas3D::RenderPbrLightingOptions()

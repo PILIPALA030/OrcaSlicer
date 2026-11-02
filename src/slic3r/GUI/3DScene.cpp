@@ -148,6 +148,8 @@ static void InitVolumeModel(Slic3r::GUI::GLModel& model, const indexed_triangle_
 
 static const int PBR_ENV_TEXTURE_UNIT = Slic3r::GUI::PbrEnvironment::ENV_TEXTURE_UNIT;
 static const int PBR_NOISE_TEXTURE_UNIT = Slic3r::GUI::PbrEnvironment::NOISE_TEXTURE_UNIT;
+static const int PBR_SCENE_TEXTURE_UNIT = Slic3r::GUI::PbrEnvironment::SCENE_TEXTURE_UNIT;
+static const int PBR_BED_NOISE_TEXTURE_UNIT = Slic3r::GUI::PbrEnvironment::BED_NOISE_TEXTURE_UNIT;
 
 /// @brief Bind the IBL cube map and the pattern noise, and upload their uniforms.
 ///        The shader falls back to a gradient environment and no pattern when they are not ready.
@@ -201,6 +203,21 @@ static void SetPbrMaterialUniforms(Slic3r::GLShaderProgram* shader, const Slic3r
         shader->set_uniform(field.uniform, material.*field.member);
 }
 
+/// @brief Upload the scene lighting: tunable fields, lights off dimming and the environment rotation.
+static void SetPbrLightingUniforms(Slic3r::GLShaderProgram* shader, const Slic3r::Transform3d& viewMatrix)
+{
+    // Environment left in the lights off preview, enough to see the object shapes.
+    static const float PBR_LIGHTS_OFF_SCALE = 0.05f;
+    if (shader == nullptr)
+        return;
+    const Slic3r::GUI::PbrMaterialTable& table = Slic3r::GUI::PbrMaterialTable::Instance();
+    const Slic3r::GUI::PbrLightingParams& lighting = table.GetLighting();
+    for (const Slic3r::GUI::PbrLightingField& field : Slic3r::GUI::GetPbrLightingFields())
+        shader->set_uniform(field.uniform, lighting.*field.member);
+    shader->set_uniform("pbr_light_scale", table.IsLightsOffPreview() ? PBR_LIGHTS_OFF_SCALE : 1.0f);
+    shader->set_uniform("pbr_view_to_env", Slic3r::GUI::PbrEnvironment::ViewToEnvironment(viewMatrix));
+}
+
 namespace Slic3r {
 
 bool BeginPbrSurface(GLShaderProgram& shader, const Transform3d& viewMatrix, const Transform3d& projectionMatrix,
@@ -226,10 +243,10 @@ bool BeginPbrSurface(GLShaderProgram& shader, const Transform3d& viewMatrix, con
     shader.set_uniform("debug_normal_color", false);
     shader.set_uniform("pbr_env_map", PBR_ENV_TEXTURE_UNIT);
     shader.set_uniform("pbr_noise_tex", PBR_NOISE_TEXTURE_UNIT);
-    const GUI::PbrLightingParams& lighting = GUI::PbrMaterialTable::Instance().GetLighting();
-    for (const GUI::PbrLightingField& field : GUI::GetPbrLightingFields())
-        shader.set_uniform(field.uniform, lighting.*field.member);
-    shader.set_uniform("pbr_view_to_env", GUI::PbrEnvironment::ViewToEnvironment(viewMatrix));
+    shader.set_uniform("pbr_scene_tex", PBR_SCENE_TEXTURE_UNIT);
+    shader.set_uniform("pbr_bed_noise_tex", PBR_BED_NOISE_TEXTURE_UNIT);
+    shader.set_uniform("pbr_scene_ready", false);
+    SetPbrLightingUniforms(&shader, viewMatrix);
     SetPbrMaterialUniforms(&shader, material);
     return BindPbrEnvironment(&shader);
 }
@@ -468,6 +485,7 @@ GLVolume::GLVolume(float r, float g, float b, float a)
     , hover(HS_None)
     , is_modifier(false)
     , is_wipe_tower(false)
+    , is_closed_mesh(false)
     , is_extrusion_path(false)
     , force_transparent(false)
     , force_native_color(false)
@@ -1074,6 +1092,7 @@ int GLVolumeCollection::load_object_volume(const ModelObject* model_object,
 
     // Always init the main model (GLModel is a value type, not shared)
     const TriangleMesh& mesh = *meshPtr;
+    v.is_closed_mesh = mesh.stats().open_edges == 0 && mesh.stats().volume > 0.0f;
 #if ENABLE_SMOOTH_NORMALS
     v.model.init_from(mesh, true);
 #else
@@ -1338,6 +1357,27 @@ int GLVolumeCollection::get_selection_support_threshold_angle(bool& enable_suppo
     return support_threshold_angle;
 }
 
+bool GLVolumeCollection::IsPbrTranslucentVolume(const GLVolume& volume) const
+{
+    if (volume.is_modifier || volume.is_wipe_tower)
+        return false;
+    // Same filament mapping as the PBR shading.
+    const int filamentIdx = std::max(volume.extruder_id, 1) - 1;
+    if (filamentIdx >= static_cast<int>(_extruderMaterials.size()))
+        return false;
+    return _extruderMaterials[static_cast<size_t>(filamentIdx)].params.transmission > 0.0f;
+}
+
+bool GLVolumeCollection::HasPbrTranslucentVolume() const
+{
+    for (const GLVolume* volume : volumes)
+    {
+        if (volume != nullptr && volume->is_active && IsPbrTranslucentVolume(*volume))
+            return true;
+    }
+    return false;
+}
+
 void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
                                 bool                                 disable_cullface,
                                 const GUI::Camera&                   camera,
@@ -1347,6 +1387,22 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
     const Transform3d& view_matrix = camera.get_view_matrix();
     const Transform3d& projection_matrix = camera.get_projection_matrix();
     GLVolumeWithIdAndZList to_render = volumes_to_render(volumes, type, view_matrix, filter_func);
+    // Translucent filaments may be drawn later, over a copy of the scene behind them.
+    if (type == ERenderType::Opaque && _pbrTranslucentPass != PbrTranslucentPass::All)
+    {
+        const bool keepTranslucent = _pbrTranslucentPass == PbrTranslucentPass::OnlyTranslucent;
+        to_render.erase(std::remove_if(to_render.begin(), to_render.end(),
+                                       [this, keepTranslucent](const GLVolumeWithIdAndZ& item)
+                                       {
+                                           if (IsPbrTranslucentVolume(*item.first) != keepTranslucent)
+                                               return true;
+                                           // Translucent groups are drawn one after the other over fresh scene copies.
+                                           return keepTranslucent && !_pbrTranslucentGroup.empty() &&
+                                                  std::find(_pbrTranslucentGroup.begin(), _pbrTranslucentGroup.end(),
+                                                            item.first) == _pbrTranslucentGroup.end();
+                                       }),
+                        to_render.end());
+    }
     if (to_render.empty())
         return;
 
@@ -1364,14 +1420,28 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
     // The cube and 3D samplers always point to their own units, so they never share a unit with 2D samplers.
     shader->set_uniform("pbr_env_map", PBR_ENV_TEXTURE_UNIT);
     shader->set_uniform("pbr_noise_tex", PBR_NOISE_TEXTURE_UNIT);
+    shader->set_uniform("pbr_scene_tex", PBR_SCENE_TEXTURE_UNIT);
+    shader->set_uniform("pbr_bed_noise_tex", PBR_BED_NOISE_TEXTURE_UNIT);
+    // Only the build plate uses the planar pattern.
+    shader->set_uniform("pbr_planar_pattern", false);
     bool pbrEnvBound = false;
     if (_usePbr)
     {
-        const GUI::PbrLightingParams& lighting = GUI::PbrMaterialTable::Instance().GetLighting();
-        for (const GUI::PbrLightingField& field : GUI::GetPbrLightingFields())
-            shader->set_uniform(field.uniform, lighting.*field.member);
-        shader->set_uniform("pbr_view_to_env", GUI::PbrEnvironment::ViewToEnvironment(view_matrix));
+        SetPbrLightingUniforms(shader, view_matrix);
         pbrEnvBound = BindPbrEnvironment(shader);
+    }
+    // The scene copy is sampled only by translucent volumes drawn after the bed.
+    const bool pbrSceneBound = _usePbr && type == ERenderType::Opaque &&
+                               _pbrTranslucentPass == PbrTranslucentPass::OnlyTranslucent && _pbrSceneTexture != 0;
+    shader->set_uniform("pbr_scene_ready", pbrSceneBound);
+    if (pbrSceneBound)
+    {
+        shader->set_uniform("pbr_scene_max_lod", _pbrSceneMaxLod);
+        shader->set_uniform("pbr_scene_rect", _pbrSceneRect);
+        shader->set_uniform("pbr_scene_viewport_scale", _pbrSceneViewportScale);
+        glsafe(::glActiveTexture(GL_TEXTURE0 + PBR_SCENE_TEXTURE_UNIT));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, _pbrSceneTexture));
+        glsafe(::glActiveTexture(GL_TEXTURE0));
     }
 
     if (type == ERenderType::Transparent) {
@@ -1382,6 +1452,11 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
     glsafe(::glCullFace(GL_BACK));
     if (disable_cullface)
         glsafe(::glDisable(GL_CULL_FACE));
+    // PBR shading is costly: closed meshes skip their hidden back faces even where culling is off to show broken
+    // geometry. Not in clipped or cut views, which show the inside.
+    const bool clipped = m_use_color_clip_plane || m_clipping_plane[3] < 1.0e30 || m_z_range[0] > -0.5f * FLT_MAX ||
+                         m_z_range[1] < 0.5f * FLT_MAX;
+    const bool pbrCullClosedMeshes = _usePbr && disable_cullface && type == ERenderType::Opaque && !clipped;
 
     // Set static camera state for LOD evaluation in GLVolume rendering
     GLVolume::s_curZoom = camera.get_zoom();
@@ -1509,7 +1584,12 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
         const Matrix3d view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) *
                                             model_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
         shader->set_uniform("view_normal_matrix", view_normal_matrix);
+        const bool cullBackFaces = pbrCullClosedMeshes && volume.first->is_closed_mesh;
+        if (cullBackFaces)
+            glsafe(::glEnable(GL_CULL_FACE));
         volume.first->render();
+        if (cullBackFaces)
+            glsafe(::glDisable(GL_CULL_FACE));
 
 #if ENABLE_ENVIRONMENT_MAP
         if (use_environment_texture)
@@ -1550,6 +1630,13 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType      type,
     GLVolume::s_pbrMaterials = nullptr;
     if (pbrEnvBound)
         UnbindPbrTextures();
+    if (pbrSceneBound)
+    {
+        shader->set_uniform("pbr_scene_ready", false);
+        glsafe(::glActiveTexture(GL_TEXTURE0 + PBR_SCENE_TEXTURE_UNIT));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+        glsafe(::glActiveTexture(GL_TEXTURE0));
+    }
 
     if (disable_cullface)
         glsafe(::glEnable(GL_CULL_FACE));

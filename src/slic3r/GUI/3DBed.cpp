@@ -14,6 +14,7 @@
 #include "GLCanvas3D.hpp"
 #include "Plater.hpp"
 #include "Camera.hpp"
+#include "PbrEnvironment.hpp"
 
 #include <GL/glew.h>
 
@@ -698,7 +699,24 @@ void Bed3D::render_model(const Transform3d& view_matrix, const Transform3d& proj
         pbrShader->start_using();
         const bool envBound = BeginPbrSurface(*pbrShader, view_matrix, projection_matrix,
                                               Geometry::assemble_transform(m_model_offset), material);
+        // The plate is flat: its relief reads a cheaper 2D noise, falling back to the 3D one if unavailable.
+        PbrEnvironment& environment = PbrEnvironment::Instance();
+        const bool planarPattern = environment.EnsureBedNoiseLoaded();
+        pbrShader->set_uniform("pbr_planar_pattern", planarPattern);
+        if (planarPattern)
+        {
+            glsafe(::glActiveTexture(GL_TEXTURE0 + PbrEnvironment::BED_NOISE_TEXTURE_UNIT));
+            glsafe(::glBindTexture(GL_TEXTURE_2D, environment.GetBedNoiseTextureId()));
+            glsafe(::glActiveTexture(GL_TEXTURE0));
+        }
         m_model.render();
+        if (planarPattern)
+        {
+            glsafe(::glActiveTexture(GL_TEXTURE0 + PbrEnvironment::BED_NOISE_TEXTURE_UNIT));
+            glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+            glsafe(::glActiveTexture(GL_TEXTURE0));
+        }
+        pbrShader->set_uniform("pbr_planar_pattern", false);
         EndPbrSurface(*pbrShader, envBound);
         pbrShader->stop_using();
         return;

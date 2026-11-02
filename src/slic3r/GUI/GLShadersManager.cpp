@@ -77,6 +77,16 @@ std::pair<bool, std::string> GLShadersManager::init()
         valid &= append_shader("gpu_path", { prefix + "gpu_path.vs", prefix + "gpu_path.fs" });
         valid &= append_shader("gpu_path_marker", { prefix + "gpu_path_marker.vs", prefix + "gpu_path_marker.fs" });
     }
+    // used to blur and add the halo of glowing PBR materials, optional: without them there is no halo
+    if (GUI::wxGetApp().is_gl_version_greater_or_equal_to(3, 1)) {
+        for (const std::string name : { "pbr_glow_blur", "pbr_glow_composite" }) {
+            const size_t errorLength = error.size();
+            if (!append_shader(name, { prefix + "background.vs", prefix + name + ".fs" })) {
+                error.erase(errorLength);
+                BOOST_LOG_TRIVIAL(warning) << "PBR glow shader unavailable: " << name;
+            }
+        }
+    }
     //used to render thumbnail
     valid &= append_shader("thumbnail", { prefix + "thumbnail.vs", prefix + "thumbnail.fs"});
     // used to render printbed
@@ -92,12 +102,14 @@ std::pair<bool, std::string> GLShadersManager::init()
         , { "ENABLE_ENVIRONMENT_MAP"sv }
 #endif // ENABLE_ENVIRONMENT_MAP
         );
-    // Cube and 3D samplers both default to unit 0, which is invalid for any draw; give them their own units now.
+    // Cube, 3D and 2D samplers all default to unit 0, which is invalid for any draw; give them their own units now.
     GLShaderProgram* gouraud = get_shader("gouraud");
     if (gouraud != nullptr && GUI::wxGetApp().is_gl_version_greater_or_equal_to(3, 1)) {
         gouraud->start_using();
         gouraud->set_uniform("pbr_env_map", GUI::PbrEnvironment::ENV_TEXTURE_UNIT);
         gouraud->set_uniform("pbr_noise_tex", GUI::PbrEnvironment::NOISE_TEXTURE_UNIT);
+        gouraud->set_uniform("pbr_scene_tex", GUI::PbrEnvironment::SCENE_TEXTURE_UNIT);
+        gouraud->set_uniform("pbr_bed_noise_tex", GUI::PbrEnvironment::BED_NOISE_TEXTURE_UNIT);
         gouraud->stop_using();
     }
     // used to render variable layers heights in 3d editor

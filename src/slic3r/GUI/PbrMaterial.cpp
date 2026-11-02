@@ -170,6 +170,18 @@ const std::vector<PbrMaterialField>& GetPbrMaterialFields()
           "Relief shape: 0 = smooth waves (wood), 1 = packed grains (matte)" },
         { "sheen", "pbr_sheen", &PbrMaterialParams::sheen, 0.0f, 1.0f, false,
           "Soft bright edges of rough surfaces (dusty matte look)" },
+        { "transmission", "pbr_transmission", &PbrMaterialParams::transmission, 0.0f, 1.0f, false,
+          "Light passing through the body: soft shading, bright thin edges, 0 = opaque" },
+        { "emission", "pbr_emission", &PbrMaterialParams::emission, 0.0f, 3.0f, false,
+          "Self glow strength (glow in the dark), 0 = off" },
+        { "emission_r", "pbr_emission_r", &PbrMaterialParams::emissionR, 0.0f, 1.0f, false,
+          "Glow color, red" },
+        { "emission_g", "pbr_emission_g", &PbrMaterialParams::emissionG, 0.0f, 1.0f, false,
+          "Glow color, green" },
+        { "emission_b", "pbr_emission_b", &PbrMaterialParams::emissionB, 0.0f, 1.0f, false,
+          "Glow color, blue" },
+        { "emission_tint", "pbr_emission_tint", &PbrMaterialParams::emissionTint, 0.0f, 1.0f, false,
+          "Glow color source: 0 = emission_r/g/b, 1 = filament color" },
     };
     return fields;
 }
@@ -189,6 +201,10 @@ const std::vector<PbrLightingField>& GetPbrLightingFields()
           "Scale of the reflections and highlights" },
         { "reflection_saturation", "pbr_reflection_saturation", &PbrLightingParams::reflectionSaturation, 0.0f, 1.0f,
           "Reflection color: 0 = gray studio, 1 = original studio colors" },
+        { "back_light", "pbr_back_light", &PbrLightingParams::backLight, 0.0f, 3.0f,
+          "Virtual light behind objects showing translucency, 0 = studio light only" },
+        { "glow_halo", "pbr_glow_halo", &PbrLightingParams::glowHalo, 0.0f, 3.0f,
+          "Strength of the halo around glowing filaments, 0 = no halo" },
     };
     return fields;
 }

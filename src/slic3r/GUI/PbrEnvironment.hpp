@@ -16,6 +16,10 @@ public:
     // Texture units of the PBR samplers, unit 0 is left to 2D textures.
     static const int ENV_TEXTURE_UNIT = 1;
     static const int NOISE_TEXTURE_UNIT = 2;
+    // Scene copy sampled through translucent filaments.
+    static const int SCENE_TEXTURE_UNIT = 3;
+    // Planar noise of the build plate pattern.
+    static const int BED_NOISE_TEXTURE_UNIT = 4;
 
     /// @brief Get the shared environment. Main thread only.
     /// @return the environment instance.
@@ -52,6 +56,16 @@ public:
     /// @return texture id, 0 if not created.
     unsigned int GetNoiseTextureId() const { return _noiseId; }
 
+    /// @brief Generate the tileable 2D noise of the flat build plate once, both grain octaves pre-summed so the
+    ///        plate needs one cheap 2D fetch. Texel: r = value, gb = gradient along x / y, packed like the 3D noise.
+    ///        Needs a current GL 3.1+ context.
+    /// @return true if the 2D texture is ready to bind.
+    bool EnsureBedNoiseLoaded();
+
+    /// @brief Get the GL 2D bed noise texture (repeat wrap, with mipmaps).
+    /// @return texture id, 0 if not created.
+    unsigned int GetBedNoiseTextureId() const { return _bedNoiseId; }
+
 private:
     PbrEnvironment() = default;
 
@@ -64,6 +78,10 @@ private:
     /// @return false if the GL texture can not be created.
     bool CreateNoiseTexture();
 
+    /// @brief Build the 2D bed noise on the CPU and upload it with mipmaps.
+    /// @return false if the GL texture can not be created.
+    bool CreateBedNoiseTexture();
+
     // GL objects live until exit, the shared context is gone before static destructors run.
     unsigned int _textureId{ 0 };
     float _maxLod{ 0.0f };
@@ -71,6 +89,8 @@ private:
     bool _loadTried{ false };
     unsigned int _noiseId{ 0 };
     bool _noiseTried{ false };
+    unsigned int _bedNoiseId{ 0 };
+    bool _bedNoiseTried{ false };
 };
 
 } // namespace GUI
