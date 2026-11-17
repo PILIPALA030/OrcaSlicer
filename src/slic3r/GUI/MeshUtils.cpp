@@ -449,9 +449,9 @@ bool MeshRaycaster::unproject_on_mesh(const Vec2d& mouse_pos, const Transform3d&
             break;
     }
 
-    if (i==hits.size() || (hits.size()-i) % 2 != 0) {
-        // All hits are either clipped, or there is an odd number of unclipped
-        // hits - meaning the nearest must be from inside the mesh.
+    if (i == hits.size() || (i > 0 && (hits.size() - i) % 2 != 0)) {
+        // All hits clipped, or clipped hits were skipped and an odd count remains (we're looking
+        // into the inside). A visible first hit (i == 0) is kept even if coincident shells make the count odd.
         return false;
     }
 
